@@ -1,4 +1,4 @@
-# KhentUsage
+# Cinder
 
 Desktop app (Tauri 2) showing your coding-agent usage stats on this machine.
 

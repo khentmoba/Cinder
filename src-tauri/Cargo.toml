@@ -1,7 +1,7 @@
 [package]
-name = "khentusage"
+name = "cinder"
 version = "0.1.0"
-description = "Coding agent usage statistics"
+description = "Cinder — coding agent usage statistics"
 edition = "2021"
 
 [build-dependencies]

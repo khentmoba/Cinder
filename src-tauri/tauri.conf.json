@@ -1,8 +1,8 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "KhentUsage",
+  "productName": "Cinder",
   "version": "0.1.0",
-  "identifier": "com.khent.usage",
+  "identifier": "com.cinder.usage",
   "build": {
     "frontendDist": "../src"
   },
@@ -10,7 +10,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "KhentUsage — Coding Agent Stats",
+        "title": "Cinder — Coding Agent Stats",
         "width": 1100,
         "height": 760,
         "minWidth": 800,

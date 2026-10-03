@@ -1,4 +1,4 @@
-// KhentUsage UI: aggregates the per-day rows from the Rust collector.
+// Cinder UI: aggregates the per-day rows from the Rust collector.
 const invoke = () => (window.__TAURI__ ? window.__TAURI__.core.invoke('get_stats') : Promise.reject('not in Tauri'));
 
 let DATA = null;

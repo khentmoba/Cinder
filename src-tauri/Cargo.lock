@@ -341,6 +341,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cinder"
+version = "0.1.0"
+dependencies = [
+ "dirs 6.0.0",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+]
+
+[[package]]
 name = "combine"
 version = "4.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1696,18 +1708,6 @@ checksum = "0fbe853b403ae61a04233030ae8a79d94975281ed9770a1f9e246732b534b28d"
 dependencies = [
  "bitflags 2.13.2",
  "serde",
-]
-
-[[package]]
-name = "khentusage"
-version = "0.1.0"
-dependencies = [
- "dirs 6.0.0",
- "rusqlite",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
 ]
 
 [[package]]

@@ -1,4 +1,4 @@
-// KhentUsage — coding agent usage statistics collector
+// Cinder — coding agent usage statistics collector
 //
 // Parses the local session stores of the coding agents installed on this machine
 // and emits per-day, per-agent, per-model rows. The UI aggregates by time range.
@@ -774,7 +774,7 @@ mod tests {
         let rows: u64 = s.rows.iter().map(|r| r.requests + r.tools).sum();
         eprintln!("rows={} events={} sessions={} limits={} pricing={}", s.rows.len(), rows, s.sessions.len(), s.limits.len(), s.pricing.embedded + s.pricing.local);
         let json = serde_json::to_string(&s).unwrap();
-        std::fs::write(std::env::temp_dir().join("khentusage-stats.json"), &json).unwrap();
+        std::fs::write(std::env::temp_dir().join("cinder-stats.json"), &json).unwrap();
         // summary per agent
         let mut per: HashMap<String, (u64, u64, f64, u64)> = HashMap::new();
         for r in &s.rows {

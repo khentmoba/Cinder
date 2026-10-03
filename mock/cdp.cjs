@@ -2,7 +2,8 @@
 const fs = require('fs');
 const PORT = process.env.CDP_PORT || 9333;
 const URL_ = process.argv[2];
-const OUT = process.argv[3] || 'C:/APPLICATIONS/KhentUsage/mock/shot.png';
+const path = require('path');
+const OUT = process.argv[3] || path.join(__dirname, 'shot.png');
 const EVAL = process.argv[4] || '1';
 
 (async () => {
