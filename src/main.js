@@ -2,10 +2,12 @@
 const invoke = () => (window.__TAURI__ ? window.__TAURI__.core.invoke('get_stats') : Promise.reject('not in Tauri'));
 
 let DATA = null;
+let LOADING = false;         // a scan is in flight
 let metric = 'tokens';       // cost | tokens | limits
 let rangeDays = 90;          // 1 | 7 | 30 | 90 | 0 = all
 let breakMode = 'model';     // model | day
 let selectedAgent = null;    // null = all agents
+let chart = null;            // last drawn chart geometry, for the hover tooltip
 
 const AGENT_COLORS = {
   'Codex': '#e8e8ea', 'Pi': '#4da3ff', 'OpenCode': '#3fb950', 'Claude Code': '#d29922',
@@ -101,6 +103,19 @@ function acc(r, a) {
 }
 const tok = a => a.input + a.cache_read + a.cache_write + a.output;
 
+// One accessor per metric, so every panel (hero, agent list, chart, breakdown,
+// tooltip) reads the same number. Antigravity logs carry no token or cost field
+// anywhere -- not in the transcripts, not in the conversation db -- so a
+// tokens/cost-only UI renders it as a row of zeros and a flat line pinned to the
+// baseline: "no data", even though requests and tool calls were collected fine.
+const METRICS = {
+  cost:     { label: 'cost',     get: a => a.cost,     fmt: (n, known) => fmtUsd(n, known) },
+  tokens:   { label: 'tokens',   get: tok,             fmt: n => fmtTok(n) },
+  requests: { label: 'requests', get: a => a.requests, fmt: n => n.toLocaleString() },
+};
+const mval = a => METRICS[metric].get(a);
+const mfmt = (n, known) => METRICS[metric].fmt(n, known);
+
 function byAgent() {
   const m = new Map();
   for (const r of filtered()) {
@@ -114,7 +129,7 @@ function byAgent() {
   const sess = new Map();
   for (const s of sessionCount()) sess.set(s.agent, (sess.get(s.agent) || 0) + s.sessions);
   const list = [...m.entries()].map(([agent, a]) => ({ agent, ...a, sessions: sess.get(agent) || 0 }));
-  list.sort((x, y) => (metric === 'cost' ? y.cost - x.cost : tok(y) - tok(x)));
+  list.sort((x, y) => mval(y) - mval(x));
   const grand = list.reduce((t, a) => { acc(a, t); t.sessions += a.sessions; return t; }, { ...blank(), sessions: 0 });
   return { list, grand };
 }
@@ -132,7 +147,7 @@ function byModel() {
   }
   const list = [...m.entries()].map(([model, a]) => ({ model, ...a }));
   const totalTok = list.reduce((t, a) => t + tok(a), 0);
-  list.sort((x, y) => (metric === 'cost' ? y.cost - x.cost : tok(y) - tok(x)));
+  list.sort((x, y) => mval(y) - mval(x));
   return { list, totalTok };
 }
 
@@ -147,16 +162,26 @@ function byDay() {
   return [...m.entries()].map(([day, a]) => ({ day, ...a })).sort((a, b) => a.day.localeCompare(b.day));
 }
 
-function chartSeries() {
-  const { list } = byAgent();
-  return list.map(a => ({
-    agent: a.agent,
-    values: byDay().filter(d => (a.day.get(d.day))).map(d => metric === 'cost' ? d.cost : tok(d)),
-  }));
+// ---------- rendering ----------
+// Startup scan: fill the real panels with shimmering stand-ins that mirror the
+// final layout, so a cold start reads as loading instead of an empty window.
+// Same element ids, so render() simply overwrites them once the scan lands.
+function renderSkeleton() {
+  const sk = c => `<i class="sk ${c}"></i>`;
+  document.querySelector('.hero').innerHTML =
+    `<div id="bigTotal" class="big sk h1"></div><div id="bigSub" class="sub sk w3"></div>`;
+  document.getElementById('agentList').innerHTML = [0, 1, 2, 3].map(() =>
+    `<li>${sk('dot')}${sk('sq')}${sk('w1')}${sk('w2')}</li>`).join('');
+  document.getElementById('totals').innerHTML = [0, 1, 2, 3, 4].map(() =>
+    `<div class="t">${sk('l w3')}${sk('v w4')}</div>`).join('');
+  document.getElementById('breakdown').innerHTML =
+    '<tr><th>#</th><th>Model</th><th>Cost</th><th>Share</th><th>Tokens</th></tr>' +
+    [0, 1, 2, 3, 4, 5, 6].map(i =>
+      `<tr><td>${i + 1}</td><td>${sk('w5')}</td><td>${sk('w3')}</td><td>${sk('w3')}</td><td>${sk('w4')}</td></tr>`).join('');
 }
 
-// ---------- rendering ----------
 function render() {
+  if (!DATA) return;          // still scanning: nothing to draw yet
   renderLimits();
   const dash = document.getElementById('dash');
   const limitsView = document.getElementById('limitsView');
@@ -166,20 +191,28 @@ function render() {
   if (showLimits) { renderRangeLabel(); return; }
 
   const { list, grand } = byAgent();
-  const bigVal = metric === 'cost' ? fmtUsd(grand.cost, grand.cost_known) : fmtTok(tok(grand));
-  document.getElementById('bigTotal').textContent = bigVal;
-  document.getElementById('bigSub').textContent = grand.sessions + ' sessions · ' + grand.requests.toLocaleString() + ' requests · ' + fmtTok(grand.tools) + ' tool calls';
+  const bigVal = mfmt(mval(grand), grand.cost_known);
+  // reset the class too: the first render may land on skeleton placeholders
+  const big = document.getElementById('bigTotal');
+  big.className = 'big';
+  big.textContent = bigVal;
+  const sub = document.getElementById('bigSub');
+  sub.className = 'sub';
+  sub.textContent = grand.sessions + ' sessions · ' + grand.requests.toLocaleString() + ' requests · ' + fmtTok(grand.tools) + ' tool calls';
 
+  const grandVal = mval(grand);
   document.getElementById('agentList').innerHTML = list.map(a => {
-    const t = tok(a);
-    const share = tok(grand) ? (t / tok(grand) * 100).toFixed(1) : '0.0';
-    const val = metric === 'cost' ? fmtUsd(a.cost, a.cost_known) : fmtTok(t);
-    const costTxt = fmtUsd(a.cost, a.cost_known);
+    const v = mval(a);
+    const share = grandVal ? (v / grandVal * 100).toFixed(1) : '0.0';
+    // Cost is redundant when it is the selected metric; the request count never
+    // is, and it is the only volume signal for agents that log no tokens.
+    const extra = metric === 'cost' ? ''
+      : ` • ${fmtUsd(a.cost, a.cost_known)} • ${a.requests.toLocaleString()} req`;
     return `<li class="${selectedAgent === a.agent ? 'sel' : ''}" data-agent="${esc(a.agent)}" style="box-shadow:inset 2px 0 0 ${color(a.agent)}">
       <span class="radio"></span>
       <img class="logo" src="${agentLogo(a.agent)}" alt="" onerror="this.style.visibility='hidden'">
       <span class="name">${esc(a.agent)} <span class="cnt">${a.sessions} sessions</span></span>
-      <span class="val">${val}<span class="pct">${share}% of ${metric === 'cost' ? 'cost' : 'tokens'}${metric === 'cost' ? '' : ' • ' + costTxt}</span></span>
+      <span class="val">${mfmt(v, a.cost_known)}<span class="pct">${share}% of ${METRICS[metric].label}${extra}</span></span>
     </li>`;
   }).join('') || '<li class="dim">no data</li>';
   document.querySelectorAll('#agentList li[data-agent]').forEach(li =>
@@ -210,10 +243,10 @@ function renderBreakdown() {
   const el = document.getElementById('breakdown');
   if (breakMode === 'day') {
     const days = byDay();
-    const total = days.reduce((t, d) => t + (metric === 'cost' ? d.cost : tok(d)), 0) || 1;
+    const total = days.reduce((t, d) => t + mval(d), 0) || 1;
     el.innerHTML = `<tr><th>#</th><th>Day</th><th>Cost</th><th>Share</th><th>${metric === 'cost' ? 'Requests' : 'Tokens'}</th></tr>` +
       days.slice().reverse().map((d, i) => {
-        const v = metric === 'cost' ? d.cost : tok(d);
+        const v = mval(d);
         const last = metric === 'cost' ? d.requests.toLocaleString() : fmtTok(tok(d));
         const share = v / total * 100;
         const bar = share > 0.5 ? `<span class="bar" style="width:${Math.min(100, share * 4)}%"></span>` : '';
@@ -224,17 +257,18 @@ function renderBreakdown() {
   }
   const { list, totalTok } = byModel();
   const totalCost = list.reduce((t, a) => t + a.cost, 0) || 1;
-  el.innerHTML = `<tr><th>#</th><th>Model</th><th>Cost</th><th>Share</th><th>Tokens</th></tr>` +
+  const totalBase = (metric === 'cost' ? totalCost
+    : metric === 'tokens' ? totalTok
+    : list.reduce((t, a) => t + a.requests, 0)) || 1;
+  el.innerHTML = `<tr><th>#</th><th>Model</th><th>Cost</th><th>Share</th><th>${metric === 'requests' ? 'Requests' : 'Tokens'}</th></tr>` +
     list.slice(0, 25).map((a, i) => {
       const priced = a.cost_known && (a.input + a.output + a.cache_read + a.cache_write) > 0;
-      const shareBase = metric === 'cost' ? a.cost : tok(a);
-      const totalBase = metric === 'cost' ? totalCost : totalTok;
-      const share = shareBase / totalBase * 100;
+      const share = mval(a) / totalBase * 100;
       const bar = share > 0.5 ? `<span class="bar" style="width:${Math.min(100, share * 4)}%"></span>` : '';
       const logo = providerLogo(a.model);
       return `<tr><td>${i + 1}</td><td class="modelcell">${logo ? `<img class="logo sm" src="${logo}" alt="" onerror="this.remove()">` : ''}${esc(a.model)}${bar}</td>` +
         `<td class="${priced ? 'cost' : 'unpriced'}">${priced ? fmtUsd(a.cost, true) : 'Unpriced'}</td>` +
-        `<td>${share < 0.1 ? '<0.1%' : share.toFixed(1) + '%'}</td><td>${fmtTok(tok(a))}</td></tr>`;
+        `<td>${share < 0.1 ? '<0.1%' : share.toFixed(1) + '%'}</td><td>${metric === 'requests' ? a.requests.toLocaleString() : fmtTok(tok(a))}</td></tr>`;
     }).join('');
 }
 
@@ -248,9 +282,15 @@ function renderRangeLabel() {
 function renderChart(list) {
   const box = document.getElementById('chart');
   const days = byDay();
-  document.getElementById('chartTitle').textContent = 'Daily ' + (metric === 'cost' ? 'cost' : 'processed tokens');
-  if (!days.length) { box.innerHTML = ''; return; }
-  const series = list.map(a => ({ agent: a.agent, values: days.map(d => (metric === 'cost' ? d.cost : tok(d))) }));
+  document.getElementById('chartTitle').textContent = 'Daily ' + (metric === 'cost' ? 'cost'
+    : metric === 'requests' ? 'requests' : 'processed tokens');
+  if (!days.length) { box.innerHTML = ''; chart = null; return; }
+  const cell = (a, d) => a.day.get(d.day);
+  const series = list.map(a => ({
+    agent: a.agent,
+    known: days.map(d => cell(a, d)?.cost_known),
+    values: days.map(d => { const v = cell(a, d); return v ? mval(v) : 0; }),
+  }));
   const W = box.clientWidth || 800, H = box.clientHeight || 400;
   const padL = 46, padR = 8, padT = 8, padB = 22;
   const max = Math.max(1e-6, ...series.flatMap(s => s.values));
@@ -274,7 +314,64 @@ function renderChart(list) {
   const labels = [0, Math.floor(days.length / 2), days.length - 1].filter((v, i, a) => a.indexOf(v) === i)
     .map(i => `<text class="xl" x="${x(i)}" y="${H - 6}" text-anchor="${i === 0 ? 'start' : i === days.length - 1 ? 'end' : 'middle'}">${fmtDay(days[i].day)}</text>`).join('');
 
-  box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${gl}${paths}${labels}</svg>`;
+  box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${gl}${paths}${labels}
+    <g class="hv" opacity="0"><line class="cross" y1="${padT}" y2="${H - padB}"/><g class="dots">${
+      series.map(s => `<circle r="2.5" fill="${color(s.agent)}" stroke="#0a0a0c" stroke-width="1"/>`).join('')}</g></g>
+    <rect x="${padL}" y="${padT}" width="${Math.max(0, W - padL - padR)}" height="${Math.max(0, H - padT - padB)}" fill="transparent"/></svg>
+    <div class="tt" hidden></div>`;
+  chart = {
+    box, days, series, W, padL, padR, y, x,
+    hv: box.querySelector('.hv'), cross: box.querySelector('.cross'),
+    dots: [...box.querySelectorAll('.dots circle')], tt: box.querySelector('.tt'),
+  };
+}
+
+// hover: crosshair on the nearest day + a day/agent/total tooltip
+function chartHover(e) {
+  if (!chart) return;
+  const { box, days, series, x, y, W, padL, padR } = chart;
+  const r = box.getBoundingClientRect();
+  if (!r.width) return;
+  const span = (W - padL - padR) / Math.max(1, days.length - 1);
+  const i = Math.max(0, Math.min(days.length - 1,
+    Math.round(((e.clientX - r.left) * (W / r.width) - padL) / span)));
+  const px = x(i);
+  chart.hv.setAttribute('opacity', '1');
+  chart.cross.setAttribute('x1', px);
+  chart.cross.setAttribute('x2', px);
+  series.forEach((s, k) => {
+    const dot = chart.dots[k], v = s.values[i];
+    dot.setAttribute('cx', px);
+    dot.setAttribute('cy', y(v));
+    dot.setAttribute('opacity', v > 0 ? 1 : 0);
+  });
+  const tt = chart.tt;
+  tt.hidden = false;
+  tt.innerHTML = tipHTML(days, series, i);
+  let left = e.clientX - r.left + 16;
+  if (left + tt.offsetWidth > box.clientWidth - 4) left = e.clientX - r.left - tt.offsetWidth - 16;
+  tt.style.left = Math.max(4, left) + 'px';
+  tt.style.top = Math.max(4, Math.min(e.clientY - r.top - 8, box.clientHeight - tt.offsetHeight - 4)) + 'px';
+}
+
+function chartLeave() {
+  if (!chart) return;
+  chart.hv.setAttribute('opacity', '0');
+  chart.tt.hidden = true;
+}
+
+function tipHTML(days, series, i) {
+  const head = new Date(days[i].day + 'T00:00:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  const rows = series.map(s => ({
+    agent: s.agent, v: s.values[i],
+    txt: mfmt(s.values[i], s.known[i]),
+  })).sort((a, b) => b.v - a.v);
+  const total = rows.reduce((t, r) => t + r.v, 0);
+  const totalTxt = mfmt(total, total > 0);
+  return `<div class="d">${head}</div>` + rows.map(r =>
+    `<div class="r"><img class="logo sm" src="${agentLogo(r.agent)}" alt="" onerror="this.style.visibility='hidden'">` +
+    `<span class="n">${esc(r.agent)}</span><b>${r.txt}</b></div>`).join('') +
+    `<div class="r tot"><span class="n">Total</span><b>${totalTxt}</b></div>`;
 }
 
 function niceStep(raw) {
@@ -304,27 +401,53 @@ function renderLimits() {
 }
 
 // ---------- wiring ----------
+const statusLine = () => document.getElementById('status');
+
 async function load() {
-  const status = document.getElementById('status');
-  status.textContent = 'scanning local agent logs…';
+  if (LOADING) return;        // a scan is already walking the logs
+  LOADING = true;
+  document.body.classList.add('loading');
+  if (!DATA) renderSkeleton();  // first scan: nothing real to keep on screen
+  statusLine().textContent = 'scanning local agent logs…';
   try {
     DATA = await invoke();
     render();
-    status.textContent = 'updated ' + new Date().toLocaleTimeString();
-    const p = DATA.pricing;
-    const adj = DATA.adjusted_tokens || 0;
-    const notes = [];
-    if (adj > 0) notes.push(`cache ratio re-applied to ${fmtTok(adj)} tokens (Codex proxy hides cache hits)`);
-    if ((DATA.plan_routes || []).length) notes.push('plan routes (no per-token billing): ' + DATA.plan_routes.join(', '));
-    if ((DATA.unpriced || []).length) notes.push('unpriced: ' + DATA.unpriced.slice(0, 3).join(', '));
-    document.getElementById('priceinfo').textContent =
-      `prices: ${p.local} local + ${p.embedded} ${p.source} · ` +
-      DATA.sources.map(s => `${s.agent}: ${s.found ? s.files : 'not installed'}`).join(' · ') +
-      (notes.length ? ' · ' + notes.join(' · ') : '');
+    statusLine().textContent = 'updated ' + new Date().toLocaleTimeString();
+    renderMeta(false);
   } catch (e) {
-    status.textContent = 'error: ' + e;
+    statusLine().textContent = 'error: ' + e;
+  } finally {
+    LOADING = false;
+    document.body.classList.remove('loading');
   }
 }
+
+// footer metadata line, shared by manual loads and live watcher pushes
+function renderMeta(live) {
+  const p = DATA.pricing;
+  const adj = DATA.adjusted_tokens || 0;
+  const notes = [];
+  if (adj > 0) notes.push(`cache ratio re-applied to ${fmtTok(adj)} tokens (Codex proxy hides cache hits)`);
+  if ((DATA.plan_routes || []).length) notes.push('plan routes (no per-token billing): ' + DATA.plan_routes.join(', '));
+  if ((DATA.unpriced || []).length) notes.push('unpriced: ' + DATA.unpriced.slice(0, 3).join(', '));
+  document.getElementById('priceinfo').textContent =
+    `prices: ${p.local} local + ${p.embedded} ${p.source} · ` +
+    DATA.sources.map(s => `${s.agent}: ${s.found ? s.files : 'not installed'}`).join(' · ') +
+    (notes.length ? ' · ' + notes.join(' · ') : '') +
+    (live ? ' · live' : '');
+}
+
+// the background log watcher pushes fresh stats when agents write new logs,
+// so the window never goes stale while it sits open — no refresh click needed
+window.__TAURI__?.event?.listen('stats-updated', e => {
+  DATA = e.payload;
+  render();
+  renderMeta(true);
+  if (!LOADING) statusLine().textContent = 'updated ' + new Date().toLocaleTimeString() + ' · live';
+});
+window.__TAURI__?.event?.listen('stats-stage', e => {
+  if (LOADING) statusLine().textContent = 'scanning ' + e.payload + '…';
+});
 
 for (const [id, set] of [['metric', v => { metric = v; }], ['range', v => { rangeDays = v === '0' ? 0 : +v; }],
   ['breakMode', v => { breakMode = v; }]]) {
@@ -336,6 +459,9 @@ for (const [id, set] of [['metric', v => { metric = v; }], ['range', v => { rang
     render();
   });
 }
+const chartBox = document.getElementById('chart');
+chartBox.addEventListener('pointermove', chartHover);
+chartBox.addEventListener('pointerleave', chartLeave);
 document.getElementById('refresh').addEventListener('click', load);
 window.addEventListener('resize', () => DATA && renderChart(byAgent().list));
 load();

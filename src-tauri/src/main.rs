@@ -10,7 +10,9 @@ use pricing::Pricing;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use tauri::{AppHandle, Emitter};
 
 #[derive(Serialize, Default, Clone)]
 struct Row {
@@ -188,29 +190,78 @@ fn list_files(root: &Path, ext: &str, name: Option<&str>) -> Vec<PathBuf> {
     out
 }
 
-fn read_lines(path: &Path) -> Option<String> {
-    fs::read_to_string(path).ok()
+fn each_line(path: &Path, mut f: impl FnMut(&str)) {
+    // Stream the file instead of read_to_string: session files reach 13 MB and
+    // the trees total ~1.6 GB, so holding whole files (plus split lines) spikes
+    // RSS and stalls a cold start on page-cache misses. A 256 KiB BufReader with
+    // a reused buffer keeps one line resident at a time.
+    let Ok(file) = fs::File::open(path) else { return };
+    let mut reader = BufReader::with_capacity(256 * 1024, file);
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        match reader.read_line(&mut buf) {
+            Ok(0) => break,
+            Ok(_) => {
+                let line = buf.trim_end();
+                if !line.is_empty() {
+                    f(line);
+                }
+            }
+            Err(_) => break,
+        }
+    }
 }
+
+/// True when a line carries at least one of `keys`. A JSONL line that carries none
+/// of them cannot change the collected stats, so it is never handed to serde_json.
+/// The logs are ~1.6 GB across ~1000 files; skipping half of the lines halves the
+/// parse work, which is what a cold start (empty page cache) spends its time on.
+fn has_key(line: &str, keys: &[&str]) -> bool {
+    keys.iter().any(|k| line.contains(k))
+}
+
+/// Every line that can contribute a Pi row: the session header (day marker) or an
+/// assistant message carrying a usage block.
+const PI_KEYS: &[&str] = &["usage", "session"];
+/// Every line that can contribute a Codex row: the header/context lines, tool calls
+/// and token-count events. Response items and turn events are ignored.
+const CODEX_KEYS: &[&str] = &[
+    "session_meta",
+    "turn_context",
+    "response_item",
+    "event_msg",
+    "function_call",
+    "custom_tool_call",
+    "token_count",
+];
+/// Claude assistant messages carrying usage blocks. Without this prefilter every
+/// line of every project jsonl goes through serde_json for nothing.
+const CLAUDE_KEYS: &[&str] = &["assistant", "usage"];
+/// Planner responses, plus the lines that switch the model.
+const AGY_KEYS: &[&str] = &["PLANNER_RESPONSE", "Model Selection"];
 
 // ---------------- Pi ----------------
 fn parse_pi(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Sess, plan_routes: &mut HashMap<String, u64>) -> u64 {
     let root = home.join(".pi").join("agent").join("sessions");
     let files = list_files(&root, "jsonl", None);
     for file in &files {
-        let Some(text) = read_lines(file) else { continue };
         let mut day = String::new();
-        for line in text.lines() {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        each_line(file, |line| {
+            if !has_key(line, PI_KEYS) {
+                return;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return };
             let ts = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
             if v.get("type").and_then(|t| t.as_str()) == Some("session") && day.is_empty() {
                 day = day_of(ts);
             }
             if v.get("type").and_then(|t| t.as_str()) != Some("message") {
-                continue;
+                return;
             }
-            let Some(msg) = v.get("message") else { continue };
+            let Some(msg) = v.get("message") else { return };
             if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
-                continue;
+                return;
             }
             let u = msg.get("usage").cloned().unwrap_or(serde_json::Value::Null);
             let input = u.get("input").and_then(|x| x.as_u64()).unwrap_or(0);
@@ -219,7 +270,7 @@ fn parse_pi(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Sess, pl
             let cache_write = u.get("cacheWrite").and_then(|x| x.as_u64()).unwrap_or(0);
             let reasoning = u.get("reasoning").and_then(|x| x.as_u64()).unwrap_or(0);
             if input + output + cache_read + cache_write == 0 {
-                continue;
+                return;
             }
             let mut tools = 0u64;
             if let Some(content) = msg.get("content").and_then(|x| x.as_array()) {
@@ -278,7 +329,7 @@ fn parse_pi(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Sess, pl
                 r.day = day.clone();
             }
             add(rows, sess, "Pi", &model, &r.day.clone(), r);
-        }
+        });
         if !day.is_empty() {
             session(sess, "Pi", &day);
         }
@@ -291,13 +342,15 @@ fn parse_codex(home: &Path, pricing: &Pricing, ratios: &mut CacheRatios, rows: &
     let root = home.join(".codex").join("sessions");
     let files = list_files(&root, "jsonl", None);
     for file in &files {
-        let Some(text) = read_lines(file) else { continue };
         let mut model = String::from("unknown");
         let mut day = String::new();
         let mut latest: Option<(String, f64, i64, i64)> = None;
         let mut plan = String::new();
-        for line in text.lines() {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        each_line(file, |line| {
+            if !has_key(line, CODEX_KEYS) {
+                return;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return };
             let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
             let p = v.get("payload").cloned().unwrap_or(serde_json::Value::Null);
             let ts = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
@@ -326,7 +379,7 @@ fn parse_codex(home: &Path, pricing: &Pricing, ratios: &mut CacheRatios, rows: &
                 }
                 "event_msg" => {
                     if p.get("type").and_then(|t| t.as_str()) != Some("token_count") {
-                        continue;
+                        return;
                     }
                     if let Some(ptype) = p.get("rate_limits").and_then(|rl| rl.get("plan_type")).and_then(|x| x.as_str()) {
                         plan = ptype.to_string();
@@ -345,14 +398,14 @@ fn parse_codex(home: &Path, pricing: &Pricing, ratios: &mut CacheRatios, rows: &
                             }
                         }
                     }
-                    let Some(info) = p.get("info") else { continue };
-                    let Some(last) = info.get("last_token_usage") else { continue };
+                    let Some(info) = p.get("info") else { return };
+                    let Some(last) = info.get("last_token_usage") else { return };
                     let input = last.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
                     let cached = last.get("cached_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
                     let output = last.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
                     let reasoning = last.get("reasoning_output_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
                     if input + output == 0 {
-                        continue;
+                        return;
                     }
                     let mut uncached = input.saturating_sub(cached);
                     let total_in = input;
@@ -389,7 +442,7 @@ fn parse_codex(home: &Path, pricing: &Pricing, ratios: &mut CacheRatios, rows: &
                 }
                 _ => {}
             }
-        }
+        });
         if let Some((window, pct, wm, ra)) = latest {
             let entry = limits
                 .iter_mut()
@@ -425,25 +478,27 @@ fn parse_claude(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Sess
     }
     let files = list_files(&projects, "jsonl", None);
     for file in &files {
-        let Some(text) = read_lines(file) else { continue };
         let mut day = String::new();
-        for line in text.lines() {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        each_line(file, |line| {
+            if !has_key(line, CLAUDE_KEYS) {
+                return;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return };
             let ts = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
             if day.is_empty() && !day_of(ts).is_empty() {
                 day = day_of(ts);
             }
             if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
-                continue;
+                return;
             }
-            let Some(msg) = v.get("message") else { continue };
-            let Some(u) = msg.get("usage") else { continue };
+            let Some(msg) = v.get("message") else { return };
+            let Some(u) = msg.get("usage") else { return };
             let input = u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
             let output = u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
             let cache_read = u.get("cache_read_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
             let cache_write = u.get("cache_creation_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
             if input + output + cache_read + cache_write == 0 {
-                continue;
+                return;
             }
             let mut tools = 0u64;
             if let Some(content) = msg.get("content").and_then(|x| x.as_array()) {
@@ -474,7 +529,7 @@ fn parse_claude(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Sess
             }
             if r.day.is_empty() { r.day = day.clone(); }
             add(rows, sess, "Claude Code", &model, &r.day.clone(), r);
-        }
+        });
         if !day.is_empty() {
             session(sess, "Claude Code", &day);
         }
@@ -492,6 +547,9 @@ fn parse_opencode(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Se
     let Ok(conn) = rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
         return 0;
     };
+    // The owner app may be writing (WAL mode): don't fail the whole scan on a
+    // locked page, wait briefly instead of returning empty OpenCode stats.
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
     let table = ["session_v2", "session"].iter().find(|t| {
         conn.query_row(&format!("SELECT COUNT(*) FROM {}", t), [], |r| r.get::<_, i64>(0))
             .map(|n| n > 0)
@@ -569,24 +627,29 @@ fn parse_opencode(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Se
             }
         }
     }
-    // tool calls, attributed to the owning session's model and day
+    // tool calls, attributed to the owning session's model and day.
+    // Group by day inside SQLite: grouping by raw millisecond timestamps emits
+    // one row per tool call (~26k rows over the wire), which then explodes into
+    // thousands of sparse frontend rows. Models x days is a few hundred rows.
     let tools_sql = format!(
-        "SELECT s.model, p.time_created, COUNT(*) FROM part p \
+        "SELECT s.model, date(p.time_created/1000,'unixepoch'), COUNT(*) FROM part p \
          JOIN message m ON p.message_id = m.id JOIN {} s ON m.session_id = s.id \
-         WHERE p.data LIKE '%\"type\":\"tool\"%' GROUP BY s.model, p.time_created",
+         WHERE p.data LIKE '%\"type\":\"tool\"%' GROUP BY s.model, date(p.time_created/1000,'unixepoch')",
         table
     );
     if let Ok(mut stmt) = conn.prepare(&tools_sql) {
         if let Ok(it) = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, Option<String>>(0)?,
-                r.get::<_, Option<i64>>(1)?,
+                r.get::<_, Option<String>>(1)?,
                 r.get::<_, Option<i64>>(2)?,
             ))
         }) {
-            for (model, ts, n) in it.flatten() {
-                let secs = ts.map(|t| if t > 1_000_000_000_000 { t / 1000 } else { t }).unwrap_or(0);
-                let day = unix_day(secs);
+            for (model, day_opt, n) in it.flatten() {
+                let day = day_opt.unwrap_or_default();
+                if day.is_empty() {
+                    continue;
+                }
                 let model = pricing::normalize_model(&model.unwrap_or_else(|| "unknown".into()));
                 add(
                     rows,
@@ -611,7 +674,6 @@ fn parse_antigravity(home: &Path, rows: &mut Rows, sess: &mut Sess) -> u64 {
         let brain = home.join(".gemini").join(variant).join("brain");
         let transcripts = list_files(&brain, "jsonl", Some("transcript.jsonl"));
         for file in &transcripts {
-            let Some(text) = read_lines(file) else { continue };
             let mtime_day = fs::metadata(file)
                 .and_then(|m| m.modified())
                 .ok()
@@ -620,8 +682,11 @@ fn parse_antigravity(home: &Path, rows: &mut Rows, sess: &mut Sess) -> u64 {
                 .unwrap_or_default();
             session(sess, "Antigravity", &mtime_day);
             let mut model = String::from("unknown");
-            for line in text.lines() {
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            each_line(file, |line| {
+                if !has_key(line, AGY_KEYS) {
+                    return;
+                }
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return };
                 if let Some(content) = v.get("content").and_then(|x| x.as_str()) {
                     if let Some(idx) = content.rfind("Model Selection` from") {
                         let rest = &content[idx..];
@@ -649,7 +714,7 @@ fn parse_antigravity(home: &Path, rows: &mut Rows, sess: &mut Sess) -> u64 {
                     };
                     add(rows, sess, "Antigravity", &model, &r.day.clone(), r);
                 }
-            }
+            });
         }
         // conversation dbs without transcripts still count as sessions (dated by file mtime)
         if transcripts.is_empty() {
@@ -685,9 +750,23 @@ fn unix_day(secs: i64) -> String {
     format!("{:04}-{:02}-{:02}", y, m, d)
 }
 
-#[tauri::command]
-fn get_stats() -> Stats {
+/// Collect the stats. Runs off the UI thread and reports the stage it is on, so a
+/// cold start stays responsive (and legible) while it walks the local logs.
+#[tauri::command(async)]
+fn get_stats(app: AppHandle) -> Stats {
+    scan(&|stage| {
+        let _ = app.emit("stats-stage", stage);
+    })
+}
+
+fn scan(progress: &dyn Fn(&str)) -> Stats {
+    // Serialise concurrent scans (manual refresh + background watcher): each one
+    // walks ~5 GB, so overlapping runs just thrash the disk for the same result.
+    static SCAN_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+    let _guard = SCAN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    progress("model prices");
     let pricing = Pricing::load(&home);
     let mut rows = Rows::new();
     let mut sess = Sess::new();
@@ -696,13 +775,19 @@ fn get_stats() -> Stats {
     let mut plan_routes: HashMap<String, u64> = HashMap::new();
 
     // parse the agents that report cache usage truthfully first, so Codex can borrow their ratios
+    progress("Pi logs");
     let pi_files = parse_pi(&home, &pricing, &mut rows, &mut sess, &mut plan_routes);
+    progress("Claude Code logs");
     let claude_files = parse_claude(&home, &pricing, &mut rows, &mut sess);
+    progress("OpenCode database");
     let opencode_n = parse_opencode(&home, &pricing, &mut rows, &mut sess);
+    progress("Antigravity logs");
     let agy_dbs = parse_antigravity(&home, &mut rows, &mut sess);
     ratios.learn(&rows);
 
+    progress("Codex logs");
     let codex_files = parse_codex(&home, &pricing, &mut ratios, &mut rows, &mut sess, &mut limits);
+    progress("done");
 
     let sources = vec![
         Source { agent: "Pi".into(), path: "~/.pi/agent/sessions".into(), found: pi_files > 0, files: pi_files },
@@ -755,9 +840,90 @@ fn get_stats() -> Stats {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .setup(|app| {
+            spawn_log_watcher(app.handle().clone());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![get_stats])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// Watch the agent log stores and push fresh stats whenever they change, so the
+/// window never goes stale while agents are working — including while Cinder
+/// itself sits open on the desktop. OS-level notifications cost nothing when idle
+/// (no polling reads); rescans fire 10 s after writes go quiet (or after 60 s of
+/// continuous writes, so a busy agent can't starve updates) and at most once per
+/// minute, because a full scan still walks ~5 GB of logs + database.
+fn spawn_log_watcher(app: AppHandle) {
+    std::thread::spawn(move || {
+        use notify::{RecursiveMode, Watcher};
+        use std::time::{Duration, Instant};
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = match notify::recommended_watcher(move |res| {
+            let _ = tx.send(res);
+        }) {
+            Ok(w) => w,
+            Err(_) => return,
+        };
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let roots: Vec<(PathBuf, RecursiveMode)> = vec![
+            (home.join(".pi").join("agent").join("sessions"), RecursiveMode::Recursive),
+            (home.join(".codex").join("sessions"), RecursiveMode::Recursive),
+            (home.join(".claude").join("projects"), RecursiveMode::Recursive),
+            (home.join(".gemini").join("antigravity"), RecursiveMode::Recursive),
+            (home.join(".gemini").join("antigravity-cli"), RecursiveMode::Recursive),
+            // Non-recursive: the db/wal/shm files live here, and this skips the
+            // heavy log/repos/snapshot subtrees (WAL writes hit the -wal file,
+            // so the directory itself — not just opencode.db — must be watched).
+            (home.join(".local").join("share").join("opencode"), RecursiveMode::NonRecursive),
+        ];
+        let mut watching = 0;
+        for (p, mode) in &roots {
+            if p.exists() && watcher.watch(p, *mode).is_ok() {
+                watching += 1;
+            }
+        }
+        if watching == 0 {
+            return;
+        }
+        // Old enough that the first real change rescans after the quiet period;
+        // startup itself already ran a full scan via get_stats.
+        let mut last_scan = Instant::now() - Duration::from_secs(3600);
+        let mut pending = false;
+        let mut last_event = Instant::now();
+        let mut pending_since = Instant::now();
+        loop {
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(Ok(_)) => {
+                    if !pending {
+                        pending_since = Instant::now();
+                    }
+                    pending = true;
+                    last_event = Instant::now();
+                }
+                Ok(Err(_)) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            // Rescan 10 s after writes go quiet — or after 60 s of continuous
+            // writes, so a long-running agent session can't starve updates.
+            let quiet = last_event.elapsed() >= Duration::from_secs(10);
+            let overdue = pending_since.elapsed() >= Duration::from_secs(60);
+            if pending && (quiet || overdue) {
+                if last_scan.elapsed() >= Duration::from_secs(60) {
+                    pending = false;
+                    let stats = scan(&|_| {});
+                    last_scan = Instant::now();
+                    let _ = app.emit("stats-updated", &stats);
+                } else {
+                    // Rate limit: re-check once the minute is up. Events arriving
+                    // meanwhile just refresh the quiet timer above.
+                    std::thread::sleep(Duration::from_secs(5));
+                }
+            }
+        }
+    });
 }
 
 fn main() {
@@ -770,7 +936,7 @@ mod tests {
 
     #[test]
     fn dump_stats() {
-        let s = super::get_stats();
+        let s = super::scan(&|_| {});
         let rows: u64 = s.rows.iter().map(|r| r.requests + r.tools).sum();
         eprintln!("rows={} events={} sessions={} limits={} pricing={}", s.rows.len(), rows, s.sessions.len(), s.limits.len(), s.pricing.embedded + s.pricing.local);
         let json = serde_json::to_string(&s).unwrap();

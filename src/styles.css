@@ -97,12 +97,26 @@ td .bar { display: block; height: 2px; background: var(--accent); margin-top: 5p
 tr.dim td { color: var(--faint); }
 
 /* chart */
-.chart { flex: 1; min-height: 0; }
+.chart { flex: 1; min-height: 0; position: relative; }
 .chart svg { width: 100%; height: 100%; display: block; }
 .chart .gl { stroke: #1c1d22; stroke-width: 1; }
 .chart .yl { fill: var(--faint); font-size: 10px; }
 .chart .xl { fill: var(--dim); font-size: 10px; }
 .chart path.series { fill: none; stroke-width: 1.6; }
+.chart .cross { stroke: #3a3a42; stroke-width: 1; stroke-dasharray: 3 3; }
+.chart .tt {
+  position: absolute; z-index: 4; pointer-events: none; min-width: 150px;
+  background: rgba(19, 20, 24, .94); border: 1px solid var(--line); border-radius: 10px;
+  padding: 8px 10px; font-size: 12px; box-shadow: 0 12px 32px rgba(0, 0, 0, .55);
+}
+.chart .tt[hidden] { display: none; }
+.chart .tt .d { color: var(--faint); font-size: 11px; margin-bottom: 6px; }
+.chart .tt .r { display: flex; align-items: center; gap: 7px; padding: 2px 0; }
+.chart .tt .r .logo.sm { width: 13px; height: 13px; margin-right: 0; flex: none; }
+.chart .tt .r .n { flex: 1; white-space: nowrap; }
+.chart .tt .r b { font-weight: 600; font-variant-numeric: tabular-nums; }
+.chart .tt .r.tot { border-top: 1px solid var(--line); margin-top: 6px; padding-top: 6px; }
+.chart .tt .r.tot .n { color: var(--dim); }
 
 /* limits */
 .limits { max-width: 640px; }
@@ -115,6 +129,60 @@ tr.dim td { color: var(--faint); }
 footer {
   display: flex; justify-content: space-between; padding: 10px 22px 14px;
   color: var(--faint); font-size: 11px; border-top: 1px solid var(--line);
+}
+
+/* startup scan: the window stays live while the collector walks the local logs */
+@keyframes sweep { from { background-position: -60% 0; } to { background-position: 160% 0; } }
+@keyframes shimmer { from { background-position: 100% 0; } to { background-position: 0 0; } }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* indeterminate bar across the very top */
+body.loading::before {
+  content: ''; position: fixed; top: 0; left: 0; right: 0; height: 3px; z-index: 10;
+  background: linear-gradient(90deg, transparent, rgba(107, 138, 253, .3) 30%, #9db2ff 50%, rgba(107, 138, 253, .3) 70%, transparent);
+  background-size: 50% 100%; background-repeat: no-repeat;
+  animation: sweep 1.2s ease-in-out infinite;
+}
+/* spinner in front of the status line */
+body.loading #status::before {
+  content: ''; display: inline-block; width: 9px; height: 9px; margin-right: 7px;
+  border: 1.5px solid #2c2d34; border-top-color: var(--accent); border-radius: 50%;
+  animation: spin .7s linear infinite; vertical-align: -1px;
+}
+
+/* placeholders that stand in for the real panels until the first scan lands */
+.sk {
+  display: block; height: 10px; border-radius: 6px;
+  background: linear-gradient(90deg, #131419 25%, #1b1c23 37%, #131419 63%);
+  background-size: 400% 100%; animation: shimmer 1.5s ease-in-out infinite;
+}
+.sk.dot { width: 12px; height: 12px; border-radius: 50%; }
+.sk.sq { width: 15px; height: 15px; border-radius: 4px; }
+.sk.h1 { height: 40px; width: 210px; border-radius: 10px; }
+.sk.w1 { width: 70%; } .sk.w2 { width: 118px; } .sk.w3 { width: 68px; }
+.sk.w4 { width: 54px; } .sk.w5 { width: 250px; }
+.totals .sk.l { height: 9px; margin-bottom: 6px; }
+.totals .sk.v { height: 17px; }
+.agents li .sk { justify-self: center; }
+.agents li .sk.w1 { justify-self: start; }
+.agents li:hover { background: none; }
+#breakdown .sk { margin-left: auto; }
+#breakdown td:first-child .sk, #breakdown td:nth-child(2) .sk { margin-left: 0; }
+body.loading #stacked {
+  background: linear-gradient(90deg, #111217 25%, #17181e 37%, #111217 63%);
+  background-size: 400% 100%; animation: shimmer 1.5s ease-in-out infinite;
+}
+/* hint at the plot area before the first series is drawn */
+body.loading #chart { background: repeating-linear-gradient(to bottom, transparent 0 95px, #1a1b21 95px 96px); }
+body.loading #chart::after {
+  content: ''; position: absolute; inset: 6px 0 24px; border-radius: 8px;
+  background: linear-gradient(90deg, rgba(17, 18, 23, .55) 25%, rgba(23, 24, 30, .55) 37%, rgba(17, 18, 23, .55) 63%);
+  background-size: 400% 100%; animation: shimmer 1.5s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body.loading::before, body.loading #status::before, .sk,
+  body.loading #stacked, body.loading #chart::after { animation: none; }
 }
 ::-webkit-scrollbar { width: 8px; }
 ::-webkit-scrollbar-thumb { background: #1e1f24; border-radius: 4px; }
