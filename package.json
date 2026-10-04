@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "tauri dev",
     "build": "tauri build",
-    "install-local": "tauri build && src-tauri/target/release/bundle/nsis/Cinder_0.1.0_x64-setup.exe /S",
+    "install-local": "tauri build && .\\src-tauri\\target\\release\\bundle\\nsis\\Cinder_0.1.0_x64-setup.exe /S",
     "tauri": "tauri"
   },
   "devDependencies": {
