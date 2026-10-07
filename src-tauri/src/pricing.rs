@@ -57,9 +57,23 @@ fn norm(s: &str) -> String {
     };
     // strip trailing date / build tags: -20250929, -v1:0, @free, :free, -latest
     let mut base = out.clone();
-    for pat in [":free", "@free", "-latest", "-preview"] {
+    // DSH names the model with its route baked in (antigravity-gemini-3.8-flash
+    // served by the antigravity route); the catalog prices the bare id.
+    if let Some(stripped) = base.strip_prefix("antigravity-") {
+        base = stripped.to_string();
+    }
+    for pat in [":free", "@free", "-latest", "-preview", "-tiered"] {
         if let Some(i) = base.rfind(pat) {
             base.truncate(i);
+        }
+    }
+    // strip a trailing context-size tag like -1m (gpt-6-luna-1m is the 1M-context
+    // variant of gpt-6-luna at the same base price; tiers above 272k input
+    // tokens cost more, which this estimate does not capture)
+    if let Some(dash) = base.rfind('-') {
+        let suf = &base[dash + 1..];
+        if suf.len() >= 2 && suf[..suf.len() - 1].chars().all(|c| c.is_ascii_digit()) && suf.ends_with('m') {
+            base.truncate(dash);
         }
     }
     // strip trailing date digits group like -20250929 or -v2
@@ -132,15 +146,24 @@ impl Pricing {
     fn from_local(&self, provider: Option<&str>, model: &str) -> Option<Price> {
         let m = model.to_lowercase();
         let t = tail(&m);
+        // also try the normalized tail so context-size variants
+        // (gpt-6-luna-1m) match the base catalog entry (gpt-6-luna)
+        let mut tails = vec![t.clone()];
+        let nt = norm(&t);
+        if nt != t {
+            tails.push(nt);
+        }
         match provider {
             // a known provider is priced strictly by its own catalog entry
             Some(p) => {
                 for cand in provider_candidates(p) {
-                    if let Some(pr) = self
-                        .local_by_provider
-                        .get(&format!("{}/{}", cand, t))
-                    {
-                        return Some(*pr);
+                    for tail in &tails {
+                        if let Some(pr) = self
+                            .local_by_provider
+                            .get(&format!("{}/{}", cand, tail))
+                        {
+                            return Some(*pr);
+                        }
                     }
                 }
                 None
@@ -193,6 +216,7 @@ impl Pricing {
             ("opus", "claude-opus-4-5"),
             ("sonnet", "claude-sonnet-4-5"),
             ("haiku", "claude-haiku-4-5"),
+            ("gpt-oss", "groq/openai/gpt-oss-120b"),
             ("gpt-5-nano", "gpt-5-nano"),
             ("gpt-5-mini", "gpt-5-mini"),
             ("gpt-5", "gpt-5"),
@@ -279,6 +303,25 @@ fn provider_candidates(provider: &str) -> Vec<String> {
             out.push("opencode".to_string());
         }
         "openai-codex" => out.push("openai".to_string()),
+        // user-defined routes that re-serve known catalog models under the
+        // same ids (verified identical prices across the aliased providers)
+        "custom" => {
+            out.push("opencode-go".to_string());
+            out.push("opencode".to_string());
+            out.push("meta".to_string());
+        }
+        "codex" => {
+            out.push("openai-codex".to_string());
+            out.push("openai".to_string());
+        }
+        "opencode2dsh" => out.push("opencode".to_string()),
+        "google-antigravity" => out.push("antigravity".to_string()),
+        "codex-router" => {
+            out.push("custom".to_string());
+            out.push("opencode-go".to_string());
+            out.push("opencode".to_string());
+            out.push("meta".to_string());
+        }
         _ => {}
     }
     out.dedup();

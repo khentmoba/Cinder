@@ -11,7 +11,7 @@ let chart = null;            // last drawn chart geometry, for the hover tooltip
 
 const AGENT_COLORS = {
   'Codex': '#e8e8ea', 'Pi': '#4da3ff', 'OpenCode': '#3fb950', 'Claude Code': '#d29922',
-  'Antigravity': '#a371f7', 'T3': '#f0883e', 'Cursor': '#9aa0a6'
+  'Antigravity': '#a371f7', 'T3': '#f0883e', 'DSH': '#f778ba', 'LM Studio': '#6e56cf', 'Cursor': '#9aa0a6'
 };
 const color = a => AGENT_COLORS[a] || '#7d8590';
 
@@ -104,10 +104,10 @@ function acc(r, a) {
 const tok = a => a.input + a.cache_read + a.cache_write + a.output;
 
 // One accessor per metric, so every panel (hero, agent list, chart, breakdown,
-// tooltip) reads the same number. Antigravity logs carry no token or cost field
-// anywhere -- not in the transcripts, not in the conversation db -- so a
-// tokens/cost-only UI renders it as a row of zeros and a flat line pinned to the
-// baseline: "no data", even though requests and tool calls were collected fine.
+// tooltip) reads the same number. Older Antigravity IDE transcripts carry no
+// token or cost field, so a tokens/cost-only UI renders those rows as zeros and
+// a flat line pinned to the baseline: switch to the requests metric to see
+// them. Newer CLI transcripts do report tokens and are priced like the rest.
 const METRICS = {
   cost:     { label: 'cost',     get: a => a.cost,     fmt: (n, known) => fmtUsd(n, known) },
   tokens:   { label: 'tokens',   get: tok,             fmt: n => fmtTok(n) },

@@ -8,7 +8,7 @@ mod pricing;
 
 use pricing::Pricing;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -339,8 +339,11 @@ fn parse_pi(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Sess, pl
 
 // ---------------- Codex ----------------
 fn parse_codex(home: &Path, pricing: &Pricing, ratios: &mut CacheRatios, rows: &mut Rows, sess: &mut Sess, limits: &mut Vec<LimitRow>) -> u64 {
-    let root = home.join(".codex").join("sessions");
-    let files = list_files(&root, "jsonl", None);
+    let mut files = list_files(&home.join(".codex").join("sessions"), "jsonl", None);
+    // Retired rollouts keep the same schema; without them old usage goes missing.
+    // (Own session ids are unique per file — forks share only the parent id —
+    // so every file is parsed; verified zero overlap between the two roots.)
+    files.extend(list_files(&home.join(".codex").join("archived_sessions"), "jsonl", None));
     for file in &files {
         let mut model = String::from("unknown");
         let mut day = String::new();
@@ -666,7 +669,7 @@ fn parse_opencode(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Se
 }
 
 // ---------------- Antigravity ----------------
-fn parse_antigravity(home: &Path, rows: &mut Rows, sess: &mut Sess) -> u64 {
+fn parse_antigravity(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Sess) -> u64 {
     let mut dbs = 0u64;
     for variant in ["antigravity", "antigravity-cli"] {
         let conv = home.join(".gemini").join(variant).join("conversations");
@@ -682,6 +685,9 @@ fn parse_antigravity(home: &Path, rows: &mut Rows, sess: &mut Sess) -> u64 {
                 .unwrap_or_default();
             session(sess, "Antigravity", &mtime_day);
             let mut model = String::from("unknown");
+            // Transcript tails sometimes repeat the final steps; dedupe by step
+            // index so a re-appended tail does not double-count requests.
+            let mut seen_steps = std::collections::HashSet::new();
             each_line(file, |line| {
                 if !has_key(line, AGY_KEYS) {
                     return;
@@ -692,26 +698,55 @@ fn parse_antigravity(home: &Path, rows: &mut Rows, sess: &mut Sess) -> u64 {
                         let rest = &content[idx..];
                         if let Some(to) = rest.find(" to ") {
                             let tail = &rest[to + 4..];
-                            if let Some(end) = tail.find('.') {
-                                let m = tail[..end].trim();
-                                if !m.is_empty() && m != "None" {
-                                    model = m.to_string();
-                                }
+                            // The model name ends at the sentence boundary, not the
+                            // first dot: "Claude Opus 4.6 (Thinking). ..." must not
+                            // truncate to "Claude Opus 4".
+                            let end = tail
+                                .find(". ")
+                                .map(|i| i + 1)
+                                .or_else(|| tail.strip_suffix('.').map(|s| s.len()))
+                                .unwrap_or_else(|| {
+                                    tail.find('\n').unwrap_or(tail.len())
+                                });
+                            let m = tail[..end].trim().trim_end_matches('.').trim();
+                            if !m.is_empty() && m != "None" {
+                                model = pricing::normalize_model(m);
                             }
                         }
                     }
                 }
                 if v.get("type").and_then(|t| t.as_str()) == Some("PLANNER_RESPONSE") {
+                    if let Some(si) = v.get("step_index").and_then(|x| x.as_i64()) {
+                        if !seen_steps.insert(si) {
+                            return;
+                        }
+                    }
                     let tools = v.get("tool_calls").and_then(|t| t.as_array()).map(|a| a.len() as u64).unwrap_or(0);
+                    // Newer (CLI) transcripts report per-response tokens; older IDE
+                    // ones carry no token fields anywhere, so these stay zero there.
+                    let input = v.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                    let cache_read = v.get("cache_read_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                    let output = v.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
                     let ts = v.get("created_at").and_then(|t| t.as_str()).unwrap_or("");
-                    let r = Row {
+                    let mut r = Row {
                         day: day_of(ts),
                         agent: "Antigravity".into(),
                         model: model.clone(),
                         requests: 1,
+                        input,
+                        cache_read,
+                        output,
                         tools,
                         ..Default::default()
                     };
+                    if input + output + cache_read > 0 {
+                        if let Some(pr) = pricing.lookup(model_provider(&model), &model) {
+                            r.cost = pr.cost(input, cache_read, 0, output);
+                            r.cost_known = true;
+                            r.savings = pr.savings(cache_read, 0);
+                        }
+                    }
+                    if r.day.is_empty() { r.day = mtime_day.clone(); }
                     add(rows, sess, "Antigravity", &model, &r.day.clone(), r);
                 }
             });
@@ -730,6 +765,553 @@ fn parse_antigravity(home: &Path, rows: &mut Rows, sess: &mut Sess) -> u64 {
         }
     }
     dbs
+}
+
+// ---------------- T3 (Antigravity backend) ----------------
+// T3 drives Antigravity conversations of its own under
+// ~/.t3/userdata/providers/antigravity/*/antigravity-acp/. Same engine, same
+// transcript schema, so these rows count as Antigravity. T3 never switches
+// models mid-transcript, so the model is the dominant one in the sibling
+// conversation db's gen_metadata.
+fn t3_conv_db(file: &Path) -> Option<PathBuf> {
+    // .../antigravity-acp/brain/<conv>/.system_generated/logs/transcript.jsonl
+    let conv = file.parent()?.parent()?.parent()?;
+    let brain = conv.parent()?;
+    let acp = brain.parent()?;
+    if brain.file_name().and_then(|f| f.to_str()) != Some("brain") {
+        return None;
+    }
+    let id = conv.file_name()?.to_str()?;
+    Some(acp.join("conversations").join(format!("{}.db", id)))
+}
+
+/// Dominant model id across a conversation db's gen_metadata blobs, e.g.
+/// "gemini-3.8-flash-high". Requires a vendor hint plus a digit so prompt
+/// boilerplate ("disable-teamwork-forced-flash-model") never matches; the
+/// most frequent candidate wins so one-off binary artifacts glued to a real
+/// id ("highh") can never beat the id itself. One conversation uses one
+/// model, so per-response mapping is unnecessary.
+fn agy_db_model(db: &Path) -> String {
+    let Ok(conn) = rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return "unknown".into();
+    };
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    let Ok(mut stmt) = conn.prepare("SELECT data FROM gen_metadata ORDER BY idx") else {
+        return "unknown".into();
+    };
+    let Ok(rows) = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0)) else {
+        return "unknown".into();
+    };
+    let mut votes: HashMap<String, u64> = HashMap::new();
+    for blob in rows.flatten() {
+        let mut cur = Vec::new();
+        let mut consider = |cur: &[u8]| {
+            if cur.len() >= 8 {
+                if let Ok(s) = std::str::from_utf8(cur) {
+                    let t = s.trim_matches(|c| c == '.' || c == '-' || c == '_');
+                    let l = t.to_lowercase();
+                    let vendor = l.contains("gemini") || l.contains("claude") || l.contains("gpt") || l.contains("opus") || l.contains("sonnet");
+                    if vendor && l.bytes().any(|b| b.is_ascii_digit()) {
+                        *votes.entry(t.to_string()).or_insert(0) += 1;
+                    }
+                }
+            }
+        };
+        for &b in &blob {
+            if b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-' {
+                cur.push(b);
+            } else {
+                consider(&cur);
+                cur.clear();
+            }
+        }
+        consider(&cur);
+    }
+    votes.into_iter().max_by(|a, b| a.1.cmp(&b.1).then(a.0.len().cmp(&b.0.len()))).map(|(m, _)| m).unwrap_or_else(|| "unknown".into())
+}
+
+fn parse_t3(home: &Path, rows: &mut Rows, sess: &mut Sess) -> u64 {
+    let prov = home.join(".t3").join("userdata").join("providers").join("antigravity");
+    let Ok(top) = fs::read_dir(&prov) else { return 0 };
+    let mut files = Vec::new();
+    for e in top.flatten() {
+        let brain = e.path().join("antigravity-acp").join("brain");
+        files.extend(list_files(&brain, "jsonl", Some("transcript.jsonl")));
+    }
+    for file in &files {
+        let model = pricing::normalize_model(&t3_conv_db(file).map(|db| agy_db_model(&db)).unwrap_or_else(|| "unknown".into()));
+        let mtime_day = fs::metadata(file)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| unix_day(d.as_secs() as i64))
+            .unwrap_or_default();
+        session(sess, "Antigravity", &mtime_day);
+        let mut seen_steps = HashSet::new();
+        each_line(file, |line| {
+            if !has_key(line, AGY_KEYS) {
+                return;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return };
+            if v.get("type").and_then(|t| t.as_str()) != Some("PLANNER_RESPONSE") {
+                return;
+            }
+            if let Some(si) = v.get("step_index").and_then(|x| x.as_i64()) {
+                if !seen_steps.insert(si) {
+                    return;
+                }
+            }
+            // T3 transcripts carry no token fields; requests + tools only.
+            let tools = v.get("tool_calls").and_then(|t| t.as_array()).map(|a| a.len() as u64).unwrap_or(0);
+            let ts = v.get("created_at").and_then(|t| t.as_str()).unwrap_or("");
+            let mut r = Row {
+                day: day_of(ts),
+                agent: "Antigravity".into(),
+                model: model.clone(),
+                requests: 1,
+                tools,
+                ..Default::default()
+            };
+            if r.day.is_empty() { r.day = mtime_day.clone(); }
+            add(rows, sess, "Antigravity", &model, &r.day.clone(), r);
+        });
+    }
+    // Conversation DBs without transcripts (assistant ran, logs rotated away):
+    // read the steps table directly. step_type 15 is an assistant response;
+    // its tool calls show up as toolu_ ids in the payload blob.
+    let mut with_transcript = HashSet::new();
+    for file in &files {
+        if let Some(db) = t3_conv_db(file) {
+            if let Some(id) = db.file_stem().and_then(|s| s.to_str()) {
+                with_transcript.insert(id.to_string());
+            }
+        }
+    }
+    let mut dbs = files.len() as u64;
+    // (re-read: the first directory listing was already consumed above)
+    let Ok(top2) = fs::read_dir(&prov) else { return dbs };
+    for e in top2.flatten() {
+        let conv = e.path().join("antigravity-acp").join("conversations");
+        for db in list_files(&conv, "db", None) {
+            let id = db.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
+            if with_transcript.contains(&id) {
+                continue;
+            }
+            dbs += 1;
+            let model = pricing::normalize_model(&agy_db_model(&db));
+            let mtime_day = fs::metadata(&db)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| unix_day(d.as_secs() as i64))
+                .unwrap_or_default();
+            session(sess, "Antigravity", &mtime_day);
+            let Ok(conn) = rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else { continue };
+            let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+            // Assistant responses carry the day + model order; tool calls live
+            // in their own steps (types 21/25/38/103: one call_* id each).
+            let Ok(mut stmt) = conn.prepare("SELECT step_type, metadata FROM steps ORDER BY idx") else { continue };
+            let Ok(steps) = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))) else { continue };
+            let mut day_model: Vec<(String, String)> = Vec::new();
+            let mut tools_per_day: HashMap<String, u64> = HashMap::new();
+            for step in steps.flatten() {
+                let (st, meta) = step;
+                let mut d = agy_step_day(&meta);
+                if d.is_empty() { d = mtime_day.clone(); }
+                if st == 15 {
+                    day_model.push((d, model.clone()));
+                } else if st == 21 || st == 25 || st == 38 || st == 103 {
+                    *tools_per_day.entry(d).or_insert(0) += 1;
+                }
+            }
+            for (d, model) in &day_model {
+                add(rows, sess, "Antigravity", model, d, Row {
+                    day: d.clone(),
+                    agent: "Antigravity".into(),
+                    model: model.clone(),
+                    requests: 1,
+                    ..Default::default()
+                });
+            }
+            for (d, n) in &tools_per_day {
+                let model = day_model.iter().find(|(dd, _)| dd == d).map(|(_, m)| m.clone()).unwrap_or_else(|| "unknown".into());
+                add(rows, sess, "Antigravity", &model, d, Row {
+                    day: d.clone(),
+                    agent: "Antigravity".into(),
+                    model: model.clone(),
+                    tools: *n,
+                    ..Default::default()
+                });
+            }
+        }
+    }
+    dbs
+}
+
+// T3 keeps exact per-turn token usage in its local orchestration database.
+// The Antigravity route is recorded as a model id (antigravity/<model>), even
+// when the provider adapter is Pi. Public API prices are used only for Cinder's
+// API estimate; Antigravity's subscription charge is not exposed here.
+fn parse_t3_usage(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Sess) -> bool {
+    let db = home.join(".t3").join("userdata").join("statev2.sqlite");
+    let Ok(conn) = rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return false;
+    };
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    // Model selection is per run; a provider session can be reused after a model change.
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT t.provider_thread_id, t.started_at, t.payload_json, r.payload_json
+         FROM orchestration_v2_projection_provider_turns t
+         JOIN orchestration_v2_projection_run_attempts a ON a.attempt_id = t.run_attempt_id
+         JOIN orchestration_v2_projection_runs r ON r.run_id = a.run_id",
+    ) else {
+        return false;
+    };
+    let Ok(turns) = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+        ))
+    }) else {
+        return false;
+    };
+
+    let mut thread_days: HashMap<String, String> = HashMap::new();
+    for turn in turns.flatten() {
+        let (thread_id, started_at, payload, run_payload) = turn;
+        let Ok(run) = serde_json::from_str::<serde_json::Value>(&run_payload) else { continue };
+        let Some(raw_model) = run
+            .get("modelSelection")
+            .and_then(|m| m.get("model"))
+            .and_then(|m| m.as_str())
+        else {
+            continue;
+        };
+        let model = pricing::normalize_model(raw_model);
+        if !model.to_lowercase().starts_with("antigravity/") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) else { continue };
+        let Some(usage) = v.get("tokenUsage") else { continue };
+        let input = usage.get("inputTokens").and_then(|x| x.as_u64()).unwrap_or(0);
+        let cache_read = usage.get("cachedInputTokens").and_then(|x| x.as_u64()).unwrap_or(0);
+        let output = usage.get("outputTokens").and_then(|x| x.as_u64()).unwrap_or(0);
+        let reasoning = usage.get("reasoningOutputTokens").and_then(|x| x.as_u64()).unwrap_or(0);
+        if input + cache_read + output == 0 {
+            continue;
+        }
+
+        let day = day_of(&started_at);
+        let day = if day.is_empty() {
+            usage
+                .get("updatedAt")
+                .and_then(|x| x.as_str())
+                .map(day_of)
+                .unwrap_or_default()
+        } else {
+            day
+        };
+        if !day.is_empty() {
+            thread_days
+                .entry(thread_id)
+                .and_modify(|first| {
+                    if day.as_str() < first.as_str() {
+                        *first = day.clone();
+                    }
+                })
+                .or_insert_with(|| day.clone());
+        }
+        let mut r = Row {
+            day: day.clone(),
+            agent: "Antigravity".into(),
+            model: model.clone(),
+            requests: 1,
+            input,
+            cache_read,
+            output,
+            reasoning,
+            ..Default::default()
+        };
+        if let Some(pr) = pricing.lookup(None, &model) {
+            r.cost = pr.cost(input, cache_read, 0, output);
+            r.cost_known = true;
+            r.savings = pr.savings(cache_read, 0);
+        }
+        add(rows, sess, "Antigravity", &model, &day, r);
+    }
+    for day in thread_days.values() {
+        session(sess, "Antigravity", day);
+    }
+    true
+}
+
+/// Step timestamp: metadata is a protobuf whose field 1 holds an inner message
+/// with the unix-seconds timestamp as its field 1 varint.
+fn agy_step_day(meta: &[u8]) -> String {
+    let varint = |pos: &mut usize| -> Option<u64> {
+        let mut v = 0u64;
+        let mut shift = 0;
+        while *pos < meta.len() {
+            let b = meta[*pos];
+            *pos += 1;
+            v |= ((b & 0x7F) as u64) << shift;
+            shift += 7;
+            if b & 0x80 == 0 {
+                return Some(v);
+            }
+            if shift > 70 {
+                return None;
+            }
+        }
+        None
+    };
+    if meta.first() == Some(&0x0A) {
+        let mut pos = 1;
+        let len = varint(&mut pos).unwrap_or(0) as usize;
+        let end = pos + len;
+        if end <= meta.len() && meta.get(pos) == Some(&0x08) {
+            pos += 1;
+            if let Some(ts) = varint(&mut pos) {
+                if ts >= 1_700_000_000 && ts < 2_000_000_000 {
+                    return unix_day(ts as i64);
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+// ---------------- DSH ----------------
+// ~/.dsh/sessions/**/session.v4.jsonl.zstd: zstd-compressed JSONL, one object
+// per line. assistant/message lines are the requests (content items of type
+// "tool-call" are the tool calls) and carry data.usage with Pi-style token
+// counts: inputTokens excludes cacheReadTokens, total = the parts summed.
+fn ms_day(ms: i64) -> String {
+    if ms <= 0 {
+        return String::new();
+    }
+    unix_day(ms / 1000)
+}
+
+fn parse_dsh(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Sess) -> u64 {
+    let root = home.join(".dsh").join("sessions");
+    let mut files = Vec::new();
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        if let Ok(rd) = fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.file_name().and_then(|f| f.to_str()).map(|f| f.ends_with(".jsonl.zstd")).unwrap_or(false) {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    walk(&root, &mut files);
+    for file in &files {
+        let Ok(f) = fs::File::open(file) else { continue };
+        let Ok(bytes) = zstd::stream::decode_all(f) else { continue };
+        let text = String::from_utf8_lossy(&bytes);
+        let mut model = String::from("unknown");
+        let mut day = String::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            match v.get("type").and_then(|t| t.as_str()) {
+                Some("session") => {
+                    if let Some(ms) = v.get("createdAt").and_then(|x| x.as_i64()) {
+                        day = ms_day(ms);
+                    }
+                    session(sess, "DSH", &day);
+                }
+                Some("model/selection") => {
+                    if let Some(d) = v.get("data") {
+                        let p = d.get("provider").and_then(|x| x.as_str()).unwrap_or("");
+                        let m = d.get("model").and_then(|x| x.as_str()).unwrap_or("");
+                        if !m.is_empty() {
+                            let full = if p.is_empty() { m.to_string() } else { format!("{}/{}", p, m) };
+                            model = pricing::normalize_model(&full);
+                        }
+                    }
+                }
+                Some("assistant/message") => {
+                    let ts = v.get("time").and_then(|x| x.as_i64()).unwrap_or(0);
+                    let mut tools = 0u64;
+                    let mut m = model.clone();
+                    let mut input = 0u64;
+                    let mut output = 0u64;
+                    let mut cache_read = 0u64;
+                    let mut cache_write = 0u64;
+                    let mut reasoning = 0u64;
+                    if let Some(d) = v.get("data") {
+                        if let Some(content) = d.get("message").and_then(|x| x.get("content")).and_then(|x| x.as_array()) {
+                            for item in content {
+                                if item.get("type").and_then(|t| t.as_str()) == Some("tool-call") {
+                                    tools += 1;
+                                }
+                            }
+                        }
+                        if let Some(src) = d.get("message").and_then(|x| x.get("source")) {
+                            let p = src.get("provider").and_then(|x| x.as_str()).unwrap_or("");
+                            let mm = src.get("model").and_then(|x| x.as_str()).unwrap_or("");
+                            if !mm.is_empty() {
+                                let full = if p.is_empty() { mm.to_string() } else { format!("{}/{}", p, mm) };
+                                m = pricing::normalize_model(&full);
+                            }
+                        }
+                        if let Some(u) = d.get("usage") {
+                            input = u.get("inputTokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                            output = u.get("outputTokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                            cache_read = u.get("cacheReadTokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                            cache_write = u.get("cacheWriteTokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                            reasoning = u.get("reasoningTokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                        }
+                    }
+                    let d = ms_day(ts);
+                    let d = if d.is_empty() { day.clone() } else { d };
+                    let mut r = Row {
+                        day: d.clone(),
+                        agent: "DSH".into(),
+                        model: m.clone(),
+                        requests: 1,
+                        input,
+                        cache_read,
+                        cache_write,
+                        output,
+                        reasoning,
+                        tools,
+                        ..Default::default()
+                    };
+                    if input + output + cache_read + cache_write > 0 {
+                        if let Some(pr) = pricing.lookup(model_provider(&m), &m) {
+                            r.cost = pr.cost(input, cache_read, cache_write, output);
+                            r.cost_known = true;
+                            r.savings = pr.savings(cache_read, cache_write);
+                        }
+                    }
+                    add(rows, sess, "DSH", &m, &d, r);
+                }
+                _ => {}
+            }
+        }
+    }
+    files.len() as u64
+}
+
+// ---------------- LM Studio ----------------
+// ~/.lmstudio/conversations/*.conversation.json gives requests + sessions +
+// the model (gguf stem from indexedModelIdentifier). tokenCount there is the
+// live context size at save time, NOT cumulative usage, so it is ignored.
+// Real per-prediction tokens come from ~/.lmstudio/server-logs/**/*.log:
+//   prompt eval time = ... / N tokens   -> input
+//         eval time = ... / N tokens   -> output
+// Only the first line of each burst carries a [date] prefix; the rest
+// inherit the day, and predictions inherit the last loaded model.
+// Local inference has no price: tokens are recorded, cost stays unknown.
+fn lms_stem(path: &str) -> String {
+    let base = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let base = base.strip_suffix(".gguf").or_else(|| base.strip_suffix(".GGUF")).unwrap_or(base);
+    pricing::normalize_model(base)
+}
+
+/// (is_prompt, n) for a slot print_timing line, else None.
+fn lms_tokens(line: &str) -> Option<(bool, u64)> {
+    let prompt = line.contains("prompt eval time");
+    if !prompt && !line.contains("eval time") {
+        return None;
+    }
+    let mi = line.find("eval time")? + "eval time".len();
+    let rest = &line[mi..];
+    let slash = rest.find('/')?;
+    let num: String = rest[slash + 1..].trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+    Some((prompt, num.parse().ok()?))
+}
+
+fn parse_lmstudio(home: &Path, rows: &mut Rows, sess: &mut Sess) -> u64 {
+    let dir = home.join(".lmstudio").join("conversations");
+    let files: Vec<PathBuf> = list_files(&dir, "json", None)
+        .into_iter()
+        .filter(|p| p.file_name().and_then(|f| f.to_str()).map(|f| f.ends_with(".conversation.json")).unwrap_or(false))
+        .collect();
+    for file in &files {
+        let Ok(text) = fs::read_to_string(file) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+        let day = v.get("createdAt").and_then(|x| x.as_i64()).map(ms_day).unwrap_or_default();
+        let model = v.get("lastUsedModel").and_then(|m| m.get("indexedModelIdentifier")).and_then(|x| x.as_str()).map(lms_stem).unwrap_or_else(|| {
+            v.get("lastUsedModel").and_then(|m| m.get("identifier")).and_then(|x| x.as_str()).map(pricing::normalize_model).unwrap_or_else(|| "unknown".into())
+        });
+        let mut requests = 0u64;
+        if let Some(msgs) = v.get("messages").and_then(|x| x.as_array()) {
+            for m in msgs {
+                let sel = m.get("currentlySelected").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+                if let Some(ver) = m.get("versions").and_then(|x| x.as_array()).and_then(|a| a.get(sel)) {
+                    if ver.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+                        requests += 1;
+                    }
+                }
+            }
+        }
+        session(sess, "LM Studio", &day);
+        if requests > 0 {
+            add(rows, sess, "LM Studio", &model, &day, Row {
+                day: day.clone(),
+                agent: "LM Studio".into(),
+                model: model.clone(),
+                requests,
+                ..Default::default()
+            });
+        }
+    }
+    let mut logs = list_files(&home.join(".lmstudio").join("server-logs"), "log", None);
+    // Chronological order, one shared state: a rotated log continues the
+    // previous file's tasks without repeating the load_model line.
+    logs.sort();
+    let mut day = String::new();
+    let mut model = String::from("unknown");
+    for file in &logs {
+        each_line(file, |line| {
+            if line.starts_with('[') && line.len() > 11 && line.as_bytes().get(11) == Some(&b' ') {
+                let d = day_of(&line[1..]);
+                if d.len() == 10 {
+                    day = d;
+                }
+            }
+            if line.contains("load_model") && line.contains(".gguf") {
+                if let Some(i) = line.find("loading model") {
+                    let rest = &line[i + "loading model".len()..];
+                    let path = rest.trim().trim_matches('\'').trim_matches('"');
+                    let stem = lms_stem(path.split_whitespace().next().unwrap_or(path));
+                    if stem != "unknown" {
+                        model = stem;
+                    }
+                }
+            }
+            if let Some((is_prompt, n)) = lms_tokens(line) {
+                if day.is_empty() || model == "unknown" || n == 0 {
+                    return;
+                }
+                let mut r = Row {
+                    day: day.clone(),
+                    agent: "LM Studio".into(),
+                    model: model.clone(),
+                    ..Default::default()
+                };
+                if is_prompt {
+                    r.input = n;
+                } else {
+                    r.output = n;
+                }
+                add(rows, sess, "LM Studio", &model, &day, r);
+            }
+        });
+    }
+    (files.len() + logs.len()) as u64
 }
 
 fn unix_day(secs: i64) -> String {
@@ -782,7 +1364,15 @@ fn scan(progress: &dyn Fn(&str)) -> Stats {
     progress("OpenCode database");
     let opencode_n = parse_opencode(&home, &pricing, &mut rows, &mut sess);
     progress("Antigravity logs");
-    let agy_dbs = parse_antigravity(&home, &mut rows, &mut sess);
+    let agy_dbs = parse_antigravity(&home, &pricing, &mut rows, &mut sess);
+    progress("T3 logs");
+    let t3_files = parse_t3(&home, &mut rows, &mut sess);
+    progress("T3 usage database");
+    let t3_usage_db = parse_t3_usage(&home, &pricing, &mut rows, &mut sess);
+    progress("DSH logs");
+    let dsh_files = parse_dsh(&home, &pricing, &mut rows, &mut sess);
+    progress("LM Studio logs");
+    let lms_files = parse_lmstudio(&home, &mut rows, &mut sess);
     ratios.learn(&rows);
 
     progress("Codex logs");
@@ -791,10 +1381,17 @@ fn scan(progress: &dyn Fn(&str)) -> Stats {
 
     let sources = vec![
         Source { agent: "Pi".into(), path: "~/.pi/agent/sessions".into(), found: pi_files > 0, files: pi_files },
-        Source { agent: "Codex".into(), path: "~/.codex/sessions".into(), found: codex_files > 0, files: codex_files },
+        Source { agent: "Codex".into(), path: "~/.codex/sessions + archived_sessions".into(), found: codex_files > 0, files: codex_files },
         Source { agent: "Claude Code".into(), path: "~/.claude/projects".into(), found: claude_files > 0, files: claude_files },
         Source { agent: "OpenCode".into(), path: "~/.local/share/opencode/opencode.db".into(), found: opencode_n > 0, files: opencode_n },
-        Source { agent: "Antigravity".into(), path: "~/.gemini/antigravity*/conversations".into(), found: agy_dbs > 0, files: agy_dbs },
+        Source {
+            agent: "Antigravity".into(),
+            path: "~/.gemini/antigravity* + ~/.t3/userdata/statev2.sqlite + providers/antigravity/*/antigravity-acp".into(),
+            found: agy_dbs + t3_files > 0 || t3_usage_db,
+            files: agy_dbs + t3_files + (t3_usage_db as u64),
+        },
+        Source { agent: "DSH".into(), path: "~/.dsh/sessions".into(), found: dsh_files > 0, files: dsh_files },
+        Source { agent: "LM Studio".into(), path: "~/.lmstudio/conversations".into(), found: lms_files > 0, files: lms_files },
     ];
 
     let mut rows: Vec<Row> = rows.into_values().collect();
@@ -867,17 +1464,35 @@ fn spawn_log_watcher(app: AppHandle) {
             Err(_) => return,
         };
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        let roots: Vec<(PathBuf, RecursiveMode)> = vec![
+        let mut roots: Vec<(PathBuf, RecursiveMode)> = vec![
             (home.join(".pi").join("agent").join("sessions"), RecursiveMode::Recursive),
             (home.join(".codex").join("sessions"), RecursiveMode::Recursive),
+            (home.join(".codex").join("archived_sessions"), RecursiveMode::Recursive),
             (home.join(".claude").join("projects"), RecursiveMode::Recursive),
             (home.join(".gemini").join("antigravity"), RecursiveMode::Recursive),
             (home.join(".gemini").join("antigravity-cli"), RecursiveMode::Recursive),
-            // Non-recursive: the db/wal/shm files live here, and this skips the
-            // heavy log/repos/snapshot subtrees (WAL writes hit the -wal file,
-            // so the directory itself — not just opencode.db — must be watched).
-            (home.join(".local").join("share").join("opencode"), RecursiveMode::NonRecursive),
+            (home.join(".dsh").join("sessions"), RecursiveMode::Recursive),
+            (home.join(".lmstudio").join("conversations"), RecursiveMode::NonRecursive),
+            (home.join(".lmstudio").join("server-logs"), RecursiveMode::Recursive),
+            // Non-recursive so statev2.sqlite and its WAL trigger live refreshes
+            // without watching T3's unrelated logs and conversation trees.
+            (home.join(".t3").join("userdata"), RecursiveMode::NonRecursive),
         ];
+        // T3's own Antigravity workspaces; enumerated so the watcher does not
+        // descend into the unrelated codex shadow copies next to them.
+        let t3prov = home.join(".t3").join("userdata").join("providers").join("antigravity");
+        if let Ok(top) = fs::read_dir(&t3prov) {
+            for e in top.flatten() {
+                let acp = e.path().join("antigravity-acp");
+                if acp.exists() {
+                    roots.push((acp, RecursiveMode::Recursive));
+                }
+            }
+        }
+        // Non-recursive: the db/wal/shm files live here, and this skips the
+        // heavy log/repos/snapshot subtrees (WAL writes hit the -wal file,
+        // so the directory itself — not just opencode.db — must be watched).
+        roots.push((home.join(".local").join("share").join("opencode"), RecursiveMode::NonRecursive));
         let mut watching = 0;
         for (p, mode) in &roots {
             if p.exists() && watcher.watch(p, *mode).is_ok() {

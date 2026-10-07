@@ -32,10 +32,13 @@ watcher through a shared scan lock.
 | Codex | `~/.codex/sessions/**/*.jsonl` | requests, tokens, tools, models; cost estimated |
 | Claude Code | `~/.claude/projects/**/*.jsonl` | requests, tokens, tools, models; cost estimated |
 | OpenCode | `~/.local/share/opencode/opencode.db` | sessions, tokens, cost, tool calls |
-| Antigravity | `~/.gemini/antigravity*/` (transcripts + conversation DB) | requests, tool calls, sessions (no token/cost) |
+| Antigravity | `~/.gemini/antigravity*/` + T3 `~/.t3/userdata/statev2.sqlite` and `~/.t3/userdata/providers/antigravity/*/antigravity-acp` | requests, tools, sessions, T3-reported tokens; API cost estimated |
+| DSH | `~/.dsh/sessions/**/session.v4.jsonl.zstd` | requests, tokens, tools, sessions, models; cost estimated |
+| LM Studio | `~/.lmstudio/conversations/*.conversation.json` | requests, sessions, models (no token/cost) |
 
-Agents that log no token or cost field (Antigravity today) are still fully
-visible: use the **Requests** metric. Cost/tokens views show a `—` for them by
-design, so the agent list also prints the request count next to the cost.
+Agents that log no token or cost field (older Antigravity IDE transcripts) are
+still fully visible: use the **Requests** metric. Cost/tokens views show a `—`
+for them by design, so the agent list also prints the request count next to
+the cost.
 
 Add agents by extending `parse_*` functions in `src-tauri/src/main.rs`.
