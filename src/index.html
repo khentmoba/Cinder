@@ -22,6 +22,10 @@
         <button data-v="30">30 days</button>
         <button data-v="90" class="on">90 days</button>
       </div>
+      <button id="updateBadge" class="update-badge" hidden title="Update available">
+        <span class="update-dot"></span>
+        <span id="updateBadgeText">Update</span>
+      </button>
       <button id="refresh" class="icon" title="Refresh">&#8635;</button>
     </div>
   </header>
@@ -60,9 +64,69 @@
   </main>
 
   <footer>
-    <span id="status">loading…</span>
-    <span id="priceinfo"></span>
+    <div class="footer-left">
+      <span id="status">loading…</span>
+      <span id="updateStatusText" class="update-status-link" title="Click to view update" hidden></span>
+    </div>
+    <div class="footer-right">
+      <span id="priceinfo"></span>
+      <span id="appVersion" class="app-version" title="Click to check for updates">v0.1.0</span>
+    </div>
   </footer>
+
+  <div id="updateModal" class="modal-backdrop" hidden>
+    <div class="modal-card">
+      <div class="modal-header">
+        <div class="modal-title-group">
+          <span class="modal-title">Cinder Update</span>
+          <span class="modal-tag" id="modalTag">v0.2.0</span>
+        </div>
+        <button id="modalCloseBtn" class="modal-close" title="Close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="update-meta">
+          <div class="meta-col">
+            <span class="meta-label">Current</span>
+            <span class="meta-val" id="updateCurrentVer">0.1.0</span>
+          </div>
+          <div class="meta-arrow">&rarr;</div>
+          <div class="meta-col">
+            <span class="meta-label">New Version</span>
+            <span class="meta-val highlight" id="updateNewVer">0.2.0</span>
+          </div>
+          <div class="meta-col right">
+            <span class="meta-label">Published</span>
+            <span class="meta-val" id="updateDate">—</span>
+          </div>
+        </div>
+
+        <div class="notes-section">
+          <div class="notes-header">Release Notes</div>
+          <div id="updateNotes" class="notes-body"></div>
+        </div>
+
+        <div id="updateProgressBox" class="progress-box" hidden>
+          <div class="progress-head">
+            <span id="progressLabel">Downloading update…</span>
+            <span id="progressPercent">0%</span>
+          </div>
+          <div class="progress-bar-bg">
+            <div id="progressBar" class="progress-bar-fill" style="width: 0%"></div>
+          </div>
+          <div class="progress-sub" id="progressSub">0 MB / 0 MB</div>
+        </div>
+
+        <div id="updateMsg" class="update-msg" hidden></div>
+      </div>
+      <div class="modal-footer">
+        <a id="modalGithubBtn" href="#" target="_blank" class="modal-btn secondary">View on GitHub</a>
+        <div class="modal-btns-right">
+          <button id="modalLaterBtn" class="modal-btn secondary">Later</button>
+          <button id="modalActionBtn" class="modal-btn primary">Update Now</button>
+        </div>
+      </div>
+    </div>
+  </div>
   <script src="main.js"></script>
 </body>
 </html>

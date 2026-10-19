@@ -5,6 +5,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod pricing;
+mod updater;
 
 use pricing::Pricing;
 use serde::Serialize;
@@ -1327,6 +1328,28 @@ fn scan_home(home: &Path, progress: &dyn Fn(&str)) -> Stats {
     }
 }
 
+#[tauri::command]
+async fn check_update() -> Result<updater::UpdateInfo, String> {
+    let current_version = env!("CARGO_PKG_VERSION");
+    let repo = std::env::var("CINDER_UPDATE_REPO")
+        .unwrap_or_else(|_| updater::DEFAULT_REPO.to_string());
+    updater::check_for_updates_impl(current_version, &repo).await
+}
+
+#[tauri::command]
+async fn download_and_install_update(
+    app: AppHandle,
+    download_url: String,
+    asset_name: Option<String>,
+) -> Result<(), String> {
+    updater::download_and_install_impl(app, download_url, asset_name).await
+}
+
+#[tauri::command]
+fn get_app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1334,7 +1357,12 @@ pub fn run() {
             spawn_log_watcher(app.handle().clone());
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_stats])
+        .invoke_handler(tauri::generate_handler![
+            get_stats,
+            check_update,
+            download_and_install_update,
+            get_app_version
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -1,5 +1,6 @@
 // Cinder UI: aggregates the per-day rows from the Rust collector.
-const invoke = () => (window.__TAURI__ ? window.__TAURI__.core.invoke('get_stats') : Promise.reject('not in Tauri'));
+const invokeCmd = (cmd, args) => (window.__TAURI__ ? window.__TAURI__.core.invoke(cmd, args) : Promise.reject('not in Tauri'));
+const invoke = () => invokeCmd('get_stats');
 
 let DATA = null;
 let LOADING = false;         // a scan is in flight
@@ -464,3 +465,217 @@ chartBox.addEventListener('pointerleave', chartLeave);
 document.getElementById('refresh').addEventListener('click', load);
 window.addEventListener('resize', () => DATA && metric !== 'limits' && renderChart(byAgent().list));
 load();
+
+// ---------- update system ----------
+let UPDATE_INFO = null;
+let UPDATE_DOWNLOADING = false;
+
+function fmtBytes(bytes) {
+  if (!bytes || bytes <= 0) return '0 B';
+  const k = 1024;
+  if (bytes >= k * k * k) return (bytes / (k * k * k)).toFixed(2) + ' GB';
+  if (bytes >= k * k) return (bytes / (k * k)).toFixed(1) + ' MB';
+  if (bytes >= k) return (bytes / k).toFixed(1) + ' KB';
+  return bytes + ' B';
+}
+
+function showUpdateModal(info, isUpToDateMessage = false) {
+  const modal = document.getElementById('updateModal');
+  if (!modal) return;
+
+  const tag = document.getElementById('modalTag');
+  const curVer = document.getElementById('updateCurrentVer');
+  const newVer = document.getElementById('updateNewVer');
+  const dateEl = document.getElementById('updateDate');
+  const notesEl = document.getElementById('updateNotes');
+  const ghLink = document.getElementById('modalGithubBtn');
+  const progressBox = document.getElementById('updateProgressBox');
+  const actionBtn = document.getElementById('modalActionBtn');
+  const msgEl = document.getElementById('updateMsg');
+  const metaBox = document.querySelector('.update-meta');
+  const notesSec = document.querySelector('.notes-section');
+
+  if (progressBox) progressBox.hidden = true;
+  if (msgEl) msgEl.hidden = true;
+
+  if (isUpToDateMessage || !info.available) {
+    if (tag) tag.textContent = 'Latest';
+    if (metaBox) metaBox.hidden = true;
+    if (notesSec) notesSec.hidden = true;
+    if (msgEl) {
+      msgEl.hidden = false;
+      msgEl.textContent = `You are on the latest version of Cinder (v${info.current_version}).`;
+    }
+    if (actionBtn) {
+      actionBtn.textContent = 'OK';
+      actionBtn.disabled = false;
+      actionBtn.onclick = hideUpdateModal;
+    }
+  } else {
+    if (metaBox) metaBox.hidden = false;
+    if (notesSec) notesSec.hidden = false;
+    if (tag) tag.textContent = 'v' + info.latest_version;
+    if (curVer) curVer.textContent = 'v' + info.current_version;
+    if (newVer) newVer.textContent = 'v' + info.latest_version;
+    if (dateEl) {
+      dateEl.textContent = info.published_at ? new Date(info.published_at).toLocaleDateString() : '—';
+    }
+    if (notesEl) {
+      notesEl.textContent = info.release_notes || 'No release notes provided.';
+    }
+    if (ghLink) ghLink.href = info.release_url || 'https://github.com/khentmoba/Cinder/releases';
+    if (actionBtn) {
+      actionBtn.textContent = 'Update Now';
+      actionBtn.disabled = false;
+      actionBtn.onclick = startUpdateDownload;
+    }
+  }
+
+  modal.hidden = false;
+}
+
+function hideUpdateModal() {
+  const modal = document.getElementById('updateModal');
+  if (modal) modal.hidden = true;
+}
+
+function updateProgressUI(downloaded, total, percent, finished) {
+  const progressBox = document.getElementById('updateProgressBox');
+  const bar = document.getElementById('progressBar');
+  const pct = document.getElementById('progressPercent');
+  const label = document.getElementById('progressLabel');
+  const sub = document.getElementById('progressSub');
+
+  if (progressBox) progressBox.hidden = false;
+  const clamped = Math.min(100, Math.max(0, percent));
+  if (bar) bar.style.width = clamped + '%';
+  if (pct) pct.textContent = Math.round(clamped) + '%';
+  if (sub) sub.textContent = `${fmtBytes(downloaded)} / ${total > 0 ? fmtBytes(total) : 'unknown'}`;
+
+  if (finished) {
+    if (label) label.textContent = 'Installing update and restarting Cinder…';
+    if (pct) pct.textContent = '100%';
+    if (bar) bar.style.width = '100%';
+  }
+}
+
+async function startUpdateDownload() {
+  if (UPDATE_DOWNLOADING || !UPDATE_INFO) return;
+  if (!UPDATE_INFO.download_url) {
+    if (UPDATE_INFO.release_url) window.open(UPDATE_INFO.release_url, '_blank');
+    return;
+  }
+
+  UPDATE_DOWNLOADING = true;
+  const actionBtn = document.getElementById('modalActionBtn');
+  const progressBox = document.getElementById('updateProgressBox');
+  const label = document.getElementById('progressLabel');
+  const msgEl = document.getElementById('updateMsg');
+
+  if (actionBtn) {
+    actionBtn.disabled = true;
+    actionBtn.textContent = 'Downloading…';
+  }
+  if (progressBox) progressBox.hidden = false;
+  if (label) label.textContent = 'Downloading update…';
+  if (msgEl) msgEl.hidden = true;
+
+  try {
+    await invokeCmd('download_and_install_update', {
+      downloadUrl: UPDATE_INFO.download_url,
+      assetName: UPDATE_INFO.asset_name,
+    });
+  } catch (err) {
+    UPDATE_DOWNLOADING = false;
+    if (actionBtn) {
+      actionBtn.disabled = false;
+      actionBtn.textContent = 'Retry Update';
+    }
+    if (msgEl) {
+      msgEl.hidden = false;
+      msgEl.textContent = 'Update failed: ' + err;
+    }
+  }
+}
+
+async function checkForUpdates(interactive = false) {
+  try {
+    const info = await invokeCmd('check_update');
+    UPDATE_INFO = info;
+
+    const badge = document.getElementById('updateBadge');
+    const badgeText = document.getElementById('updateBadgeText');
+    const updateLink = document.getElementById('updateStatusText');
+
+    if (info.available) {
+      if (badge) {
+        badge.hidden = false;
+        if (badgeText) badgeText.textContent = `v${info.latest_version} available`;
+      }
+      if (updateLink) {
+        updateLink.textContent = `✦ Update v${info.latest_version}`;
+        updateLink.hidden = false;
+      }
+      if (interactive) {
+        showUpdateModal(info, false);
+      }
+    } else {
+      if (badge) badge.hidden = true;
+      if (updateLink) updateLink.hidden = true;
+      if (interactive) {
+        showUpdateModal(info, true);
+      }
+    }
+  } catch (e) {
+    if (interactive) {
+      showUpdateModal({ current_version: '0.1.0', available: false }, false);
+      const msgEl = document.getElementById('updateMsg');
+      if (msgEl) {
+        msgEl.hidden = false;
+        msgEl.textContent = 'Check failed: ' + e;
+      }
+    }
+  }
+}
+
+// Initial version fetch & update listeners
+invokeCmd('get_app_version')
+  .then(ver => {
+    const verEl = document.getElementById('appVersion');
+    if (verEl && ver) verEl.textContent = 'v' + ver;
+  })
+  .catch(() => {});
+
+window.__TAURI__?.event?.listen('update-download-progress', e => {
+  const p = e.payload;
+  if (p) updateProgressUI(p.downloaded, p.total, p.percent, p.finished);
+});
+
+document.getElementById('updateBadge')?.addEventListener('click', () => {
+  if (UPDATE_INFO && UPDATE_INFO.available) {
+    showUpdateModal(UPDATE_INFO, false);
+  } else {
+    checkForUpdates(true);
+  }
+});
+document.getElementById('appVersion')?.addEventListener('click', () => checkForUpdates(true));
+document.getElementById('updateStatusText')?.addEventListener('click', () => {
+  if (UPDATE_INFO && UPDATE_INFO.available) {
+    showUpdateModal(UPDATE_INFO, false);
+  } else {
+    checkForUpdates(true);
+  }
+});
+document.getElementById('modalCloseBtn')?.addEventListener('click', hideUpdateModal);
+document.getElementById('modalLaterBtn')?.addEventListener('click', hideUpdateModal);
+document.getElementById('updateModal')?.addEventListener('click', e => {
+  if (e.target.id === 'updateModal') hideUpdateModal();
+});
+window.addEventListener('keydown', e => {
+  if (e.key === 'Escape') hideUpdateModal();
+});
+
+// Check for updates in the background after startup
+if (typeof setTimeout === 'function') {
+  setTimeout(() => checkForUpdates(false), 2500);
+}

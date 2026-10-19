@@ -16,6 +16,23 @@ npm run install-local  # build + silently reinstall, so the desktop
 > repo. After any code change, run `npm run install-local` (or re-run the
 > NSIS setup by hand) — otherwise the shortcut keeps opening the stale build.
 
+## In-app updates
+
+Cinder checks GitHub Releases (`khentmoba/Cinder/releases`) for new versions on startup and on demand:
+- **Automatic detection**: When a newer release is published, an update badge (`Update vX.Y.Z`) appears in the header and footer.
+- **Manual check**: Click the version label (`v0.1.0`) in the footer at any time to check for updates.
+- **Native installation**: Clicking **Update Now** downloads the release installer (`.exe`) directly in-app with real-time download progress, runs the silent NSIS installer, and automatically restarts Cinder on the new version.
+
+### Publishing a release
+
+1. Update version in `package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json`.
+2. Tag and push to GitHub:
+   ```bash
+   git tag v0.2.0
+   git push origin v0.2.0
+   ```
+3. The GitHub Actions Release workflow (`.github/workflows/release.yml`) builds the Windows NSIS installer, creates the GitHub Release, and attaches the setup binary. Existing installations will immediately detect the update.
+
 ## Live updates
 
 Cinder watches the log stores below with OS file notifications and pushes fresh
