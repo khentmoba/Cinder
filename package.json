@@ -1,13 +1,13 @@
 {
   "name": "cinder",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "tauri dev",
     "test": "node --test tests/*.test.cjs",
     "build": "tauri build",
-    "install-local": "tauri build && .\\src-tauri\\target\\release\\bundle\\nsis\\Cinder_0.1.0_x64-setup.exe /S",
+    "install-local": "tauri build && .\\src-tauri\\target\\release\\bundle\\nsis\\Cinder_0.2.0_x64-setup.exe /S",
     "tauri": "tauri"
   },
   "devDependencies": {
