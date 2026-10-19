@@ -28,6 +28,7 @@ struct Row {
     tools: u64,
     cost: f64,
     cost_known: bool,
+    cost_partial: bool,
     savings: f64,
 }
 
@@ -69,8 +70,6 @@ struct Stats {
     limits: Vec<LimitRow>,
     sources: Vec<Source>,
     pricing: PricingInfo,
-    /// tokens re-priced because the reporting agent did not expose cache hits
-    adjusted_tokens: u64,
     unpriced: Vec<String>,
     /// providers covered by a subscription/plan instead of per-token billing
     plan_routes: Vec<String>,
@@ -85,49 +84,6 @@ struct PricingInfo {
 
 type Rows = HashMap<(String, String, String), Row>;
 type Sess = HashMap<(String, String), u64>;
-
-/// Observed cache-hit ratio per model, learned from agents that report cache usage
-/// truthfully. Routes behind a proxy (Codex -> opencode-go) often report
-/// cached_input_tokens = 0 even though the upstream caches ~95% of the prompt,
-/// which makes a naive cost estimate ~20x too high.
-#[derive(Default)]
-struct CacheRatios {
-    cache: HashMap<String, u64>,
-    total: HashMap<String, u64>,
-    adjusted: u64,
-}
-
-impl CacheRatios {
-    fn learn(&mut self, rows: &Rows) {
-        for r in rows.values() {
-            if r.cache_read == 0 {
-                continue;
-            }
-            let key = model_tail(&r.model);
-            *self.cache.entry(key.clone()).or_default() += r.cache_read;
-            *self.total.entry(key).or_default() += r.input + r.cache_read + r.cache_write;
-        }
-    }
-
-    fn observed(&self, model: &str) -> Option<f64> {
-        let key = model_tail(model);
-        let cache = *self.cache.get(&key)? as f64;
-        let total = *self.total.get(&key)? as f64;
-        if total < 100_000.0 {
-            return None;
-        }
-        let r = cache / total;
-        if r >= 0.5 {
-            Some(r)
-        } else {
-            None
-        }
-    }
-}
-
-fn model_tail(model: &str) -> String {
-    model.rsplit('/').next().unwrap_or(model).to_lowercase()
-}
 
 /// Provider prefix of a model string ("opencode-go/deepseek-v4-flash" -> "opencode-go").
 fn model_provider(model: &str) -> Option<&str> {
@@ -151,6 +107,7 @@ fn add(rows: &mut Rows, sess: &mut Sess, agent: &str, model: &str, day: &str, r:
     e.tools += r.tools;
     e.cost += r.cost;
     e.cost_known = e.cost_known || r.cost_known;
+    e.cost_partial |= r.cost_partial || (!r.cost_known && r.tokens() > 0);
     e.savings += r.savings;
     let _ = sess;
 }
@@ -338,7 +295,8 @@ fn parse_pi(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Sess, pl
 }
 
 // ---------------- Codex ----------------
-fn parse_codex(home: &Path, pricing: &Pricing, ratios: &mut CacheRatios, rows: &mut Rows, sess: &mut Sess, limits: &mut Vec<LimitRow>) -> u64 {
+fn parse_codex(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Sess, limits: &mut Vec<LimitRow>) -> u64 {
+    let mut latest: HashMap<String, (String, LimitRow)> = HashMap::new();
     let mut files = list_files(&home.join(".codex").join("sessions"), "jsonl", None);
     // Retired rollouts keep the same schema; without them old usage goes missing.
     // (Own session ids are unique per file — forks share only the parent id —
@@ -347,7 +305,6 @@ fn parse_codex(home: &Path, pricing: &Pricing, ratios: &mut CacheRatios, rows: &
     for file in &files {
         let mut model = String::from("unknown");
         let mut day = String::new();
-        let mut latest: Option<(String, f64, i64, i64)> = None;
         let mut plan = String::new();
         each_line(file, |line| {
             if !has_key(line, CODEX_KEYS) {
@@ -391,12 +348,16 @@ fn parse_codex(home: &Path, pricing: &Pricing, ratios: &mut CacheRatios, rows: &
                         for key in ["primary", "secondary"] {
                             if let Some(w) = rl.get(key) {
                                 if let Some(pct) = w.get("used_percent").and_then(|x| x.as_f64()) {
-                                    latest = Some((
-                                        key.to_string(),
-                                        pct,
-                                        w.get("window_minutes").and_then(|x| x.as_i64()).unwrap_or(0),
-                                        w.get("resets_at").and_then(|x| x.as_i64()).unwrap_or(0),
-                                    ));
+                                    if !ts.is_empty() && latest.get(key).is_none_or(|(stamp, _)| ts >= stamp.as_str()) {
+                                        latest.insert(key.to_string(), (ts.to_string(), LimitRow {
+                                            agent: "Codex".into(),
+                                            window: key.to_string(),
+                                            used_percent: pct,
+                                            window_minutes: w.get("window_minutes").and_then(|x| x.as_i64()).unwrap_or(0),
+                                            resets_at: w.get("resets_at").and_then(|x| x.as_i64()).unwrap_or(0),
+                                            plan: plan.clone(),
+                                        }));
+                                    }
                                 }
                             }
                         }
@@ -410,19 +371,7 @@ fn parse_codex(home: &Path, pricing: &Pricing, ratios: &mut CacheRatios, rows: &
                     if input + output == 0 {
                         return;
                     }
-                    let mut uncached = input.saturating_sub(cached);
-                    let total_in = input;
-                    // The proxy in front of Codex does not surface cache-hit tokens.
-                    // Re-derive the cache ratio from clients that do report it.
-                    let reported_ratio = if total_in > 0 { cached as f64 / total_in as f64 } else { 0.0 };
-                    if let Some(observed) = ratios.observed(&model) {
-                        if total_in >= 100_000 && reported_ratio < observed * 0.5 {
-                            let new_cached = (total_in as f64 * observed).round() as u64;
-                            uncached = total_in.saturating_sub(new_cached);
-                            ratios.adjusted += total_in;
-                        }
-                    }
-                    let cached = total_in.saturating_sub(uncached);
+                    let uncached = input.saturating_sub(cached);
                     let mut r = Row {
                         day: day_of(ts),
                         agent: "Codex".into(),
@@ -446,30 +395,12 @@ fn parse_codex(home: &Path, pricing: &Pricing, ratios: &mut CacheRatios, rows: &
                 _ => {}
             }
         });
-        if let Some((window, pct, wm, ra)) = latest {
-            let entry = limits
-                .iter_mut()
-                .find(|l: &&mut LimitRow| l.agent == "Codex" && l.window == window && l.plan == plan);
-            match entry {
-                Some(l) => {
-                    l.used_percent = l.used_percent.max(pct);
-                    l.window_minutes = wm;
-                    l.resets_at = ra;
-                }
-                None => limits.push(LimitRow {
-                    agent: "Codex".into(),
-                    window,
-                    used_percent: pct,
-                    window_minutes: wm,
-                    resets_at: ra,
-                    plan: plan.clone(),
-                }),
-            }
-        }
         if !day.is_empty() {
             session(sess, "Codex", &day);
         }
     }
+    limits.extend(latest.into_values().map(|(_, limit)| limit));
+    limits.sort_by(|a, b| a.window.cmp(&b.window));
     files.len() as u64
 }
 
@@ -542,16 +473,10 @@ fn parse_claude(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Sess
 
 // ---------------- OpenCode ----------------
 fn parse_opencode(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Sess) -> u64 {
-    let dir = home.join(".local").join("share").join("opencode");
-    let db = dir.join("opencode.db");
-    if !db.exists() {
-        return 0;
-    }
+    let db = home.join(".local").join("share").join("opencode").join("opencode.db");
     let Ok(conn) = rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
         return 0;
     };
-    // The owner app may be writing (WAL mode): don't fail the whole scan on a
-    // locked page, wait briefly instead of returning empty OpenCode stats.
     let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
     let table = ["session_v2", "session"].iter().find(|t| {
         conn.query_row(&format!("SELECT COUNT(*) FROM {}", t), [], |r| r.get::<_, i64>(0))
@@ -559,113 +484,79 @@ fn parse_opencode(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Se
             .unwrap_or(false)
     });
     let Some(table) = table else { return 0 };
-    let mut count = 0u64;
-    let sql = format!(
-        "SELECT model, cost, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, time_created, time_updated FROM {}",
-        table
-    );
-    if let Ok(mut stmt) = conn.prepare(&sql) {
-        let rows_iter = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, Option<String>>(0)?,
-                r.get::<_, Option<f64>>(1)?,
-                r.get::<_, Option<i64>>(2)?,
-                r.get::<_, Option<i64>>(3)?,
-                r.get::<_, Option<i64>>(4)?,
-                r.get::<_, Option<i64>>(5)?,
-                r.get::<_, Option<i64>>(6)?,
-                r.get::<_, Option<i64>>(7)?,
-                r.get::<_, Option<i64>>(8)?,
-            ))
-        });
-        if let Ok(it) = rows_iter {
-            for row in it.flatten() {
-                let (model, cost, ti, to, tcr, tcw, tr, tcreated, tupdated) = row;
-                count += 1;
-                let input = ti.unwrap_or(0).max(0) as u64;
-                let output = to.unwrap_or(0).max(0) as u64;
-                let cache_read = tcr.unwrap_or(0).max(0) as u64;
-                let cache_write = tcw.unwrap_or(0).max(0) as u64;
-                let reasoning = tr.unwrap_or(0).max(0) as u64;
-                let model = pricing::normalize_model(&model.unwrap_or_else(|| "unknown".into()));
-                let ts = tupdated.or(tcreated).unwrap_or(0);
-                let secs = if ts > 1_000_000_000_000 { ts / 1000 } else { ts };
-                let day = unix_day(secs);
-                let mut r = Row {
-                    day: day.clone(),
-                    agent: "OpenCode".into(),
-                    model: model.clone(),
-                    requests: 1,
-                    input,
-                    cache_read,
-                    cache_write,
-                    output,
-                    reasoning,
-                    ..Default::default()
-                };
-                match cost {
-                    Some(c) if c > 0.0 => {
-                        r.cost = c;
-                        r.cost_known = true;
-                    }
-                    Some(_) => {
-                        r.cost = 0.0;
-                        r.cost_known = true;
-                    }
-                    _ => {
-                        if let Some(p) = pricing.lookup(model_provider(&model), &model) {
-                            r.cost = p.cost(input, cache_read, cache_write, output);
-                            r.cost_known = true;
-                            r.savings = p.savings(cache_read, cache_write);
-                        }
-                    }
-                }
-                if r.savings == 0.0 {
-                    if let Some(p) = pricing.lookup(model_provider(&model), &model) {
-                        r.savings = p.savings(cache_read, cache_write);
-                    }
-                }
-                add(rows, sess, "OpenCode", &model, &day, r);
+    let mut count = 0;
+    if let Ok(mut stmt) = conn.prepare(&format!("SELECT time_created FROM {}", table)) {
+        if let Ok(it) = stmt.query_map([], |r| r.get::<_, i64>(0)) {
+            for ts in it.flatten() {
+                let day = unix_day(if ts > 1_000_000_000_000 { ts / 1000 } else { ts });
                 session(sess, "OpenCode", &day);
+                count += 1;
             }
         }
     }
-    // tool calls, attributed to the owning session's model and day.
-    // Group by day inside SQLite: grouping by raw millisecond timestamps emits
-    // one row per tool call (~26k rows over the wire), which then explodes into
-    // thousands of sparse frontend rows. Models x days is a few hundred rows.
-    let tools_sql = format!(
-        "SELECT s.model, date(p.time_created/1000,'unixepoch'), COUNT(*) FROM part p \
-         JOIN message m ON p.message_id = m.id JOIN {} s ON m.session_id = s.id \
-         WHERE p.data LIKE '%\"type\":\"tool\"%' GROUP BY s.model, date(p.time_created/1000,'unixepoch')",
-        table
-    );
-    if let Ok(mut stmt) = conn.prepare(&tools_sql) {
-        if let Ok(it) = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, Option<String>>(0)?,
-                r.get::<_, Option<String>>(1)?,
-                r.get::<_, Option<i64>>(2)?,
-            ))
-        }) {
-            for (model, day_opt, n) in it.flatten() {
-                let day = day_opt.unwrap_or_default();
-                if day.is_empty() {
+    // Session totals have no daily attribution. Messages keep the actual model,
+    // request time, and usage even when a session is resumed with another model.
+    if let Ok(mut stmt) = conn.prepare("SELECT data, time_created FROM message") {
+        if let Ok(it) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) {
+            for (data, ts) in it.flatten() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else { continue };
+                if v.get("role").and_then(|x| x.as_str()) != Some("assistant") {
                     continue;
                 }
-                let model = pricing::normalize_model(&model.unwrap_or_else(|| "unknown".into()));
-                add(
-                    rows,
-                    sess,
-                    "OpenCode",
-                    &model,
-                    &day,
-                    Row { tools: n.unwrap_or(0).max(0) as u64, ..Default::default() },
-                );
+                let model = opencode_model(&v);
+                let day = unix_day(if ts > 1_000_000_000_000 { ts / 1000 } else { ts });
+                let u = &v["tokens"];
+                let mut r = Row {
+                    requests: 1,
+                    input: u["input"].as_u64().unwrap_or(0),
+                    output: u["output"].as_u64().unwrap_or(0),
+                    cache_read: u["cache"]["read"].as_u64().unwrap_or(0),
+                    cache_write: u["cache"]["write"].as_u64().unwrap_or(0),
+                    reasoning: u["reasoning"].as_u64().unwrap_or(0),
+                    ..Default::default()
+                };
+                let price = pricing.lookup(model_provider(&model), &model);
+                if let Some(cost) = v.get("cost").and_then(|x| x.as_f64()).filter(|c| *c >= 0.0) {
+                    r.cost = cost;
+                    r.cost_known = true;
+                } else if let Some(p) = price {
+                    r.cost = p.cost(r.input, r.cache_read, r.cache_write, r.output);
+                    r.cost_known = true;
+                }
+                if let Some(p) = price {
+                    r.savings = p.savings(r.cache_read, r.cache_write);
+                }
+                add(rows, sess, "OpenCode", &model, &day, r);
+            }
+        }
+    }
+    // Group tools in SQLite instead of transferring each call's JSON.
+    let sql = "SELECT json_extract(m.data, '$.providerID'), json_extract(m.data, '$.modelID'),
+                      date(p.time_created/1000,'unixepoch'), COUNT(*)
+               FROM part p JOIN message m ON p.message_id = m.id
+               WHERE json_valid(p.data) AND json_valid(m.data) AND json_extract(p.data, '$.type') = 'tool'
+               GROUP BY 1, 2, 3";
+    if let Ok(mut stmt) = conn.prepare(sql) {
+        if let Ok(it) = stmt.query_map([], |r| Ok((
+            r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?,
+            r.get::<_, Option<String>>(2)?, r.get::<_, u64>(3)?,
+        ))) {
+            for (provider, model, day, tools) in it.flatten() {
+                let Some(day) = day else { continue };
+                let model = opencode_model(&serde_json::json!({"providerID": provider, "modelID": model}));
+                add(rows, sess, "OpenCode", &model, &day, Row { tools, ..Default::default() });
             }
         }
     }
     count
+}
+
+fn opencode_model(message: &serde_json::Value) -> String {
+    let id = message["modelID"].as_str().unwrap_or("unknown");
+    match message["providerID"].as_str().filter(|p| !p.is_empty()) {
+        Some(provider) => pricing::normalize_model(&format!("{}/{}", provider, id)),
+        None => pricing::normalize_model(id),
+    }
 }
 
 // ---------------- Antigravity ----------------
@@ -830,7 +721,7 @@ fn agy_db_model(db: &Path) -> String {
     votes.into_iter().max_by(|a, b| a.1.cmp(&b.1).then(a.0.len().cmp(&b.0.len()))).map(|(m, _)| m).unwrap_or_else(|| "unknown".into())
 }
 
-fn parse_t3(home: &Path, rows: &mut Rows, sess: &mut Sess) -> u64 {
+fn parse_t3(home: &Path, rows: &mut Rows, sess: &mut Sess, counted_threads: &mut HashSet<String>) -> u64 {
     let prov = home.join(".t3").join("userdata").join("providers").join("antigravity");
     let Ok(top) = fs::read_dir(&prov) else { return 0 };
     let mut files = Vec::new();
@@ -846,7 +737,7 @@ fn parse_t3(home: &Path, rows: &mut Rows, sess: &mut Sess) -> u64 {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| unix_day(d.as_secs() as i64))
             .unwrap_or_default();
-        session(sess, "Antigravity", &mtime_day);
+        let mut session_day: Option<String> = None;
         let mut seen_steps = HashSet::new();
         each_line(file, |line| {
             if !has_key(line, AGY_KEYS) {
@@ -873,20 +764,22 @@ fn parse_t3(home: &Path, rows: &mut Rows, sess: &mut Sess) -> u64 {
                 ..Default::default()
             };
             if r.day.is_empty() { r.day = mtime_day.clone(); }
+            if session_day.as_ref().is_none_or(|day| r.day < *day) {
+                session_day = Some(r.day.clone());
+            }
             add(rows, sess, "Antigravity", &model, &r.day.clone(), r);
         });
-    }
-    // Conversation DBs without transcripts (assistant ran, logs rotated away):
-    // read the steps table directly. step_type 15 is an assistant response;
-    // its tool calls show up as toolu_ ids in the payload blob.
-    let mut with_transcript = HashSet::new();
-    for file in &files {
-        if let Some(db) = t3_conv_db(file) {
-            if let Some(id) = db.file_stem().and_then(|s| s.to_str()) {
-                with_transcript.insert(id.to_string());
+        if let Some(day) = session_day {
+            session(sess, "Antigravity", &day);
+            if let Some(db) = t3_conv_db(file) {
+                if let Some(id) = db.file_stem().and_then(|s| s.to_str()) {
+                    counted_threads.insert(id.to_string());
+                }
             }
         }
     }
+    // Missing or empty transcripts fall back to the conversation DB.
+    let with_transcript = counted_threads.clone();
     let mut dbs = files.len() as u64;
     // (re-read: the first directory listing was already consumed above)
     let Ok(top2) = fs::read_dir(&prov) else { return dbs };
@@ -905,7 +798,6 @@ fn parse_t3(home: &Path, rows: &mut Rows, sess: &mut Sess) -> u64 {
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| unix_day(d.as_secs() as i64))
                 .unwrap_or_default();
-            session(sess, "Antigravity", &mtime_day);
             let Ok(conn) = rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else { continue };
             let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
             // Assistant responses carry the day + model order; tool calls live
@@ -923,6 +815,10 @@ fn parse_t3(home: &Path, rows: &mut Rows, sess: &mut Sess) -> u64 {
                 } else if st == 21 || st == 25 || st == 38 || st == 103 {
                     *tools_per_day.entry(d).or_insert(0) += 1;
                 }
+            }
+            if let Some((day, _)) = day_model.iter().min_by(|a, b| a.0.cmp(&b.0)) {
+                session(sess, "Antigravity", day);
+                counted_threads.insert(id);
             }
             for (d, model) in &day_model {
                 add(rows, sess, "Antigravity", model, d, Row {
@@ -952,7 +848,7 @@ fn parse_t3(home: &Path, rows: &mut Rows, sess: &mut Sess) -> u64 {
 // The Antigravity route is recorded as a model id (antigravity/<model>), even
 // when the provider adapter is Pi. Public API prices are used only for Cinder's
 // API estimate; Antigravity's subscription charge is not exposed here.
-fn parse_t3_usage(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Sess) -> bool {
+fn parse_t3_usage(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Sess, counted_threads: &HashSet<String>) -> bool {
     let db = home.join(".t3").join("userdata").join("statev2.sqlite");
     let Ok(conn) = rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
         return false;
@@ -1013,7 +909,8 @@ fn parse_t3_usage(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Se
         } else {
             day
         };
-        if !day.is_empty() {
+        let counted = counted_threads.contains(&thread_id);
+        if !counted && !day.is_empty() {
             thread_days
                 .entry(thread_id)
                 .and_modify(|first| {
@@ -1027,7 +924,7 @@ fn parse_t3_usage(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Se
             day: day.clone(),
             agent: "Antigravity".into(),
             model: model.clone(),
-            requests: 1,
+            requests: if counted { 0 } else { 1 },
             input,
             cache_read,
             output,
@@ -1074,7 +971,7 @@ fn agy_step_day(meta: &[u8]) -> String {
         if end <= meta.len() && meta.get(pos) == Some(&0x08) {
             pos += 1;
             if let Some(ts) = varint(&mut pos) {
-                if ts >= 1_700_000_000 && ts < 2_000_000_000 {
+                if (1_700_000_000..2_000_000_000).contains(&ts) {
                     return unix_day(ts as i64);
                 }
             }
@@ -1348,35 +1245,37 @@ fn scan(progress: &dyn Fn(&str)) -> Stats {
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
     let _guard = SCAN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    scan_home(&home, progress)
+}
+
+fn scan_home(home: &Path, progress: &dyn Fn(&str)) -> Stats {
     progress("model prices");
-    let pricing = Pricing::load(&home);
+    let pricing = Pricing::load(home);
     let mut rows = Rows::new();
     let mut sess = Sess::new();
     let mut limits = Vec::new();
-    let mut ratios = CacheRatios::default();
+    let mut counted_threads = HashSet::new();
     let mut plan_routes: HashMap<String, u64> = HashMap::new();
 
-    // parse the agents that report cache usage truthfully first, so Codex can borrow their ratios
     progress("Pi logs");
-    let pi_files = parse_pi(&home, &pricing, &mut rows, &mut sess, &mut plan_routes);
+    let pi_files = parse_pi(home, &pricing, &mut rows, &mut sess, &mut plan_routes);
     progress("Claude Code logs");
-    let claude_files = parse_claude(&home, &pricing, &mut rows, &mut sess);
+    let claude_files = parse_claude(home, &pricing, &mut rows, &mut sess);
     progress("OpenCode database");
-    let opencode_n = parse_opencode(&home, &pricing, &mut rows, &mut sess);
+    let opencode_n = parse_opencode(home, &pricing, &mut rows, &mut sess);
     progress("Antigravity logs");
-    let agy_dbs = parse_antigravity(&home, &pricing, &mut rows, &mut sess);
+    let agy_dbs = parse_antigravity(home, &pricing, &mut rows, &mut sess);
     progress("T3 logs");
-    let t3_files = parse_t3(&home, &mut rows, &mut sess);
+    let t3_files = parse_t3(home, &mut rows, &mut sess, &mut counted_threads);
     progress("T3 usage database");
-    let t3_usage_db = parse_t3_usage(&home, &pricing, &mut rows, &mut sess);
+    let t3_usage_db = parse_t3_usage(home, &pricing, &mut rows, &mut sess, &counted_threads);
     progress("DSH logs");
-    let dsh_files = parse_dsh(&home, &pricing, &mut rows, &mut sess);
+    let dsh_files = parse_dsh(home, &pricing, &mut rows, &mut sess);
     progress("LM Studio logs");
-    let lms_files = parse_lmstudio(&home, &mut rows, &mut sess);
-    ratios.learn(&rows);
+    let lms_files = parse_lmstudio(home, &mut rows, &mut sess);
 
     progress("Codex logs");
-    let codex_files = parse_codex(&home, &pricing, &mut ratios, &mut rows, &mut sess, &mut limits);
+    let codex_files = parse_codex(home, &pricing, &mut rows, &mut sess, &mut limits);
     progress("done");
 
     let sources = vec![
@@ -1402,24 +1301,18 @@ fn scan(progress: &dyn Fn(&str)) -> Stats {
         .collect();
     sessions.sort_by(|a, b| a.day.cmp(&b.day));
 
-    let mut unpriced: Vec<(String, u64)> = Vec::new();
-    let mut seen: HashMap<String, ()> = HashMap::new();
-    for r in rows.iter().filter(|r| r.tokens() > 0) {
-        if r.cost_known && seen.insert(r.model.clone(), ()).is_none() {
-            continue;
-        }
-        if !r.cost_known && !r.model.is_empty() && seen.insert(r.model.clone(), ()).is_none() {
-            unpriced.push((r.model.clone(), r.tokens()));
-        }
+    let mut unpriced: HashMap<String, u64> = HashMap::new();
+    for r in rows.iter().filter(|r| r.cost_partial && !r.model.is_empty()) {
+        *unpriced.entry(r.model.clone()).or_default() += r.tokens();
     }
-    unpriced.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut unpriced: Vec<_> = unpriced.into_iter().collect();
+    unpriced.sort_by_key(|a| std::cmp::Reverse(a.1));
 
     Stats {
         rows,
         sessions,
         limits,
         sources,
-        adjusted_tokens: ratios.adjusted,
         unpriced: unpriced.into_iter().take(12).map(|(m, _)| m).collect(),
         plan_routes: {
             let mut v: Vec<(String, u64)> = plan_routes.into_iter().collect();
@@ -1446,15 +1339,59 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
-/// Watch the agent log stores and push fresh stats whenever they change, so the
-/// window never goes stale while agents are working — including while Cinder
-/// itself sits open on the desktop. OS-level notifications cost nothing when idle
-/// (no polling reads); rescans fire 10 s after writes go quiet (or after 60 s of
-/// continuous writes, so a busy agent can't starve updates) and at most once per
-/// minute, because a full scan still walks ~5 GB of logs + database.
+/// Register new source directories without re-reading any log contents.
+fn register_log_watches(
+    home: &Path,
+    watched: &mut HashSet<PathBuf>,
+    mut watch: impl FnMut(&Path, notify::RecursiveMode) -> bool,
+) -> bool {
+    use notify::RecursiveMode;
+    let mut roots: Vec<(PathBuf, RecursiveMode)> = vec![
+        (home.join(".pi").join("agent").join("sessions"), RecursiveMode::Recursive),
+        (home.join(".codex").join("sessions"), RecursiveMode::Recursive),
+        (home.join(".codex").join("archived_sessions"), RecursiveMode::Recursive),
+        (home.join(".claude").join("projects"), RecursiveMode::Recursive),
+        (home.join(".gemini").join("antigravity"), RecursiveMode::Recursive),
+        (home.join(".gemini").join("antigravity-cli"), RecursiveMode::Recursive),
+        (home.join(".dsh").join("sessions"), RecursiveMode::Recursive),
+        (home.join(".lmstudio").join("conversations"), RecursiveMode::NonRecursive),
+        (home.join(".lmstudio").join("server-logs"), RecursiveMode::Recursive),
+        // Non-recursive so statev2.sqlite and its WAL trigger live refreshes
+        // without watching T3's unrelated logs and conversation trees.
+        (home.join(".t3").join("userdata"), RecursiveMode::NonRecursive),
+    ];
+    // T3's own Antigravity workspaces; enumerated so the watcher does not
+    // descend into the unrelated codex shadow copies next to them.
+    let t3prov = home.join(".t3").join("userdata").join("providers").join("antigravity");
+    if let Ok(top) = fs::read_dir(&t3prov) {
+        for e in top.flatten() {
+            let acp = e.path().join("antigravity-acp");
+            if acp.exists() {
+                roots.push((acp, RecursiveMode::Recursive));
+            }
+        }
+    }
+    // Non-recursive: the db/wal/shm files live here, and this skips the
+    // heavy log/repos/snapshot subtrees (WAL writes hit the -wal file,
+    // so the directory itself — not just opencode.db — must be watched).
+    roots.push((home.join(".local").join("share").join("opencode"), RecursiveMode::NonRecursive));
+
+    watched.retain(|path| path.exists());
+    let mut added = false;
+    for (path, mode) in roots {
+        if !watched.contains(&path) && path.exists() && watch(&path, mode) {
+            watched.insert(path);
+            added = true;
+        }
+    }
+    added
+}
+
+/// Discover new source directories every 5 s. Rescan changed logs after 10 s
+/// quiet (or 60 s of continuous writes), at most once per minute.
 fn spawn_log_watcher(app: AppHandle) {
     std::thread::spawn(move || {
-        use notify::{RecursiveMode, Watcher};
+        use notify::Watcher;
         use std::time::{Duration, Instant};
         let (tx, rx) = std::sync::mpsc::channel();
         let mut watcher = match notify::recommended_watcher(move |res| {
@@ -1464,44 +1401,9 @@ fn spawn_log_watcher(app: AppHandle) {
             Err(_) => return,
         };
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        let mut roots: Vec<(PathBuf, RecursiveMode)> = vec![
-            (home.join(".pi").join("agent").join("sessions"), RecursiveMode::Recursive),
-            (home.join(".codex").join("sessions"), RecursiveMode::Recursive),
-            (home.join(".codex").join("archived_sessions"), RecursiveMode::Recursive),
-            (home.join(".claude").join("projects"), RecursiveMode::Recursive),
-            (home.join(".gemini").join("antigravity"), RecursiveMode::Recursive),
-            (home.join(".gemini").join("antigravity-cli"), RecursiveMode::Recursive),
-            (home.join(".dsh").join("sessions"), RecursiveMode::Recursive),
-            (home.join(".lmstudio").join("conversations"), RecursiveMode::NonRecursive),
-            (home.join(".lmstudio").join("server-logs"), RecursiveMode::Recursive),
-            // Non-recursive so statev2.sqlite and its WAL trigger live refreshes
-            // without watching T3's unrelated logs and conversation trees.
-            (home.join(".t3").join("userdata"), RecursiveMode::NonRecursive),
-        ];
-        // T3's own Antigravity workspaces; enumerated so the watcher does not
-        // descend into the unrelated codex shadow copies next to them.
-        let t3prov = home.join(".t3").join("userdata").join("providers").join("antigravity");
-        if let Ok(top) = fs::read_dir(&t3prov) {
-            for e in top.flatten() {
-                let acp = e.path().join("antigravity-acp");
-                if acp.exists() {
-                    roots.push((acp, RecursiveMode::Recursive));
-                }
-            }
-        }
-        // Non-recursive: the db/wal/shm files live here, and this skips the
-        // heavy log/repos/snapshot subtrees (WAL writes hit the -wal file,
-        // so the directory itself — not just opencode.db — must be watched).
-        roots.push((home.join(".local").join("share").join("opencode"), RecursiveMode::NonRecursive));
-        let mut watching = 0;
-        for (p, mode) in &roots {
-            if p.exists() && watcher.watch(p, *mode).is_ok() {
-                watching += 1;
-            }
-        }
-        if watching == 0 {
-            return;
-        }
+        let mut watched = HashSet::new();
+        register_log_watches(&home, &mut watched, |p, mode| watcher.watch(p, mode).is_ok());
+        let mut last_discovery = Instant::now();
         // Old enough that the first real change rescans after the quiet period;
         // startup itself already ran a full scan via get_stats.
         let mut last_scan = Instant::now() - Duration::from_secs(3600);
@@ -1520,6 +1422,15 @@ fn spawn_log_watcher(app: AppHandle) {
                 Ok(Err(_)) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            // Only discover directories here; log contents are still notification-driven.
+            if last_discovery.elapsed() >= Duration::from_secs(5) {
+                if register_log_watches(&home, &mut watched, |p, mode| watcher.watch(p, mode).is_ok()) {
+                    if !pending { pending_since = Instant::now(); }
+                    pending = true;
+                    last_event = Instant::now();
+                }
+                last_discovery = Instant::now();
             }
             // Rescan 10 s after writes go quiet — or after 60 s of continuous
             // writes, so a long-running agent session can't starve updates.
@@ -1546,38 +1457,4 @@ fn main() {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-
-    #[test]
-    fn dump_stats() {
-        let s = super::scan(&|_| {});
-        let rows: u64 = s.rows.iter().map(|r| r.requests + r.tools).sum();
-        eprintln!("rows={} events={} sessions={} limits={} pricing={}", s.rows.len(), rows, s.sessions.len(), s.limits.len(), s.pricing.embedded + s.pricing.local);
-        let json = serde_json::to_string(&s).unwrap();
-        std::fs::write(std::env::temp_dir().join("cinder-stats.json"), &json).unwrap();
-        // summary per agent
-        let mut per: HashMap<String, (u64, u64, f64, u64)> = HashMap::new();
-        for r in &s.rows {
-            let e = per.entry(r.agent.clone()).or_default();
-            e.0 += r.requests;
-            e.1 += r.input + r.output + r.cache_read + r.cache_write;
-            e.2 += r.cost;
-            e.3 += r.tools;
-        }
-        for (a, v) in per {
-            eprintln!("{:14} req={:7} tokens={:14} cost=${:9.2} tools={}", a, v.0, v.1, v.2, v.3);
-        }
-        let mut priced = 0;
-        let mut unpriced: HashMap<String, u64> = HashMap::new();
-        for r in &s.rows {
-            if r.cost_known { priced += r.tokens() } else { *unpriced.entry(r.model.clone()).or_default() += r.tokens(); }
-        }
-        eprintln!("priced tokens={} unpriced models={}", priced, unpriced.len());
-        let mut u: Vec<_> = unpriced.into_iter().collect();
-        u.sort_by_key(|(_, t)| std::cmp::Reverse(*t));
-        for (m, t) in u.into_iter().take(12) {
-            eprintln!("  unpriced {:50} {}", m, t);
-        }
-    }
-}
+mod tests;
