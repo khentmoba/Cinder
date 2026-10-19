@@ -117,7 +117,7 @@ test('Today uses UTC calendar boundaries, including through a local daylight-sav
   assert.equal(run('filtered().length'), 2);
   for (const file of ['../src/index.html', '../mock/index.html']) {
     const html = fs.readFileSync(path.join(__dirname, file), 'utf8');
-    assert.match(html, /data-v="1">Today \(UTC\)<\/button>/);
+    assert.match(html, /data-v="1" title="UTC calendar day">Today<\/button>/);
     assert.doesNotMatch(html, /Past 24h/);
   }
 });
@@ -151,4 +151,34 @@ test('All time range button and filter aggregates without date cutoff', () => {
     const html = fs.readFileSync(path.join(__dirname, file), 'utf8');
     assert.match(html, /data-v="0">All time<\/button>/);
   }
+});
+
+test('limit cards speak human time, not raw minute counts', () => {
+  const { run } = dashboard();
+  assert.equal(run('windowLabel(43200)'), '30-day window');
+  assert.equal(run('windowLabel(300)'), '5-hour window');
+  assert.equal(run('windowLabel(30)'), '30-minute window');
+  assert.equal(run('untilReset(0)'), 'due');
+  assert.match(run(`untilReset(${Math.floor(Date.now() / 1000) + 7200})`), /^in (2\.0h|1\.9h|119m)$/);
+  assert.match(run(`untilReset(${Math.floor(Date.now() / 1000) + 4 * 86400})`), /^in 4d$/);
+});
+
+test('the sources panel reports what the scan actually found', () => {
+  const { run, get } = dashboard();
+  run("DATA.sources = [{agent:'Pi', path:'~/.pi/agent/sessions', found:true, files:5}, {agent:'Claude Code', path:'~/.claude/projects', found:false, files:0}]; renderSources();");
+  const html = get('sourcesList').innerHTML;
+  assert.match(html, /5 files/);
+  assert.match(html, /not installed/);
+  assert.match(html, /~\/\.pi\/agent\/sessions/);
+});
+
+test('a 90-day chart buckets into weeks and the model filter narrows every panel', () => {
+  const { run } = dashboard();
+  const days = Array.from({ length: 90 }, (_, i) => ({ day: `2026-01-${String(i + 1).padStart(2, '0')}` }));
+  assert.equal(run('bucketDays([{day:"2026-01-01"},{day:"2026-01-02"}], false).length'), 2);
+  assert.equal(run(`bucketDays(${JSON.stringify(days)}, true).length`), 13);
+  run("selectedModel = '(tools only)'; DATA.rows = [{...blank(), model: 'gpt', requests: 1}, {...blank(), model: '', requests: 2}];");
+  const rows = run('applyModelFilter(DATA.rows)');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].requests, 2);
 });

@@ -1,6 +1,7 @@
 // Minimal CDP driver: navigate, evaluate, screenshot.
 const fs = require('fs');
 const PORT = process.env.CDP_PORT || 9333;
+const [VW, VH] = (process.env.VIEWPORT || '1400x900').split('x').map(Number);
 const URL_ = process.argv[2];
 const path = require('path');
 const OUT = process.argv[3] || path.join(__dirname, 'shot.png');
@@ -25,7 +26,7 @@ const EVAL = process.argv[4] || '1';
   const send = (method, params = {}) => new Promise(res => { const i = ++id; pending.set(i, res); ws.send(JSON.stringify({ id: i, method, params })); });
   await new Promise(r => ws.onopen = r);
   await send('Runtime.enable'); await send('Log.enable'); await send('Page.enable');
-  await send('Emulation.setDeviceMetricsOverride', { width: 1400, height: 900, deviceScaleFactor: 1, mobile: false });
+  await send('Emulation.setDeviceMetricsOverride', { width: VW, height: VH, deviceScaleFactor: 1, mobile: false });
   await send('Page.navigate', { url: URL_ });
   await new Promise(r => setTimeout(r, 2500));
   if (EVAL !== '1') {

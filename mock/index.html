@@ -10,16 +10,19 @@
 </head>
 <body>
   <header>
-    <div class="crumb">Usage <span class="sep">/</span> <b>All environments</b> <span class="range-label" id="rangeLabel"></span></div>
+    <div class="crumb" id="crumb"></div>
     <div class="controls">
+      <div class="seg" id="view">
+        <button data-v="usage" class="on">Usage</button>
+        <button data-v="limits">Limits</button>
+      </div>
       <div class="seg" id="metric">
         <button data-v="cost">Cost</button>
         <button data-v="tokens" class="on">Tokens</button>
         <button data-v="requests">Requests</button>
-        <button data-v="limits">Limits</button>
       </div>
       <div class="seg" id="range">
-        <button data-v="1">Today (UTC)</button>
+        <button data-v="1" title="UTC calendar day">Today</button>
         <button data-v="7">7 days</button>
         <button data-v="30">30 days</button>
         <button data-v="90" class="on">90 days</button>
@@ -32,12 +35,14 @@
   <main id="limitsView" hidden></main>
 
   <main id="dash">
+    <section class="hero">
+      <div id="bigTotal" class="big">—</div>
+      <div id="bigSub" class="sub">&nbsp;</div>
+      <div id="bigDelta" class="delta"></div>
+    </section>
+
     <section class="left">
-      <div class="hero">
-        <div id="bigTotal" class="big">—</div>
-        <div id="bigSub" class="sub">&nbsp;</div>
-      </div>
-      <ul id="agentList" class="agents"></ul>
+      <div id="agentList" class="agents"></div>
 
       <h3>Totals</h3>
       <div id="totals" class="totals"></div>
@@ -48,23 +53,30 @@
 
       <div class="breakdown-head">
         <h3>Breakdown</h3>
-        <div class="seg small" id="breakMode">
-          <button data-v="model" class="on">Model</button>
-          <button data-v="day">Day</button>
+        <div class="breakdown-tools">
+          <div class="seg small" id="breakMode">
+            <button data-v="model" class="on">Model</button>
+            <button data-v="day">Day</button>
+          </div>
+          <button id="exportBtn" class="mini-btn" title="Export as CSV">CSV</button>
         </div>
       </div>
-      <table id="breakdown"></table>
+      <div id="breakdown" class="bd"></div>
     </section>
 
     <section class="right">
       <h3 id="chartTitle">Daily processed tokens</h3>
+      <div id="chartLegend" class="chart-legend"></div>
       <div id="chart" class="chart"></div>
     </section>
   </main>
 
   <footer>
-    <span id="status">loading…</span>
+    <div class="footer-left">
+      <span id="status">loading…</span>
+    </div>
     <span id="priceinfo"></span>
+    <div class="footer-right"></div>
   </footer>
   <script src="main.js"></script>
 </body>

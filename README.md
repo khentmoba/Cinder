@@ -62,9 +62,23 @@ still fully visible: use the **Requests** metric. Cost/tokens views show a `—`
 for them by design, so the agent list also prints the request count next to
 the cost.
 
-Daily ranges use UTC dates; **Today (UTC)** is a calendar day, not a rolling
+Daily ranges use UTC dates; **Today** is a UTC calendar day, not a rolling
 24-hour window. Costs marked **≥** exclude some unpriced token usage. Codex
 cache counts are kept as reported, without borrowing ratios from other agents.
+
+## Using the dashboard
+
+- **Filters stack**: click an agent row, then a model row, to narrow every panel
+  at once. The breadcrumb has one click per segment to undo it.
+- **Chart**: click a legend chip to hide an agent. Ranges over six weeks bucket
+  into weeks, and the dashed line is the previous period of the same length.
+- **Breakdown**: rows are clickable filters; **Show all** lists every row and
+  **CSV** exports the visible table.
+- **Limits**: a *view* (`Usage | Limits`), not a metric. Each card shows how much
+  of the window is gone, when it resets, and — once the window is under way —
+  where the current burn rate lands by reset.
+- **Keys**: `1`–`4` cost / tokens / requests / limits, `R` refresh, `S` settings,
+  `Esc` closes a modal. Window size and position are remembered between launches.
 
 ## Tests
 
