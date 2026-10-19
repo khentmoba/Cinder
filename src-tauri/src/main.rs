@@ -1803,6 +1803,9 @@ fn get_app_version() -> String {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Remember where the user put the window instead of resetting to the
+        // config default on every launch.
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .setup(|app| {
             spawn_log_watcher(app.handle().clone());
             Ok(())

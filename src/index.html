@@ -8,16 +8,19 @@
 </head>
 <body>
   <header>
-    <div class="crumb">Usage <span class="sep">/</span> <b>All environments</b> <span class="range-label" id="rangeLabel"></span></div>
+    <div class="crumb" id="crumb"></div>
     <div class="controls">
+      <div class="seg" id="view">
+        <button data-v="usage" class="on">Usage</button>
+        <button data-v="limits">Limits</button>
+      </div>
       <div class="seg" id="metric">
         <button data-v="cost">Cost</button>
         <button data-v="tokens" class="on">Tokens</button>
         <button data-v="requests">Requests</button>
-        <button data-v="limits">Limits</button>
       </div>
       <div class="seg" id="range">
-        <button data-v="1">Today (UTC)</button>
+        <button data-v="1" title="UTC calendar day">Today</button>
         <button data-v="7">7 days</button>
         <button data-v="30">30 days</button>
         <button data-v="90" class="on">90 days</button>
@@ -39,12 +42,14 @@
   <main id="limitsView" hidden></main>
 
   <main id="dash">
+    <section class="hero">
+      <div id="bigTotal" class="big">—</div>
+      <div id="bigSub" class="sub">&nbsp;</div>
+      <div id="bigDelta" class="delta"></div>
+    </section>
+
     <section class="left">
-      <div class="hero">
-        <div id="bigTotal" class="big">—</div>
-        <div id="bigSub" class="sub">&nbsp;</div>
-      </div>
-      <ul id="agentList" class="agents"></ul>
+      <div id="agentList" class="agents"></div>
 
       <h3>Totals</h3>
       <div id="totals" class="totals"></div>
@@ -55,16 +60,20 @@
 
       <div class="breakdown-head">
         <h3>Breakdown</h3>
-        <div class="seg small" id="breakMode">
-          <button data-v="model" class="on">Model</button>
-          <button data-v="day">Day</button>
+        <div class="breakdown-tools">
+          <div class="seg small" id="breakMode">
+            <button data-v="model" class="on">Model</button>
+            <button data-v="day">Day</button>
+          </div>
+          <button id="exportBtn" class="mini-btn" title="Export as CSV">CSV</button>
         </div>
       </div>
-      <table id="breakdown"></table>
+      <div id="breakdown" class="bd"></div>
     </section>
 
     <section class="right">
       <h3 id="chartTitle">Daily processed tokens</h3>
+      <div id="chartLegend" class="chart-legend"></div>
       <div id="chart" class="chart"></div>
     </section>
   </main>
@@ -74,8 +83,8 @@
       <span id="status">loading…</span>
       <span id="updateStatusText" class="update-status-link" title="Click to view update" hidden></span>
     </div>
+    <span id="priceinfo"></span>
     <div class="footer-right">
-      <span id="priceinfo"></span>
       <button id="footerSettingsBtn" class="footer-settings-btn" title="Open Settings">
         <span class="settings-gear">&#9881;</span>
         <span id="appVersion" class="app-version">v0.2.0</span>
@@ -167,9 +176,9 @@
 
           <div class="pref-group">
             <label class="pref-label">Default Time Range on Startup</label>
-            <div class="pref-sub">Choose the calendar range loaded when Cinder launches.</div>
+            <div class="pref-sub">Choose the calendar range loaded when Cinder launches. Days are UTC calendar days, so "Today" starts at 00:00 UTC.</div>
             <div class="seg pref-seg" id="prefRange">
-              <button data-v="1">Today (UTC)</button>
+              <button data-v="1" title="UTC calendar day">Today</button>
               <button data-v="7">7 days</button>
               <button data-v="30">30 days</button>
               <button data-v="90" class="on">90 days</button>
@@ -179,37 +188,8 @@
 
         <!-- 3. DATA SOURCES TAB PANEL -->
         <div class="tab-panel" id="panelSources" hidden>
-          <div class="sources-intro">Cinder parses local logs and SQLite stores directly on this machine without network transfer:</div>
-          <div class="sources-list">
-            <div class="source-item">
-              <div class="source-name"><b>Pi</b> <code>~/.pi/agent/sessions/</code></div>
-              <div class="source-metrics">Requests, tokens, cost, tool calls, models</div>
-            </div>
-            <div class="source-item">
-              <div class="source-name"><b>Codex</b> <code>~/.codex/sessions/</code></div>
-              <div class="source-metrics">Requests, tokens, tool calls, models (cost estimated)</div>
-            </div>
-            <div class="source-item">
-              <div class="source-name"><b>Claude Code</b> <code>~/.claude/projects/</code></div>
-              <div class="source-metrics">Requests, tokens, tools, models (cost estimated)</div>
-            </div>
-            <div class="source-item">
-              <div class="source-name"><b>OpenCode</b> <code>~/.local/share/opencode/opencode.db</code></div>
-              <div class="source-metrics">Sessions, tokens, cost, tool calls</div>
-            </div>
-            <div class="source-item">
-              <div class="source-name"><b>Antigravity / T3</b> <code>~/.gemini/antigravity*</code> &amp; statev2.sqlite</div>
-              <div class="source-metrics">Requests, tools, sessions, T3 tokens (cost estimated)</div>
-            </div>
-            <div class="source-item">
-              <div class="source-name"><b>DSH</b> <code>~/.dsh/sessions/</code> (session.v4.jsonl.zstd)</div>
-              <div class="source-metrics">Requests, tokens, tools, sessions, models</div>
-            </div>
-            <div class="source-item">
-              <div class="source-name"><b>LM Studio</b> <code>~/.lmstudio/conversations/</code></div>
-              <div class="source-metrics">Requests, sessions, models</div>
-            </div>
-          </div>
+          <div class="sources-intro">Cinder parses local logs and SQLite stores directly on this machine, with no network transfer. This list is read live from your machine:</div>
+          <div class="sources-list" id="sourcesList"></div>
           <div class="sources-actions">
             <button id="settingsRescanBtn" class="modal-btn secondary">&#8635; Rescan All Sources Now</button>
           </div>
@@ -237,6 +217,10 @@
             <div class="about-row">
               <span class="about-k">Update Strategy</span>
               <span class="about-v">In-Place Overwrite (No Pre-Uninstall)</span>
+            </div>
+            <div class="about-row">
+              <span class="about-k">Keyboard</span>
+              <span class="about-v">1–4 view · R refresh · S settings · Esc close</span>
             </div>
             <div class="about-row">
               <span class="about-k">License</span>
