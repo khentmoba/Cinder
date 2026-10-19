@@ -338,7 +338,7 @@ fn parse_pi(
 
     cache.dirty = true;
     let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(16);
-    let chunk_size = (uncached.len() + num_threads - 1) / num_threads;
+    let chunk_size = uncached.len().div_ceil(num_threads);
     let mut thread_results: Vec<Vec<(String, CachedFile)>> = (0..num_threads).map(|_| Vec::new()).collect();
 
     let pricing_ref = pricing;
@@ -531,7 +531,7 @@ fn parse_codex(
     if !uncached.is_empty() {
         cache.dirty = true;
         let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(16);
-        let chunk_size = (uncached.len() + num_threads - 1) / num_threads;
+        let chunk_size = uncached.len().div_ceil(num_threads);
         let mut thread_results: Vec<Vec<(String, CachedFile)>> = (0..num_threads).map(|_| Vec::new()).collect();
 
         let pricing_ref = pricing;
