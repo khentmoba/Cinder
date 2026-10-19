@@ -134,3 +134,21 @@ test('an empty dashboard renders and resizes without throwing', () => {
   assert.doesNotThrow(() => run('render()'));
   assert.doesNotThrow(() => handlers.resize());
 });
+
+test('All time range button and filter aggregates without date cutoff', () => {
+  const { run, get } = dashboard();
+  run(`DATA.rows = [
+    {...blank(), day: '2025-01-01', agent: 'Pi', model: 'm', input: 100, cost: 1, cost_known: true},
+    {...blank(), day: '2026-10-18', agent: 'Pi', model: 'm', input: 200, cost: 2, cost_known: true}
+  ];
+  DATA.sessions = [{day: '2025-01-01', agent: 'Pi', sessions: 1}, {day: '2026-10-18', agent: 'Pi', sessions: 1}];
+  rangeDays = 0;
+  render();`);
+  assert.equal(run('filtered().length'), 2);
+  assert.equal(run('byAgent().grand.input'), 300);
+  assert.match(get('rangeLabel').textContent, /2025.*to.*2026/);
+  for (const file of ['../src/index.html', '../mock/index.html']) {
+    const html = fs.readFileSync(path.join(__dirname, file), 'utf8');
+    assert.match(html, /data-v="0">All time<\/button>/);
+  }
+});

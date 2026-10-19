@@ -275,7 +275,14 @@ function renderBreakdown() {
 function renderRangeLabel() {
   const days = byDay();
   if (!days.length) { document.getElementById('rangeLabel').textContent = ''; return; }
-  const fmtD = d => new Date(d + 'T00:00:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  const d1 = new Date(days[0].day + 'T00:00:00');
+  const d2 = new Date(days[days.length - 1].day + 'T00:00:00');
+  const diffYears = d1.getFullYear() !== d2.getFullYear();
+  const fmtD = d => new Date(d + 'T00:00:00').toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    ...(diffYears ? { year: 'numeric' } : {})
+  });
   document.getElementById('rangeLabel').textContent = fmtD(days[0].day) + ' to ' + fmtD(days[days.length - 1].day);
 }
 
@@ -311,7 +318,14 @@ function renderChart(list) {
     const pts = s.values.map((v, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join('');
     paths += `<path class="series" d="${pts}" stroke="${color(s.agent)}" opacity="0.9"/>`;
   }
-  const fmtDay = d => new Date(d + 'T00:00:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  const d1 = new Date(days[0].day + 'T00:00:00');
+  const d2 = new Date(days[days.length - 1].day + 'T00:00:00');
+  const diffYears = d1.getFullYear() !== d2.getFullYear();
+  const fmtDay = d => new Date(d + 'T00:00:00').toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    ...(diffYears ? { year: '2-digit' } : {})
+  });
   const labels = [0, Math.floor(days.length / 2), days.length - 1].filter((v, i, a) => a.indexOf(v) === i)
     .map(i => `<text class="xl" x="${x(i)}" y="${H - 6}" text-anchor="${i === 0 ? 'start' : i === days.length - 1 ? 'end' : 'middle'}">${fmtDay(days[i].day)}</text>`).join('');
 
