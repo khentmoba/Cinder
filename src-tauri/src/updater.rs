@@ -250,6 +250,7 @@ pub fn build_update_script(installer_path: &Path, target_exe: &Path, is_setup: b
         format!(
             "@echo off\r\n\
              ping 127.0.0.1 -n 3 >nul\r\n\
+             taskkill /F /IM cinder.exe >nul 2>&1\r\n\
              start /wait \"\" \"{}\" /S /UPDATE\r\n\
              start \"\" \"{}\"\r\n\
              del \"{}\" >nul 2>&1\r\n\
@@ -263,6 +264,7 @@ pub fn build_update_script(installer_path: &Path, target_exe: &Path, is_setup: b
         format!(
             "@echo off\r\n\
              ping 127.0.0.1 -n 3 >nul\r\n\
+             taskkill /F /IM cinder.exe >nul 2>&1\r\n\
              copy /y \"{}\" \"{}\" >nul 2>&1\r\n\
              start \"\" \"{}\"\r\n\
              del \"{}\" >nul 2>&1\r\n\
@@ -279,11 +281,13 @@ pub fn build_update_script(installer_path: &Path, target_exe: &Path, is_setup: b
 pub fn install_and_restart(installer_path: &Path, app: &AppHandle) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
 
-    let target_exe = dirs::data_local_dir()
-        .map(|p| p.join("Cinder").join("cinder.exe"))
+    let installed_exe = dirs::data_local_dir().map(|p| p.join("Cinder").join("cinder.exe"));
+    let target_exe = installed_exe
+        .as_ref()
         .filter(|p| p.exists())
+        .cloned()
         .or_else(|| std::env::current_exe().ok())
-        .ok_or_else(|| "Could not locate Cinder executable path".to_string())?;
+        .unwrap_or_else(|| installed_exe.unwrap_or_else(|| std::path::PathBuf::from("cinder.exe")));
 
     let temp_dir = std::env::temp_dir();
     let script_path = temp_dir.join("cinder-update-apply.cmd");

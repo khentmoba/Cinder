@@ -509,6 +509,31 @@ function switchSettingsTab(tabName) {
       modalTitle.textContent = 'Settings';
     }
   }
+
+  const laterBtn = document.getElementById('modalLaterBtn');
+  const actionBtn = document.getElementById('modalActionBtn');
+  if (tabName !== 'updates') {
+    if (laterBtn) laterBtn.hidden = true;
+    if (actionBtn) {
+      actionBtn.textContent = 'OK';
+      actionBtn.disabled = false;
+      actionBtn.onclick = hideUpdateModal;
+    }
+  } else if (UPDATE_INFO && UPDATE_INFO.available) {
+    if (laterBtn) laterBtn.hidden = false;
+    if (actionBtn) {
+      actionBtn.textContent = 'Update Now';
+      actionBtn.disabled = false;
+      actionBtn.onclick = startUpdateDownload;
+    }
+  } else {
+    if (laterBtn) laterBtn.hidden = true;
+    if (actionBtn) {
+      actionBtn.textContent = 'OK';
+      actionBtn.disabled = false;
+      actionBtn.onclick = hideUpdateModal;
+    }
+  }
 }
 
 function openSettings(tabName = 'updates') {
@@ -531,6 +556,7 @@ function showUpdateModal(info, isUpToDateMessage = false) {
   const ghLink = document.getElementById('modalGithubBtn');
   const progressBox = document.getElementById('updateProgressBox');
   const actionBtn = document.getElementById('modalActionBtn');
+  const laterBtn = document.getElementById('modalLaterBtn');
   const msgEl = document.getElementById('updateMsg');
   const metaBox = document.querySelector('.update-meta');
   const notesSec = document.querySelector('.notes-section');
@@ -548,6 +574,7 @@ function showUpdateModal(info, isUpToDateMessage = false) {
       msgEl.hidden = false;
       msgEl.textContent = `You are on the latest version of Cinder (v${info.current_version}).`;
     }
+    if (laterBtn) laterBtn.hidden = true;
     if (actionBtn) {
       actionBtn.textContent = 'OK';
       actionBtn.disabled = false;
@@ -567,6 +594,7 @@ function showUpdateModal(info, isUpToDateMessage = false) {
     }
     if (ghLink) ghLink.href = info.release_url || 'https://github.com/khentmoba/Cinder/releases';
     if (settingsStatus) settingsStatus.textContent = `Update v${info.latest_version} available!`;
+    if (laterBtn) laterBtn.hidden = false;
     if (actionBtn) {
       actionBtn.textContent = 'Update Now';
       actionBtn.disabled = false;
@@ -725,15 +753,26 @@ document.getElementById('settingsCheckBtn')?.addEventListener('click', async () 
   }
 });
 
-document.getElementById('settingsRescanBtn')?.addEventListener('click', () => {
-  const refreshBtn = document.getElementById('refresh');
-  if (refreshBtn) refreshBtn.click();
+document.getElementById('settingsRescanBtn')?.addEventListener('click', async () => {
   const rescanBtn = document.getElementById('settingsRescanBtn');
   if (rescanBtn) {
-    rescanBtn.textContent = 'Rescanning…';
-    setTimeout(() => {
+    rescanBtn.disabled = true;
+    rescanBtn.textContent = 'Rescanning all sources…';
+  }
+  document.body.classList.add('loading');
+  try {
+    DATA = await invokeCmd('rescan_stats');
+    render();
+    statusLine().textContent = 'updated ' + new Date().toLocaleTimeString();
+    renderMeta(false);
+  } catch (e) {
+    statusLine().textContent = 'error: ' + e;
+  } finally {
+    document.body.classList.remove('loading');
+    if (rescanBtn) {
+      rescanBtn.disabled = false;
       rescanBtn.textContent = '↻ Rescan All Sources Now';
-    }, 1500);
+    }
   }
 });
 
