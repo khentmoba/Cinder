@@ -20,9 +20,10 @@ npm run install-local  # build + silently reinstall, so the desktop
 
 Cinder watches the log stores below with OS file notifications and pushes fresh
 stats into the open window (`stats-updated` event): debounced 10 s after writes
-go quiet, at most one rescan per minute. No refresh clicks, no polling reads
-while idle. Manual refresh via the ↻ button still works and serialises with the
-watcher through a shared scan lock.
+go quiet, at most one rescan per minute. Source directories are checked every
+5 s to discover newly installed agents and T3 instances; log contents are read
+only for scans, not polled while idle. Manual refresh via the ↻ button still
+works and serialises with the watcher through a shared scan lock.
 
 ## Data sources (parsed locally, no network)
 
@@ -40,5 +41,18 @@ Agents that log no token or cost field (older Antigravity IDE transcripts) are
 still fully visible: use the **Requests** metric. Cost/tokens views show a `—`
 for them by design, so the agent list also prints the request count next to
 the cost.
+
+Daily ranges use UTC dates; **Today (UTC)** is a calendar day, not a rolling
+24-hour window. Costs marked **≥** exclude some unpriced token usage. Codex
+cache counts are kept as reported, without borrowing ratios from other agents.
+
+## Tests
+
+```bash
+npm test                          # dashboard regressions (Node.js 18+)
+cargo test --manifest-path src-tauri/Cargo.toml  # synthetic logs and databases
+```
+
+Tests use temporary home directories, not your real agent logs.
 
 Add agents by extending `parse_*` functions in `src-tauri/src/main.rs`.

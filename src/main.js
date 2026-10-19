@@ -71,12 +71,12 @@ function fmtAxis(n) {
   if (n >= 1e3) return (n / 1e3).toFixed(0) + 'K';
   return String(n);
 }
-const fmtUsd = (n, known) => known ? '$' + (n >= 100 ? n.toFixed(0) : n.toFixed(2)) : '—';
+const fmtUsd = (n, known, partial = false) => known ? (partial ? '≥ ' : '') + '$' + (n >= 100 ? n.toFixed(0) : n.toFixed(2)) : '—';
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
 function todayStr(offsetDays = 0) {
   const d = new Date();
-  d.setDate(d.getDate() + offsetDays);
+  d.setUTCDate(d.getUTCDate() + offsetDays);
   return d.toISOString().slice(0, 10);
 }
 
@@ -93,12 +93,14 @@ function sessionCount() {
 }
 
 function blank() {
-  return { requests: 0, input: 0, cache_read: 0, cache_write: 0, output: 0, reasoning: 0, tools: 0, cost: 0, cost_known: false, savings: 0 };
+  return { requests: 0, input: 0, cache_read: 0, cache_write: 0, output: 0, reasoning: 0, tools: 0, cost: 0, cost_known: false, cost_partial: false, savings: 0 };
 }
 function acc(r, a) {
   a.requests += r.requests; a.input += r.input; a.cache_read += r.cache_read; a.cache_write += r.cache_write;
   a.output += r.output; a.reasoning += r.reasoning; a.tools += r.tools; a.cost += r.cost;
-  a.cost_known = a.cost_known || r.cost_known; a.savings += r.savings;
+  a.cost_known = a.cost_known || r.cost_known;
+  a.cost_partial ||= !!r.cost_partial || (!r.cost_known && tok(r) > 0);
+  a.savings += r.savings;
   return a;
 }
 const tok = a => a.input + a.cache_read + a.cache_write + a.output;
@@ -109,12 +111,12 @@ const tok = a => a.input + a.cache_read + a.cache_write + a.output;
 // a flat line pinned to the baseline: switch to the requests metric to see
 // them. Newer CLI transcripts do report tokens and are priced like the rest.
 const METRICS = {
-  cost:     { label: 'cost',     get: a => a.cost,     fmt: (n, known) => fmtUsd(n, known) },
+  cost:     { label: 'cost',     get: a => a.cost,     fmt: (n, known, partial) => fmtUsd(n, known, partial) },
   tokens:   { label: 'tokens',   get: tok,             fmt: n => fmtTok(n) },
   requests: { label: 'requests', get: a => a.requests, fmt: n => n.toLocaleString() },
 };
 const mval = a => METRICS[metric].get(a);
-const mfmt = (n, known) => METRICS[metric].fmt(n, known);
+const mfmt = (n, known, partial) => METRICS[metric].fmt(n, known, partial);
 
 function byAgent() {
   const m = new Map();
@@ -139,11 +141,8 @@ function byModel() {
   for (const r of filtered()) {
     if (selectedAgent && r.agent !== selectedAgent) continue;
     const key = r.model || '(tools only)';
-    if (!m.has(key)) m.set(key, { ...blank(), agents: new Set(), pricedModels: new Set() });
-    const a = m.get(key);
-    acc(r, a);
-    a.agents.add(r.agent);
-    if (r.cost_known && (r.input + r.output + r.cache_read + r.cache_write) > 0) a.pricedModels.add(r.model);
+    if (!m.has(key)) m.set(key, blank());
+    acc(r, m.get(key));
   }
   const list = [...m.entries()].map(([model, a]) => ({ model, ...a }));
   const totalTok = list.reduce((t, a) => t + tok(a), 0);
@@ -191,7 +190,7 @@ function render() {
   if (showLimits) { renderRangeLabel(); return; }
 
   const { list, grand } = byAgent();
-  const bigVal = mfmt(mval(grand), grand.cost_known);
+  const bigVal = mfmt(mval(grand), grand.cost_known, grand.cost_partial);
   // reset the class too: the first render may land on skeleton placeholders
   const big = document.getElementById('bigTotal');
   big.className = 'big';
@@ -207,12 +206,12 @@ function render() {
     // Cost is redundant when it is the selected metric; the request count never
     // is, and it is the only volume signal for agents that log no tokens.
     const extra = metric === 'cost' ? ''
-      : ` • ${fmtUsd(a.cost, a.cost_known)} • ${a.requests.toLocaleString()} req`;
+      : ` • ${fmtUsd(a.cost, a.cost_known, a.cost_partial)} • ${a.requests.toLocaleString()} req`;
     return `<li class="${selectedAgent === a.agent ? 'sel' : ''}" data-agent="${esc(a.agent)}" style="box-shadow:inset 2px 0 0 ${color(a.agent)}">
       <span class="radio"></span>
       <img class="logo" src="${agentLogo(a.agent)}" alt="" onerror="this.style.visibility='hidden'">
       <span class="name">${esc(a.agent)} <span class="cnt">${a.sessions} sessions</span></span>
-      <span class="val">${mfmt(v, a.cost_known)}<span class="pct">${share}% of ${METRICS[metric].label}${extra}</span></span>
+      <span class="val">${mfmt(v, a.cost_known, a.cost_partial)}<span class="pct">${share}% of ${METRICS[metric].label}${extra}</span></span>
     </li>`;
   }).join('') || '<li class="dim">no data</li>';
   document.querySelectorAll('#agentList li[data-agent]').forEach(li =>
@@ -250,7 +249,7 @@ function renderBreakdown() {
         const last = metric === 'cost' ? d.requests.toLocaleString() : fmtTok(tok(d));
         const share = v / total * 100;
         const bar = share > 0.5 ? `<span class="bar" style="width:${Math.min(100, share * 4)}%"></span>` : '';
-        return `<tr><td>${i + 1}</td><td>${d.day}${bar}</td><td class="${d.cost_known ? 'cost' : 'unpriced'}">${d.cost_known ? fmtUsd(d.cost, true) : 'Unpriced'}</td>` +
+        return `<tr><td>${i + 1}</td><td>${d.day}${bar}</td><td class="${d.cost_known ? 'cost' : 'unpriced'}">${d.cost_known ? fmtUsd(d.cost, true, d.cost_partial) : 'Unpriced'}</td>` +
           `<td>${share < 0.1 ? '<0.1%' : share.toFixed(1) + '%'}</td><td>${last}</td></tr>`;
       }).join('');
     return;
@@ -267,7 +266,7 @@ function renderBreakdown() {
       const bar = share > 0.5 ? `<span class="bar" style="width:${Math.min(100, share * 4)}%"></span>` : '';
       const logo = providerLogo(a.model);
       return `<tr><td>${i + 1}</td><td class="modelcell">${logo ? `<img class="logo sm" src="${logo}" alt="" onerror="this.remove()">` : ''}${esc(a.model)}${bar}</td>` +
-        `<td class="${priced ? 'cost' : 'unpriced'}">${priced ? fmtUsd(a.cost, true) : 'Unpriced'}</td>` +
+        `<td class="${priced ? 'cost' : 'unpriced'}">${priced ? fmtUsd(a.cost, true, a.cost_partial) : 'Unpriced'}</td>` +
         `<td>${share < 0.1 ? '<0.1%' : share.toFixed(1) + '%'}</td><td>${metric === 'requests' ? a.requests.toLocaleString() : fmtTok(tok(a))}</td></tr>`;
     }).join('');
 }
@@ -289,6 +288,7 @@ function renderChart(list) {
   const series = list.map(a => ({
     agent: a.agent,
     known: days.map(d => cell(a, d)?.cost_known),
+    partial: days.map(d => cell(a, d)?.cost_partial),
     values: days.map(d => { const v = cell(a, d); return v ? mval(v) : 0; }),
   }));
   const W = box.clientWidth || 800, H = box.clientHeight || 400;
@@ -364,10 +364,11 @@ function tipHTML(days, series, i) {
   const head = new Date(days[i].day + 'T00:00:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
   const rows = series.map(s => ({
     agent: s.agent, v: s.values[i],
-    txt: mfmt(s.values[i], s.known[i]),
+    known: s.known[i], partial: s.partial[i],
+    txt: mfmt(s.values[i], s.known[i], s.partial[i]),
   })).sort((a, b) => b.v - a.v);
   const total = rows.reduce((t, r) => t + r.v, 0);
-  const totalTxt = mfmt(total, total > 0);
+  const totalTxt = mfmt(total, rows.some(r => r.known), rows.some(r => r.partial));
   return `<div class="d">${head}</div>` + rows.map(r =>
     `<div class="r"><img class="logo sm" src="${agentLogo(r.agent)}" alt="" onerror="this.style.visibility='hidden'">` +
     `<span class="n">${esc(r.agent)}</span><b>${r.txt}</b></div>`).join('') +
@@ -425,9 +426,7 @@ async function load() {
 // footer metadata line, shared by manual loads and live watcher pushes
 function renderMeta(live) {
   const p = DATA.pricing;
-  const adj = DATA.adjusted_tokens || 0;
   const notes = [];
-  if (adj > 0) notes.push(`cache ratio re-applied to ${fmtTok(adj)} tokens (Codex proxy hides cache hits)`);
   if ((DATA.plan_routes || []).length) notes.push('plan routes (no per-token billing): ' + DATA.plan_routes.join(', '));
   if ((DATA.unpriced || []).length) notes.push('unpriced: ' + DATA.unpriced.slice(0, 3).join(', '));
   document.getElementById('priceinfo').textContent =
@@ -463,5 +462,5 @@ const chartBox = document.getElementById('chart');
 chartBox.addEventListener('pointermove', chartHover);
 chartBox.addEventListener('pointerleave', chartLeave);
 document.getElementById('refresh').addEventListener('click', load);
-window.addEventListener('resize', () => DATA && renderChart(byAgent().list));
+window.addEventListener('resize', () => DATA && metric !== 'limits' && renderChart(byAgent().list));
 load();

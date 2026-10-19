@@ -72,7 +72,7 @@ fn norm(s: &str) -> String {
     // tokens cost more, which this estimate does not capture)
     if let Some(dash) = base.rfind('-') {
         let suf = &base[dash + 1..];
-        if suf.len() >= 2 && suf[..suf.len() - 1].chars().all(|c| c.is_ascii_digit()) && suf.ends_with('m') {
+        if suf.strip_suffix('m').is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())) {
             base.truncate(dash);
         }
     }
@@ -121,15 +121,19 @@ impl Pricing {
             .to_string();
 
         let mut local = HashMap::new();
-        let mut local_conflicts = load_pi_catalog(&home.join(".pi").join("agent").join("models-store.json"), &mut local);
-        let mut cline = HashMap::new();
-        let cline_conflicts = load_clinepass(&home.join(".pi").join("agent").join("clinepass-prices.json"), &mut cline);
-        local_conflicts.extend(cline_conflicts);
-        // a bare id is only usable when all providers quote the same price
+        load_clinepass(&home.join(".pi").join("agent").join("clinepass-prices.json"), &mut local);
+        load_pi_catalog(&home.join(".pi").join("agent").join("models-store.json"), &mut local);
+        // A bare id is only usable when all providers agree, including cache prices.
         let mut local_bare: HashMap<String, Price> = HashMap::new();
-        for (k, v) in local.iter().filter(|(k, _)| !k.contains('/')) {
-            local_bare.insert(k.clone(), *v);
+        let mut local_conflicts = std::collections::HashSet::new();
+        for (key, price) in &local {
+            let id = tail(key);
+            if local_bare.get(&id).is_some_and(|previous| previous != price) {
+                local_conflicts.insert(id.clone());
+            }
+            local_bare.insert(id, *price);
         }
+        local_bare.retain(|id, _| !local_conflicts.contains(id));
 
         Pricing {
             embedded_count: embedded.len(),
@@ -143,7 +147,7 @@ impl Pricing {
         }
     }
 
-    fn from_local(&self, provider: Option<&str>, model: &str) -> Option<Price> {
+    fn lookup_local(&self, provider: Option<&str>, model: &str) -> Option<Price> {
         let m = model.to_lowercase();
         let t = tail(&m);
         // also try the normalized tail so context-size variants
@@ -157,6 +161,10 @@ impl Pricing {
             // a known provider is priced strictly by its own catalog entry
             Some(p) => {
                 for cand in provider_candidates(p) {
+                    let id = m.strip_prefix(&format!("{}/", cand)).unwrap_or(&m);
+                    if let Some(price) = self.local_by_provider.get(&format!("{}/{}", cand, id)) {
+                        return Some(*price);
+                    }
                     for tail in &tails {
                         if let Some(pr) = self
                             .local_by_provider
@@ -169,17 +177,11 @@ impl Pricing {
                 None
             }
             // unknown provider: a bare id is fine, unless providers disagree about it
-            None => {
-                if self.local_conflicts.contains(&t) {
-                    None
-                } else {
-                    self.local_bare.get(&t).copied()
-                }
-            }
+            None => tails.iter().find_map(|id| self.local_bare.get(id).copied()),
         }
     }
 
-    fn from_embedded(&self, model: &str) -> Option<Price> {
+    fn lookup_embedded(&self, model: &str) -> Option<Price> {
         let m = model.to_lowercase();
         if let Some(p) = self.embedded.get(&m) {
             return Some(*p);
@@ -252,7 +254,10 @@ impl Pricing {
         if model.is_empty() || model == "unknown" {
             return None;
         }
-        if let Some(p) = self.from_local(provider, model) {
+        if provider.is_none() && [tail(model), norm(model)].iter().any(|id| self.local_conflicts.contains(id)) {
+            return None;
+        }
+        if let Some(p) = self.lookup_local(provider, model) {
             return Some(p);
         }
         // free / contributor routes genuinely cost nothing, whatever the provider
@@ -272,7 +277,7 @@ impl Pricing {
         if !mirror {
             return None;
         }
-        self.from_embedded(model).or_else(|| self.family(model))
+        self.lookup_embedded(model).or_else(|| self.family(model))
     }
 }
 
@@ -373,12 +378,10 @@ fn price_from_json(v: &serde_json::Value) -> Option<Price> {
 
 /// ~/.pi/agent/models-store.json : { provider: { models: [ { id, cost: {...} } ] } }
 /// (older builds used an object keyed by model id; both shapes are accepted)
-/// Returns the set of model ids that different providers price differently.
-fn load_pi_catalog(path: &std::path::Path, out: &mut HashMap<String, Price>) -> std::collections::HashSet<String> {
-    let mut conflicts = std::collections::HashSet::new();
-    let Ok(text) = std::fs::read_to_string(path) else { return conflicts };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return conflicts };
-    let Some(providers) = v.as_object() else { return conflicts };
+fn load_pi_catalog(path: &std::path::Path, out: &mut HashMap<String, Price>) {
+    let Ok(text) = std::fs::read_to_string(path) else { return };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return };
+    let Some(providers) = v.as_object() else { return };
     for (provider, pv) in providers {
         let Some(models) = pv.get("models") else { continue };
         let mut insert = |id: &str, mv: &serde_json::Value| {
@@ -386,12 +389,6 @@ fn load_pi_catalog(path: &std::path::Path, out: &mut HashMap<String, Price>) -> 
             if let Some(p) = price_from_json(cost) {
                 let idl = id.to_lowercase();
                 let key = format!("{}/{}", provider.to_lowercase(), idl);
-                // remember when two providers disagree about the same model id
-                if let Some(prev) = out.get(&idl) {
-                    if prev.i != p.i || prev.o != p.o {
-                        conflicts.insert(idl.clone());
-                    }
-                }
                 out.insert(key, p);
             }
         };
@@ -411,27 +408,16 @@ fn load_pi_catalog(path: &std::path::Path, out: &mut HashMap<String, Price>) -> 
             _ => {}
         }
     }
-    conflicts
 }
 
 /// ~/.pi/agent/clinepass-prices.json : { models: { key: { input, output, cacheRead } } }
-fn load_clinepass(path: &std::path::Path, out: &mut HashMap<String, Price>) -> std::collections::HashSet<String> {
-    let mut conflicts = std::collections::HashSet::new();
-    let Ok(text) = std::fs::read_to_string(path) else { return conflicts };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return conflicts };
-    let Some(models) = v.get("models").and_then(|m| m.as_object()) else { return conflicts };
+fn load_clinepass(path: &std::path::Path, out: &mut HashMap<String, Price>) {
+    let Ok(text) = std::fs::read_to_string(path) else { return };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return };
+    let Some(models) = v.get("models").and_then(|m| m.as_object()) else { return };
     for (id, mv) in models {
         if let Some(p) = price_from_json(mv) {
-            let key = id.to_lowercase();
-            let t = tail(&key);
-            if let Some(prev) = out.get(&t) {
-                if prev.i != p.i || prev.o != p.o {
-                    conflicts.insert(t.clone());
-                }
-            }
-            out.insert(key, p);
-            out.insert(t, p);
+            out.insert(id.to_lowercase(), p);
         }
     }
-    conflicts
 }
