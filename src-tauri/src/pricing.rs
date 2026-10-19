@@ -57,12 +57,16 @@ fn norm(s: &str) -> String {
     };
     // strip trailing date / build tags: -20250929, -v1:0, @free, :free, -latest
     let mut base = out.clone();
+    if let Some(i) = base.find('(') {
+        base.truncate(i);
+    }
+    base = base.trim().replace(' ', "-");
     // DSH names the model with its route baked in (antigravity-gemini-3.8-flash
     // served by the antigravity route); the catalog prices the bare id.
     if let Some(stripped) = base.strip_prefix("antigravity-") {
         base = stripped.to_string();
     }
-    for pat in [":free", "@free", "-latest", "-preview", "-tiered"] {
+    for pat in [":free", "@free", "-latest", "-preview", "-tiered", "-thinking", "-high", "-medium", "-low", "-exp"] {
         if let Some(i) = base.rfind(pat) {
             base.truncate(i);
         }
@@ -123,6 +127,7 @@ impl Pricing {
         let mut local = HashMap::new();
         load_clinepass(&home.join(".pi").join("agent").join("clinepass-prices.json"), &mut local);
         load_pi_catalog(&home.join(".pi").join("agent").join("models-store.json"), &mut local);
+        load_pi_catalog(&home.join(".pi").join("agent").join("models.json"), &mut local);
         // A bare id is only usable when all providers agree, including cache prices.
         let mut local_bare: HashMap<String, Price> = HashMap::new();
         let mut local_conflicts = std::collections::HashSet::new();
@@ -150,13 +155,31 @@ impl Pricing {
     fn lookup_local(&self, provider: Option<&str>, model: &str) -> Option<Price> {
         let m = model.to_lowercase();
         let t = tail(&m);
-        // also try the normalized tail so context-size variants
-        // (gpt-6-luna-1m) match the base catalog entry (gpt-6-luna)
         let mut tails = vec![t.clone()];
         let nt = norm(&t);
         if nt != t {
-            tails.push(nt);
+            tails.push(nt.clone());
         }
+        // Also try converting version dots <-> dashes: e.g. 3-8 <-> 3.8
+        if t.contains('.') {
+            tails.push(t.replace('.', "-"));
+        } else if t.contains('-') {
+            let mut dotted = String::new();
+            let chars: Vec<char> = t.chars().collect();
+            for i in 0..chars.len() {
+                if chars[i] == '-' && i > 0 && i + 1 < chars.len() && chars[i - 1].is_ascii_digit() && chars[i + 1].is_ascii_digit() {
+                    dotted.push('.');
+                } else {
+                    dotted.push(chars[i]);
+                }
+            }
+            if dotted != t {
+                tails.push(dotted.clone());
+                tails.push(norm(&dotted));
+            }
+        }
+        tails.dedup();
+
         match provider {
             // a known provider is priced strictly by its own catalog entry
             Some(p) => {
@@ -254,11 +277,22 @@ impl Pricing {
         if model.is_empty() || model == "unknown" {
             return None;
         }
-        if provider.is_none() && [tail(model), norm(model)].iter().any(|id| self.local_conflicts.contains(id)) {
+        let (inferred_provider, _model_tail) = match model.split_once('/') {
+            Some((p, m)) if !p.is_empty() && !m.is_empty() => (Some(p), m),
+            _ => (None, model),
+        };
+        let effective_provider = provider.or(inferred_provider);
+
+        if effective_provider.is_none() && [tail(model), norm(model)].iter().any(|id| self.local_conflicts.contains(id)) {
             return None;
         }
-        if let Some(p) = self.lookup_local(provider, model) {
+        if let Some(p) = self.lookup_local(effective_provider, model) {
             return Some(p);
+        }
+        if effective_provider != provider {
+            if let Some(p) = self.lookup_local(provider, model) {
+                return Some(p);
+            }
         }
         // free / contributor routes genuinely cost nothing, whatever the provider
         let m = model.to_lowercase();
@@ -268,7 +302,7 @@ impl Pricing {
         // Public list prices are only a fair stand-in for providers that actually bill
         // per token. A subscription route (zed-ai, antigravity, ...) is covered by its
         // plan, so pricing it from a same-named OpenAI/Anthropic model would be fiction.
-        let mirror = match provider {
+        let mirror = match effective_provider {
             None => true,
             Some(p) => provider_candidates(p)
                 .iter()
@@ -285,7 +319,8 @@ impl Pricing {
 const MIRROR_PROVIDERS: &[&str] = &[
     "openai", "anthropic", "google", "gemini", "vertex_ai-language-models", "azure",
     "openrouter", "deepseek", "mistral", "xai", "groq", "together_ai", "fireworks_ai",
-    "bedrock", "ollama", "lm_studio",
+    "bedrock", "ollama", "lm_studio", "tokenharbor", "clinepass", "cline-pass", "cline",
+    "explabs",
 ];
 
 /// "opencode-go-responses" and "opencode-go" are the same Zen route with a different
@@ -293,7 +328,7 @@ const MIRROR_PROVIDERS: &[&str] = &[
 fn provider_candidates(provider: &str) -> Vec<String> {
     let p = provider.to_lowercase();
     let mut out = vec![p.clone()];
-    for suffix in ["-responses", "-free-responses", "-chat", "-go", "-zen", "-free"] {
+    for suffix in ["-responses", "-free-responses", "-chat", "-go", "-zen", "-free", "-pass", "-official", "-account"] {
         if let Some(base) = p.strip_suffix(suffix) {
             out.push(base.to_string());
             if base.starts_with("opencode") {
@@ -308,6 +343,14 @@ fn provider_candidates(provider: &str) -> Vec<String> {
             out.push("opencode".to_string());
         }
         "openai-codex" => out.push("openai".to_string()),
+        "cline" | "clinepass" | "cline-pass" => {
+            out.push("cline-pass".to_string());
+            out.push("clinepass".to_string());
+            out.push("cline".to_string());
+        }
+        "deepseek-official" | "deepseek-account" => {
+            out.push("deepseek".to_string());
+        }
         // user-defined routes that re-serve known catalog models under the
         // same ids (verified identical prices across the aliased providers)
         "custom" => {
@@ -381,7 +424,13 @@ fn price_from_json(v: &serde_json::Value) -> Option<Price> {
 fn load_pi_catalog(path: &std::path::Path, out: &mut HashMap<String, Price>) {
     let Ok(text) = std::fs::read_to_string(path) else { return };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return };
-    let Some(providers) = v.as_object() else { return };
+    let providers = if let Some(pv) = v.get("providers").and_then(|p| p.as_object()) {
+        pv
+    } else if let Some(pv) = v.as_object() {
+        pv
+    } else {
+        return;
+    };
     for (provider, pv) in providers {
         let Some(models) = pv.get("models") else { continue };
         let mut insert = |id: &str, mv: &serde_json::Value| {
