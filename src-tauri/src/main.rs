@@ -1306,7 +1306,7 @@ fn scan_home(home: &Path, progress: &dyn Fn(&str)) -> Stats {
         *unpriced.entry(r.model.clone()).or_default() += r.tokens();
     }
     let mut unpriced: Vec<_> = unpriced.into_iter().collect();
-    unpriced.sort_by(|a, b| b.1.cmp(&a.1));
+    unpriced.sort_by_key(|a| std::cmp::Reverse(a.1));
 
     Stats {
         rows,
