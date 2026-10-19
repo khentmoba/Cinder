@@ -4,56 +4,58 @@
 // and emits per-day, per-agent, per-model rows. The UI aggregates by time range.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod cache;
 mod pricing;
 mod updater;
 
+use cache::{file_stamp, CachedDb, CachedFile, CachedLimit, ScanCache};
 use pricing::Pricing;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter};
 
-#[derive(Serialize, Default, Clone)]
-struct Row {
-    day: String,
-    agent: String,
-    model: String,
-    requests: u64,
-    input: u64,
-    cache_read: u64,
-    cache_write: u64,
-    output: u64,
-    reasoning: u64,
-    tools: u64,
-    cost: f64,
-    cost_known: bool,
-    cost_partial: bool,
-    savings: f64,
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
+pub struct Row {
+    pub day: String,
+    pub agent: String,
+    pub model: String,
+    pub requests: u64,
+    pub input: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub output: u64,
+    pub reasoning: u64,
+    pub tools: u64,
+    pub cost: f64,
+    pub cost_known: bool,
+    pub cost_partial: bool,
+    pub savings: f64,
 }
 
 impl Row {
-    fn tokens(&self) -> u64 {
+    pub fn tokens(&self) -> u64 {
         self.input + self.cache_read + self.cache_write + self.output
     }
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 struct SessionRow {
     day: String,
     agent: String,
     sessions: u64,
 }
 
-#[derive(Serialize, Clone)]
-struct LimitRow {
-    agent: String,
-    window: String,
-    used_percent: f64,
-    window_minutes: i64,
-    resets_at: i64,
-    plan: String,
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct LimitRow {
+    pub agent: String,
+    pub window: String,
+    pub used_percent: f64,
+    pub window_minutes: i64,
+    pub resets_at: i64,
+    pub plan: String,
 }
 
 #[derive(Serialize)]
@@ -200,281 +202,532 @@ const CLAUDE_KEYS: &[&str] = &["assistant", "usage"];
 const AGY_KEYS: &[&str] = &["PLANNER_RESPONSE", "Model Selection"];
 
 // ---------------- Pi ----------------
-fn parse_pi(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Sess, plan_routes: &mut HashMap<String, u64>) -> u64 {
+fn parse_single_pi(
+    file: &Path,
+    pricing: &Pricing,
+    rows: &mut Rows,
+    sess: &mut Sess,
+    plan_routes: &mut HashMap<String, u64>,
+) {
+    let mut day = String::new();
+    each_line(file, |line| {
+        if !has_key(line, PI_KEYS) {
+            return;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return };
+        let ts = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
+        if v.get("type").and_then(|t| t.as_str()) == Some("session") && day.is_empty() {
+            day = day_of(ts);
+        }
+        if v.get("type").and_then(|t| t.as_str()) != Some("message") {
+            return;
+        }
+        let Some(msg) = v.get("message") else { return };
+        if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            return;
+        }
+        let u = msg.get("usage").cloned().unwrap_or(serde_json::Value::Null);
+        let input = u.get("input").and_then(|x| x.as_u64()).unwrap_or(0);
+        let output = u.get("output").and_then(|x| x.as_u64()).unwrap_or(0);
+        let cache_read = u.get("cacheRead").and_then(|x| x.as_u64()).unwrap_or(0);
+        let cache_write = u.get("cacheWrite").and_then(|x| x.as_u64()).unwrap_or(0);
+        let reasoning = u.get("reasoning").and_then(|x| x.as_u64()).unwrap_or(0);
+        if input + output + cache_read + cache_write == 0 {
+            return;
+        }
+        let mut tools = 0u64;
+        if let Some(content) = msg.get("content").and_then(|x| x.as_array()) {
+            for item in content {
+                if item.get("type").and_then(|t| t.as_str()) == Some("toolCall") {
+                    tools += 1;
+                }
+            }
+        }
+        let model = pricing::normalize_model(msg.get("model").and_then(|m| m.as_str()).unwrap_or("unknown"));
+        let provider = msg.get("provider").and_then(|p| p.as_str()).map(|s| s.to_lowercase());
+        let mut r = Row {
+            day: day_of(ts),
+            agent: "Pi".into(),
+            model: model.clone(),
+            requests: 1,
+            input,
+            cache_read,
+            cache_write,
+            output,
+            reasoning,
+            tools,
+            ..Default::default()
+        };
+        // pi accounts for its own routes. A reported zero is meaningful: it means the
+        // route is a plan/subscription or has no per-token billing (e.g. zed-ai),
+        // so it must not be re-priced with a same-named model from another provider.
+        let reported = u.get("cost").and_then(|c| c.get("total")).and_then(|x| x.as_f64());
+        let priced = pricing.lookup(provider.as_deref(), &model);
+        match reported {
+            Some(c) if c > 0.0 => {
+                r.cost = c;
+                r.cost_known = true;
+            }
+            Some(_) if provider.is_some() && priced.is_none() => {
+                // plan route: covered by the subscription, not billed per token
+                r.cost = 0.0;
+                r.cost_known = true;
+            }
+            _ => {
+                if let Some(p) = priced {
+                    r.cost = p.cost(input, cache_read, cache_write, output);
+                    r.cost_known = true;
+                }
+            }
+        }
+        if let Some(p) = priced {
+            r.savings = p.savings(cache_read, cache_write);
+        }
+        if provider.is_some() && reported == Some(0.0) && priced.is_none() {
+            if let Some(p) = provider.as_deref() {
+                *plan_routes.entry(p.to_string()).or_insert(0) += input + cache_read + cache_write + output;
+            }
+        }
+        if r.day.is_empty() {
+            r.day = day.clone();
+        }
+        add(rows, sess, "Pi", &model, &r.day.clone(), r);
+    });
+    if !day.is_empty() {
+        session(sess, "Pi", &day);
+    }
+}
+
+fn parse_pi(
+    home: &Path,
+    pricing: &Pricing,
+    cache: &mut ScanCache,
+    rows: &mut Rows,
+    sess: &mut Sess,
+    plan_routes: &mut HashMap<String, u64>,
+) -> u64 {
     let root = home.join(".pi").join("agent").join("sessions");
     let files = list_files(&root, "jsonl", None);
+    if files.is_empty() {
+        return 0;
+    }
+
+    let mut uncached = Vec::new();
     for file in &files {
-        let mut day = String::new();
-        each_line(file, |line| {
-            if !has_key(line, PI_KEYS) {
-                return;
-            }
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return };
-            let ts = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
-            if v.get("type").and_then(|t| t.as_str()) == Some("session") && day.is_empty() {
-                day = day_of(ts);
-            }
-            if v.get("type").and_then(|t| t.as_str()) != Some("message") {
-                return;
-            }
-            let Some(msg) = v.get("message") else { return };
-            if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
-                return;
-            }
-            let u = msg.get("usage").cloned().unwrap_or(serde_json::Value::Null);
-            let input = u.get("input").and_then(|x| x.as_u64()).unwrap_or(0);
-            let output = u.get("output").and_then(|x| x.as_u64()).unwrap_or(0);
-            let cache_read = u.get("cacheRead").and_then(|x| x.as_u64()).unwrap_or(0);
-            let cache_write = u.get("cacheWrite").and_then(|x| x.as_u64()).unwrap_or(0);
-            let reasoning = u.get("reasoning").and_then(|x| x.as_u64()).unwrap_or(0);
-            if input + output + cache_read + cache_write == 0 {
-                return;
-            }
-            let mut tools = 0u64;
-            if let Some(content) = msg.get("content").and_then(|x| x.as_array()) {
-                for item in content {
-                    if item.get("type").and_then(|t| t.as_str()) == Some("toolCall") {
-                        tools += 1;
-                    }
+        let path_str = file.to_string_lossy().to_string();
+        if let Some((mtime_ns, size)) = file_stamp(file) {
+            if let Some(entry) = cache.get_file(&path_str, mtime_ns, size) {
+                for r in &entry.rows {
+                    add(rows, sess, &r.agent, &r.model, &r.day, r.clone());
                 }
-            }
-            let model = pricing::normalize_model(msg.get("model").and_then(|m| m.as_str()).unwrap_or("unknown"));
-            let provider = msg.get("provider").and_then(|p| p.as_str()).map(|s| s.to_lowercase());
-            let mut r = Row {
-                day: day_of(ts),
-                agent: "Pi".into(),
-                model: model.clone(),
-                requests: 1,
-                input,
-                cache_read,
-                cache_write,
-                output,
-                reasoning,
-                tools,
-                ..Default::default()
-            };
-            // pi accounts for its own routes. A reported zero is meaningful: it means the
-            // route is a plan/subscription or has no per-token billing (e.g. zed-ai),
-            // so it must not be re-priced with a same-named model from another provider.
-            let reported = u.get("cost").and_then(|c| c.get("total")).and_then(|x| x.as_f64());
-            let priced = pricing.lookup(provider.as_deref(), &model);
-            match reported {
-                Some(c) if c > 0.0 => {
-                    r.cost = c;
-                    r.cost_known = true;
+                for (day, agent) in &entry.sessions {
+                    session(sess, agent, day);
                 }
-                Some(_) if provider.is_some() && priced.is_none() => {
-                    // plan route: covered by the subscription, not billed per token
-                    r.cost = 0.0;
-                    r.cost_known = true;
+                for (k, v) in &entry.plan_routes {
+                    *plan_routes.entry(k.clone()).or_insert(0) += v;
                 }
-                _ => {
-                    if let Some(p) = priced {
-                        r.cost = p.cost(input, cache_read, cache_write, output);
-                        r.cost_known = true;
-                    }
-                }
+                continue;
             }
-            if let Some(p) = priced {
-                r.savings = p.savings(cache_read, cache_write);
-            }
-            if provider.is_some() && reported == Some(0.0) && priced.is_none() {
-                if let Some(p) = provider.as_deref() {
-                    *plan_routes.entry(p.to_string()).or_insert(0) += input + cache_read + cache_write + output;
-                }
-            }
-            if r.day.is_empty() {
-                r.day = day.clone();
-            }
-            add(rows, sess, "Pi", &model, &r.day.clone(), r);
-        });
-        if !day.is_empty() {
-            session(sess, "Pi", &day);
+            uncached.push((file.clone(), path_str, mtime_ns, size));
         }
     }
+
+    if uncached.is_empty() {
+        return files.len() as u64;
+    }
+
+    cache.dirty = true;
+    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(16);
+    let chunk_size = uncached.len().div_ceil(num_threads);
+    let mut thread_results: Vec<Vec<(String, CachedFile)>> = (0..num_threads).map(|_| Vec::new()).collect();
+
+    let pricing_ref = pricing;
+    std::thread::scope(|s| {
+        for (chunk, out) in uncached.chunks(chunk_size).zip(&mut thread_results) {
+            s.spawn(move || {
+                for (file, path_str, mtime_ns, size) in chunk {
+                    let mut file_rows = Rows::new();
+                    let mut file_sess = Sess::new();
+                    let mut file_plan = HashMap::new();
+                    parse_single_pi(file, pricing_ref, &mut file_rows, &mut file_sess, &mut file_plan);
+                    let cached = CachedFile {
+                        mtime_ns: *mtime_ns,
+                        size: *size,
+                        rows: file_rows.into_values().collect(),
+                        sessions: file_sess.into_keys().collect(),
+                        plan_routes: file_plan.into_iter().collect(),
+                        ..Default::default()
+                    };
+                    out.push((path_str.clone(), cached));
+                }
+            });
+        }
+    });
+
+    for list in thread_results {
+        for (path_str, entry) in list {
+            for r in &entry.rows {
+                add(rows, sess, &r.agent, &r.model, &r.day, r.clone());
+            }
+            for (day, agent) in &entry.sessions {
+                session(sess, agent, day);
+            }
+            for (k, v) in &entry.plan_routes {
+                *plan_routes.entry(k.clone()).or_insert(0) += v;
+            }
+            cache.files.insert(path_str, entry);
+        }
+    }
+
     files.len() as u64
 }
 
 // ---------------- Codex ----------------
-fn parse_codex(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Sess, limits: &mut Vec<LimitRow>) -> u64 {
-    let mut latest: HashMap<String, (String, LimitRow)> = HashMap::new();
-    let mut files = list_files(&home.join(".codex").join("sessions"), "jsonl", None);
-    // Retired rollouts keep the same schema; without them old usage goes missing.
-    // (Own session ids are unique per file — forks share only the parent id —
-    // so every file is parsed; verified zero overlap between the two roots.)
-    files.extend(list_files(&home.join(".codex").join("archived_sessions"), "jsonl", None));
-    for file in &files {
-        let mut model = String::from("unknown");
-        let mut day = String::new();
-        let mut plan = String::new();
-        each_line(file, |line| {
-            if !has_key(line, CODEX_KEYS) {
-                return;
-            }
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return };
-            let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            let p = v.get("payload").cloned().unwrap_or(serde_json::Value::Null);
-            let ts = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
-            if day.is_empty() && ty == "session_meta" {
-                day = day_of(ts);
-            }
-            match ty {
-                "turn_context" => {
-                    if let Some(m) = p.get("model").and_then(|m| m.as_str()) {
-                        model = pricing::normalize_model(m);
-                    }
+fn parse_single_codex(
+    file: &Path,
+    pricing: &Pricing,
+    rows: &mut Rows,
+    sess: &mut Sess,
+    limits_out: &mut Vec<CachedLimit>,
+) {
+    let mut model = String::from("unknown");
+    let mut day = String::new();
+    let mut plan = String::new();
+    let mut file_latest: HashMap<String, (String, LimitRow)> = HashMap::new();
+    each_line(file, |line| {
+        if !has_key(line, CODEX_KEYS) {
+            return;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return };
+        let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let p = v.get("payload").cloned().unwrap_or(serde_json::Value::Null);
+        let ts = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
+        if day.is_empty() && ty == "session_meta" {
+            day = day_of(ts);
+        }
+        match ty {
+            "turn_context" => {
+                if let Some(m) = p.get("model").and_then(|m| m.as_str()) {
+                    model = pricing::normalize_model(m);
                 }
-                "response_item" => {
-                    let pt = p.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                    if pt == "function_call" || pt == "custom_tool_call" {
-                        let mut r = Row {
-                            day: day_of(ts),
-                            agent: "Codex".into(),
-                            model: model.clone(),
-                            tools: 1,
-                            ..Default::default()
-                        };
-                        if r.day.is_empty() { r.day = day.clone(); }
-                        add(rows, sess, "Codex", &model, &r.day.clone(), r);
-                    }
-                }
-                "event_msg" => {
-                    if p.get("type").and_then(|t| t.as_str()) != Some("token_count") {
-                        return;
-                    }
-                    if let Some(ptype) = p.get("rate_limits").and_then(|rl| rl.get("plan_type")).and_then(|x| x.as_str()) {
-                        plan = ptype.to_string();
-                    }
-                    if let Some(rl) = p.get("rate_limits") {
-                        for key in ["primary", "secondary"] {
-                            if let Some(w) = rl.get(key) {
-                                if let Some(pct) = w.get("used_percent").and_then(|x| x.as_f64()) {
-                                    if !ts.is_empty() && latest.get(key).is_none_or(|(stamp, _)| ts >= stamp.as_str()) {
-                                        latest.insert(key.to_string(), (ts.to_string(), LimitRow {
-                                            agent: "Codex".into(),
-                                            window: key.to_string(),
-                                            used_percent: pct,
-                                            window_minutes: w.get("window_minutes").and_then(|x| x.as_i64()).unwrap_or(0),
-                                            resets_at: w.get("resets_at").and_then(|x| x.as_i64()).unwrap_or(0),
-                                            plan: plan.clone(),
-                                        }));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    let Some(info) = p.get("info") else { return };
-                    let Some(last) = info.get("last_token_usage") else { return };
-                    let input = last.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
-                    let cached = last.get("cached_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
-                    let output = last.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
-                    let reasoning = last.get("reasoning_output_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
-                    if input + output == 0 {
-                        return;
-                    }
-                    let uncached = input.saturating_sub(cached);
+            }
+            "response_item" => {
+                let pt = p.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                if pt == "function_call" || pt == "custom_tool_call" {
                     let mut r = Row {
                         day: day_of(ts),
                         agent: "Codex".into(),
                         model: model.clone(),
-                        requests: 1,
-                        input: uncached,
-                        cache_read: cached,
-                        cache_write: 0,
-                        output,
-                        reasoning,
+                        tools: 1,
                         ..Default::default()
                     };
-                    if let Some(pr) = pricing.lookup(model_provider(&model), &model) {
-                        r.cost = pr.cost(uncached, cached, 0, output);
-                        r.cost_known = true;
-                        r.savings = pr.savings(cached, 0);
-                    }
                     if r.day.is_empty() { r.day = day.clone(); }
                     add(rows, sess, "Codex", &model, &r.day.clone(), r);
                 }
-                _ => {}
             }
-        });
-        if !day.is_empty() {
-            session(sess, "Codex", &day);
+            "event_msg" => {
+                if p.get("type").and_then(|t| t.as_str()) != Some("token_count") {
+                    return;
+                }
+                if let Some(ptype) = p.get("rate_limits").and_then(|rl| rl.get("plan_type")).and_then(|x| x.as_str()) {
+                    plan = ptype.to_string();
+                }
+                if let Some(rl) = p.get("rate_limits") {
+                    for key in ["primary", "secondary"] {
+                        if let Some(w) = rl.get(key) {
+                            if let Some(pct) = w.get("used_percent").and_then(|x| x.as_f64()) {
+                                if !ts.is_empty() && file_latest.get(key).is_none_or(|(stamp, _)| ts >= stamp.as_str()) {
+                                    file_latest.insert(key.to_string(), (ts.to_string(), LimitRow {
+                                        agent: "Codex".into(),
+                                        window: key.to_string(),
+                                        used_percent: pct,
+                                        window_minutes: w.get("window_minutes").and_then(|x| x.as_i64()).unwrap_or(0),
+                                        resets_at: w.get("resets_at").and_then(|x| x.as_i64()).unwrap_or(0),
+                                        plan: plan.clone(),
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                }
+                let Some(info) = p.get("info") else { return };
+                let Some(last) = info.get("last_token_usage") else { return };
+                let input = last.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                let cached = last.get("cached_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                let output = last.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                let reasoning = last.get("reasoning_output_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                if input + output == 0 {
+                    return;
+                }
+                let uncached = input.saturating_sub(cached);
+                let mut r = Row {
+                    day: day_of(ts),
+                    agent: "Codex".into(),
+                    model: model.clone(),
+                    requests: 1,
+                    input: uncached,
+                    cache_read: cached,
+                    cache_write: 0,
+                    output,
+                    reasoning,
+                    ..Default::default()
+                };
+                if let Some(pr) = pricing.lookup(model_provider(&model), &model) {
+                    r.cost = pr.cost(uncached, cached, 0, output);
+                    r.cost_known = true;
+                    r.savings = pr.savings(cached, 0);
+                }
+                if r.day.is_empty() { r.day = day.clone(); }
+                add(rows, sess, "Codex", &model, &r.day.clone(), r);
+            }
+            _ => {}
+        }
+    });
+    if !day.is_empty() {
+        session(sess, "Codex", &day);
+    }
+    for (k, (ts, limit)) in file_latest {
+        limits_out.push(CachedLimit { key: k, timestamp: ts, limit });
+    }
+}
+
+fn parse_codex(
+    home: &Path,
+    pricing: &Pricing,
+    cache: &mut ScanCache,
+    rows: &mut Rows,
+    sess: &mut Sess,
+    limits: &mut Vec<LimitRow>,
+) -> u64 {
+    let mut latest: HashMap<String, (String, LimitRow)> = HashMap::new();
+    let mut files = list_files(&home.join(".codex").join("sessions"), "jsonl", None);
+    files.extend(list_files(&home.join(".codex").join("archived_sessions"), "jsonl", None));
+    if files.is_empty() {
+        return 0;
+    }
+
+    let mut uncached = Vec::new();
+    for file in &files {
+        let path_str = file.to_string_lossy().to_string();
+        if let Some((mtime_ns, size)) = file_stamp(file) {
+            if let Some(entry) = cache.get_file(&path_str, mtime_ns, size) {
+                for r in &entry.rows {
+                    add(rows, sess, &r.agent, &r.model, &r.day, r.clone());
+                }
+                for (day, agent) in &entry.sessions {
+                    session(sess, agent, day);
+                }
+                for cl in &entry.limits {
+                    if !cl.timestamp.is_empty() && latest.get(&cl.key).is_none_or(|(stamp, _)| cl.timestamp.as_str() >= stamp.as_str()) {
+                        latest.insert(cl.key.clone(), (cl.timestamp.clone(), cl.limit.clone()));
+                    }
+                }
+                continue;
+            }
+            uncached.push((file.clone(), path_str, mtime_ns, size));
         }
     }
+
+    if !uncached.is_empty() {
+        cache.dirty = true;
+        let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(16);
+        let chunk_size = uncached.len().div_ceil(num_threads);
+        let mut thread_results: Vec<Vec<(String, CachedFile)>> = (0..num_threads).map(|_| Vec::new()).collect();
+
+        let pricing_ref = pricing;
+        std::thread::scope(|s| {
+            for (chunk, out) in uncached.chunks(chunk_size).zip(&mut thread_results) {
+                s.spawn(move || {
+                    for (file, path_str, mtime_ns, size) in chunk {
+                        let mut file_rows = Rows::new();
+                        let mut file_sess = Sess::new();
+                        let mut file_limits = Vec::new();
+                        parse_single_codex(file, pricing_ref, &mut file_rows, &mut file_sess, &mut file_limits);
+                        let cached = CachedFile {
+                            mtime_ns: *mtime_ns,
+                            size: *size,
+                            rows: file_rows.into_values().collect(),
+                            sessions: file_sess.into_keys().collect(),
+                            limits: file_limits,
+                            ..Default::default()
+                        };
+                        out.push((path_str.clone(), cached));
+                    }
+                });
+            }
+        });
+
+        for list in thread_results {
+            for (path_str, entry) in list {
+                for r in &entry.rows {
+                    add(rows, sess, &r.agent, &r.model, &r.day, r.clone());
+                }
+                for (day, agent) in &entry.sessions {
+                    session(sess, agent, day);
+                }
+                for cl in &entry.limits {
+                    if !cl.timestamp.is_empty() && latest.get(&cl.key).is_none_or(|(stamp, _)| cl.timestamp.as_str() >= stamp.as_str()) {
+                        latest.insert(cl.key.clone(), (cl.timestamp.clone(), cl.limit.clone()));
+                    }
+                }
+                cache.files.insert(path_str, entry);
+            }
+        }
+    }
+
     limits.extend(latest.into_values().map(|(_, limit)| limit));
     limits.sort_by(|a, b| a.window.cmp(&b.window));
     files.len() as u64
 }
 
 // ---------------- Claude Code ----------------
-fn parse_claude(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Sess) -> u64 {
+fn parse_single_claude(
+    file: &Path,
+    pricing: &Pricing,
+    rows: &mut Rows,
+    sess: &mut Sess,
+) {
+    let mut day = String::new();
+    each_line(file, |line| {
+        if !has_key(line, CLAUDE_KEYS) {
+            return;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return };
+        let ts = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
+        if day.is_empty() && !day_of(ts).is_empty() {
+            day = day_of(ts);
+        }
+        if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+            return;
+        }
+        let Some(msg) = v.get("message") else { return };
+        let Some(u) = msg.get("usage") else { return };
+        let input = u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+        let output = u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+        let cache_read = u.get("cache_read_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+        let cache_write = u.get("cache_creation_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+        if input + output + cache_read + cache_write == 0 {
+            return;
+        }
+        let mut tools = 0u64;
+        if let Some(content) = msg.get("content").and_then(|x| x.as_array()) {
+            for item in content {
+                if item.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                    tools += 1;
+                }
+            }
+        }
+        let model = pricing::normalize_model(msg.get("model").and_then(|m| m.as_str()).unwrap_or("unknown"));
+        let mut r = Row {
+            day: day_of(ts),
+            agent: "Claude Code".into(),
+            model: model.clone(),
+            requests: 1,
+            input,
+            cache_read,
+            cache_write,
+            output,
+            reasoning: 0,
+            tools,
+            ..Default::default()
+        };
+        if let Some(pr) = pricing.lookup(model_provider(&model), &model) {
+            r.cost = pr.cost(input, cache_read, cache_write, output);
+            r.cost_known = true;
+            r.savings = pr.savings(cache_read, cache_write);
+        }
+        if r.day.is_empty() { r.day = day.clone(); }
+        add(rows, sess, "Claude Code", &model, &r.day.clone(), r);
+    });
+    if !day.is_empty() {
+        session(sess, "Claude Code", &day);
+    }
+}
+
+fn parse_claude(
+    home: &Path,
+    pricing: &Pricing,
+    cache: &mut ScanCache,
+    rows: &mut Rows,
+    sess: &mut Sess,
+) -> u64 {
     let projects = home.join(".claude").join("projects");
     if !projects.exists() {
         return 0;
     }
     let files = list_files(&projects, "jsonl", None);
+    if files.is_empty() {
+        return 0;
+    }
+
+    let mut uncached = Vec::new();
     for file in &files {
-        let mut day = String::new();
-        each_line(file, |line| {
-            if !has_key(line, CLAUDE_KEYS) {
-                return;
-            }
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return };
-            let ts = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
-            if day.is_empty() && !day_of(ts).is_empty() {
-                day = day_of(ts);
-            }
-            if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
-                return;
-            }
-            let Some(msg) = v.get("message") else { return };
-            let Some(u) = msg.get("usage") else { return };
-            let input = u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
-            let output = u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
-            let cache_read = u.get("cache_read_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
-            let cache_write = u.get("cache_creation_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
-            if input + output + cache_read + cache_write == 0 {
-                return;
-            }
-            let mut tools = 0u64;
-            if let Some(content) = msg.get("content").and_then(|x| x.as_array()) {
-                for item in content {
-                    if item.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                        tools += 1;
-                    }
+        let path_str = file.to_string_lossy().to_string();
+        if let Some((mtime_ns, size)) = file_stamp(file) {
+            if let Some(entry) = cache.get_file(&path_str, mtime_ns, size) {
+                for r in &entry.rows {
+                    add(rows, sess, &r.agent, &r.model, &r.day, r.clone());
                 }
+                for (day, agent) in &entry.sessions {
+                    session(sess, agent, day);
+                }
+                continue;
             }
-            let model = pricing::normalize_model(msg.get("model").and_then(|m| m.as_str()).unwrap_or("unknown"));
-            let mut r = Row {
-                day: day_of(ts),
-                agent: "Claude Code".into(),
-                model: model.clone(),
-                requests: 1,
-                input,
-                cache_read,
-                cache_write,
-                output,
-                reasoning: 0,
-                tools,
-                ..Default::default()
-            };
-            if let Some(pr) = pricing.lookup(model_provider(&model), &model) {
-                r.cost = pr.cost(input, cache_read, cache_write, output);
-                r.cost_known = true;
-                r.savings = pr.savings(cache_read, cache_write);
-            }
-            if r.day.is_empty() { r.day = day.clone(); }
-            add(rows, sess, "Claude Code", &model, &r.day.clone(), r);
-        });
-        if !day.is_empty() {
-            session(sess, "Claude Code", &day);
+            uncached.push((file.clone(), path_str, mtime_ns, size));
         }
     }
+
+    if !uncached.is_empty() {
+        cache.dirty = true;
+        let pricing_ref = pricing;
+        for (file, path_str, mtime_ns, size) in uncached {
+            let mut file_rows = Rows::new();
+            let mut file_sess = Sess::new();
+            parse_single_claude(&file, pricing_ref, &mut file_rows, &mut file_sess);
+            let cached = CachedFile {
+                mtime_ns,
+                size,
+                rows: file_rows.into_values().collect(),
+                sessions: file_sess.into_keys().collect(),
+                ..Default::default()
+            };
+            for r in &cached.rows {
+                add(rows, sess, &r.agent, &r.model, &r.day, r.clone());
+            }
+            for (day, agent) in &cached.sessions {
+                session(sess, agent, day);
+            }
+            cache.files.insert(path_str, cached);
+        }
+    }
+
     files.len() as u64
 }
 
 // ---------------- OpenCode ----------------
-fn parse_opencode(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Sess) -> u64 {
+fn parse_opencode(
+    home: &Path,
+    pricing: &Pricing,
+    cache: &mut ScanCache,
+    rows: &mut Rows,
+    sess: &mut Sess,
+) -> u64 {
     let db = home.join(".local").join("share").join("opencode").join("opencode.db");
+    let Some((mtime_ns, size)) = file_stamp(&db) else {
+        return 0;
+    };
+    if let Some(cached) = &cache.opencode_db {
+        if cached.mtime_ns == mtime_ns && cached.size == size {
+            for r in &cached.rows {
+                add(rows, sess, &r.agent, &r.model, &r.day, r.clone());
+            }
+            for (day, agent) in &cached.sessions {
+                session(sess, agent, day);
+            }
+            return cached.count;
+        }
+    }
+
     let Ok(conn) = rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
         return 0;
     };
@@ -486,11 +739,14 @@ fn parse_opencode(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Se
     });
     let Some(table) = table else { return 0 };
     let mut count = 0;
+    let mut db_rows = Rows::new();
+    let mut db_sess = Sess::new();
+
     if let Ok(mut stmt) = conn.prepare(&format!("SELECT time_created FROM {}", table)) {
         if let Ok(it) = stmt.query_map([], |r| r.get::<_, i64>(0)) {
             for ts in it.flatten() {
                 let day = unix_day(if ts > 1_000_000_000_000 { ts / 1000 } else { ts });
-                session(sess, "OpenCode", &day);
+                session(&mut db_sess, "OpenCode", &day);
                 count += 1;
             }
         }
@@ -527,7 +783,7 @@ fn parse_opencode(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Se
                 if let Some(p) = price {
                     r.savings = p.savings(r.cache_read, r.cache_write);
                 }
-                add(rows, sess, "OpenCode", &model, &day, r);
+                add(&mut db_rows, &mut db_sess, "OpenCode", &model, &day, r);
             }
         }
     }
@@ -545,10 +801,26 @@ fn parse_opencode(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Se
             for (provider, model, day, tools) in it.flatten() {
                 let Some(day) = day else { continue };
                 let model = opencode_model(&serde_json::json!({"providerID": provider, "modelID": model}));
-                add(rows, sess, "OpenCode", &model, &day, Row { tools, ..Default::default() });
+                add(&mut db_rows, &mut db_sess, "OpenCode", &model, &day, Row { tools, ..Default::default() });
             }
         }
     }
+
+    for r in db_rows.values() {
+        add(rows, sess, &r.agent, &r.model, &r.day, r.clone());
+    }
+    for (day, agent) in db_sess.keys() {
+        session(sess, agent, day);
+    }
+
+    cache.opencode_db = Some(CachedDb {
+        mtime_ns,
+        size,
+        count,
+        rows: db_rows.into_values().collect(),
+        sessions: db_sess.into_keys().collect(),
+    });
+    cache.dirty = true;
     count
 }
 
@@ -561,7 +833,13 @@ fn opencode_model(message: &serde_json::Value) -> String {
 }
 
 // ---------------- Antigravity ----------------
-fn parse_antigravity(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Sess) -> u64 {
+fn parse_antigravity(
+    home: &Path,
+    pricing: &Pricing,
+    cache: &mut ScanCache,
+    rows: &mut Rows,
+    sess: &mut Sess,
+) -> u64 {
     let mut dbs = 0u64;
     for variant in ["antigravity", "antigravity-cli"] {
         let conv = home.join(".gemini").join(variant).join("conversations");
@@ -569,13 +847,27 @@ fn parse_antigravity(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut
         let brain = home.join(".gemini").join(variant).join("brain");
         let transcripts = list_files(&brain, "jsonl", Some("transcript.jsonl"));
         for file in &transcripts {
+            let path_str = file.to_string_lossy().to_string();
+            if let Some((mtime_ns, size)) = file_stamp(file) {
+                if let Some(entry) = cache.get_file(&path_str, mtime_ns, size) {
+                    for r in &entry.rows {
+                        add(rows, sess, &r.agent, &r.model, &r.day, r.clone());
+                    }
+                    for (day, agent) in &entry.sessions {
+                        session(sess, agent, day);
+                    }
+                    continue;
+                }
+            }
             let mtime_day = fs::metadata(file)
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| unix_day(d.as_secs() as i64))
                 .unwrap_or_default();
-            session(sess, "Antigravity", &mtime_day);
+            let mut file_rows = Rows::new();
+            let mut file_sess = Sess::new();
+            session(&mut file_sess, "Antigravity", &mtime_day);
             let mut model = String::from("unknown");
             // Transcript tails sometimes repeat the final steps; dedupe by step
             // index so a re-appended tail does not double-count requests.
@@ -639,9 +931,25 @@ fn parse_antigravity(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut
                         }
                     }
                     if r.day.is_empty() { r.day = mtime_day.clone(); }
-                    add(rows, sess, "Antigravity", &model, &r.day.clone(), r);
+                    add(&mut file_rows, &mut file_sess, "Antigravity", &model, &r.day.clone(), r);
                 }
             });
+            for r in file_rows.values() {
+                add(rows, sess, &r.agent, &r.model, &r.day, r.clone());
+            }
+            for (day, agent) in file_sess.keys() {
+                session(sess, agent, day);
+            }
+            if let Some((mtime_ns, size)) = file_stamp(file) {
+                cache.files.insert(path_str, CachedFile {
+                    mtime_ns,
+                    size,
+                    rows: file_rows.into_values().collect(),
+                    sessions: file_sess.into_keys().collect(),
+                    ..Default::default()
+                });
+                cache.dirty = true;
+            }
         }
         // conversation dbs without transcripts still count as sessions (dated by file mtime)
         if transcripts.is_empty() {
@@ -722,7 +1030,13 @@ fn agy_db_model(db: &Path) -> String {
     votes.into_iter().max_by(|a, b| a.1.cmp(&b.1).then(a.0.len().cmp(&b.0.len()))).map(|(m, _)| m).unwrap_or_else(|| "unknown".into())
 }
 
-fn parse_t3(home: &Path, rows: &mut Rows, sess: &mut Sess, counted_threads: &mut HashSet<String>) -> u64 {
+fn parse_t3(
+    home: &Path,
+    cache: &mut ScanCache,
+    rows: &mut Rows,
+    sess: &mut Sess,
+    counted_threads: &mut HashSet<String>,
+) -> u64 {
     let prov = home.join(".t3").join("userdata").join("providers").join("antigravity");
     let Ok(top) = fs::read_dir(&prov) else { return 0 };
     let mut files = Vec::new();
@@ -731,6 +1045,21 @@ fn parse_t3(home: &Path, rows: &mut Rows, sess: &mut Sess, counted_threads: &mut
         files.extend(list_files(&brain, "jsonl", Some("transcript.jsonl")));
     }
     for file in &files {
+        let path_str = file.to_string_lossy().to_string();
+        if let Some((mtime_ns, size)) = file_stamp(file) {
+            if let Some(entry) = cache.get_file(&path_str, mtime_ns, size) {
+                for r in &entry.rows {
+                    add(rows, sess, &r.agent, &r.model, &r.day, r.clone());
+                }
+                for (day, agent) in &entry.sessions {
+                    session(sess, agent, day);
+                }
+                if let Some(id) = &entry.thread_id {
+                    counted_threads.insert(id.clone());
+                }
+                continue;
+            }
+        }
         let model = pricing::normalize_model(&t3_conv_db(file).map(|db| agy_db_model(&db)).unwrap_or_else(|| "unknown".into()));
         let mtime_day = fs::metadata(file)
             .and_then(|m| m.modified())
@@ -740,6 +1069,8 @@ fn parse_t3(home: &Path, rows: &mut Rows, sess: &mut Sess, counted_threads: &mut
             .unwrap_or_default();
         let mut session_day: Option<String> = None;
         let mut seen_steps = HashSet::new();
+        let mut file_rows = Rows::new();
+        let mut file_sess = Sess::new();
         each_line(file, |line| {
             if !has_key(line, AGY_KEYS) {
                 return;
@@ -768,15 +1099,34 @@ fn parse_t3(home: &Path, rows: &mut Rows, sess: &mut Sess, counted_threads: &mut
             if session_day.as_ref().is_none_or(|day| r.day < *day) {
                 session_day = Some(r.day.clone());
             }
-            add(rows, sess, "Antigravity", &model, &r.day.clone(), r);
+            add(&mut file_rows, &mut file_sess, "Antigravity", &model, &r.day.clone(), r);
         });
+        let mut thread_id = None;
         if let Some(day) = session_day {
-            session(sess, "Antigravity", &day);
+            session(&mut file_sess, "Antigravity", &day);
             if let Some(db) = t3_conv_db(file) {
                 if let Some(id) = db.file_stem().and_then(|s| s.to_str()) {
                     counted_threads.insert(id.to_string());
+                    thread_id = Some(id.to_string());
                 }
             }
+        }
+        for r in file_rows.values() {
+            add(rows, sess, &r.agent, &r.model, &r.day, r.clone());
+        }
+        for (day, agent) in file_sess.keys() {
+            session(sess, agent, day);
+        }
+        if let Some((mtime_ns, size)) = file_stamp(file) {
+            cache.files.insert(path_str, CachedFile {
+                mtime_ns,
+                size,
+                rows: file_rows.into_values().collect(),
+                sessions: file_sess.into_keys().collect(),
+                thread_id,
+                ..Default::default()
+            });
+            cache.dirty = true;
         }
     }
     // Missing or empty transcripts fall back to the conversation DB.
@@ -993,7 +1343,104 @@ fn ms_day(ms: i64) -> String {
     unix_day(ms / 1000)
 }
 
-fn parse_dsh(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Sess) -> u64 {
+fn parse_single_dsh(file: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Sess) {
+    let Ok(f) = fs::File::open(file) else { return };
+    let Ok(bytes) = zstd::stream::decode_all(f) else { return };
+    let text = String::from_utf8_lossy(&bytes);
+    let mut model = String::from("unknown");
+    let mut day = String::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("session") => {
+                if let Some(ms) = v.get("createdAt").and_then(|x| x.as_i64()) {
+                    day = ms_day(ms);
+                }
+                session(sess, "DSH", &day);
+            }
+            Some("model/selection") => {
+                if let Some(d) = v.get("data") {
+                    let p = d.get("provider").and_then(|x| x.as_str()).unwrap_or("");
+                    let m = d.get("model").and_then(|x| x.as_str()).unwrap_or("");
+                    if !m.is_empty() {
+                        let full = if p.is_empty() { m.to_string() } else { format!("{}/{}", p, m) };
+                        model = pricing::normalize_model(&full);
+                    }
+                }
+            }
+            Some("assistant/message") => {
+                let ts = v.get("time").and_then(|x| x.as_i64()).unwrap_or(0);
+                let mut tools = 0u64;
+                let mut m = model.clone();
+                let mut input = 0u64;
+                let mut output = 0u64;
+                let mut cache_read = 0u64;
+                let mut cache_write = 0u64;
+                let mut reasoning = 0u64;
+                if let Some(d) = v.get("data") {
+                    if let Some(content) = d.get("message").and_then(|x| x.get("content")).and_then(|x| x.as_array()) {
+                        for item in content {
+                            if item.get("type").and_then(|t| t.as_str()) == Some("tool-call") {
+                                tools += 1;
+                            }
+                        }
+                    }
+                    if let Some(src) = d.get("message").and_then(|x| x.get("source")) {
+                        let p = src.get("provider").and_then(|x| x.as_str()).unwrap_or("");
+                        let mm = src.get("model").and_then(|x| x.as_str()).unwrap_or("");
+                        if !mm.is_empty() {
+                            let full = if p.is_empty() { mm.to_string() } else { format!("{}/{}", p, mm) };
+                            m = pricing::normalize_model(&full);
+                        }
+                    }
+                    if let Some(u) = d.get("usage") {
+                        input = u.get("inputTokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                        output = u.get("outputTokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                        cache_read = u.get("cacheReadTokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                        cache_write = u.get("cacheWriteTokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                        reasoning = u.get("reasoningTokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                    }
+                }
+                let d = ms_day(ts);
+                let d = if d.is_empty() { day.clone() } else { d };
+                let mut r = Row {
+                    day: d.clone(),
+                    agent: "DSH".into(),
+                    model: m.clone(),
+                    requests: 1,
+                    input,
+                    cache_read,
+                    cache_write,
+                    output,
+                    reasoning,
+                    tools,
+                    ..Default::default()
+                };
+                if input + output + cache_read + cache_write > 0 {
+                    if let Some(pr) = pricing.lookup(model_provider(&m), &m) {
+                        r.cost = pr.cost(input, cache_read, cache_write, output);
+                        r.cost_known = true;
+                        r.savings = pr.savings(cache_read, cache_write);
+                    }
+                }
+                add(rows, sess, "DSH", &m, &d, r);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn parse_dsh(
+    home: &Path,
+    pricing: &Pricing,
+    cache: &mut ScanCache,
+    rows: &mut Rows,
+    sess: &mut Sess,
+) -> u64 {
     let root = home.join(".dsh").join("sessions");
     let mut files = Vec::new();
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -1009,96 +1456,51 @@ fn parse_dsh(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Sess) -
         }
     }
     walk(&root, &mut files);
+    if files.is_empty() {
+        return 0;
+    }
+
+    let mut uncached = Vec::new();
     for file in &files {
-        let Ok(f) = fs::File::open(file) else { continue };
-        let Ok(bytes) = zstd::stream::decode_all(f) else { continue };
-        let text = String::from_utf8_lossy(&bytes);
-        let mut model = String::from("unknown");
-        let mut day = String::new();
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() {
+        let path_str = file.to_string_lossy().to_string();
+        if let Some((mtime_ns, size)) = file_stamp(file) {
+            if let Some(entry) = cache.get_file(&path_str, mtime_ns, size) {
+                for r in &entry.rows {
+                    add(rows, sess, &r.agent, &r.model, &r.day, r.clone());
+                }
+                for (day, agent) in &entry.sessions {
+                    session(sess, agent, day);
+                }
                 continue;
             }
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-            match v.get("type").and_then(|t| t.as_str()) {
-                Some("session") => {
-                    if let Some(ms) = v.get("createdAt").and_then(|x| x.as_i64()) {
-                        day = ms_day(ms);
-                    }
-                    session(sess, "DSH", &day);
-                }
-                Some("model/selection") => {
-                    if let Some(d) = v.get("data") {
-                        let p = d.get("provider").and_then(|x| x.as_str()).unwrap_or("");
-                        let m = d.get("model").and_then(|x| x.as_str()).unwrap_or("");
-                        if !m.is_empty() {
-                            let full = if p.is_empty() { m.to_string() } else { format!("{}/{}", p, m) };
-                            model = pricing::normalize_model(&full);
-                        }
-                    }
-                }
-                Some("assistant/message") => {
-                    let ts = v.get("time").and_then(|x| x.as_i64()).unwrap_or(0);
-                    let mut tools = 0u64;
-                    let mut m = model.clone();
-                    let mut input = 0u64;
-                    let mut output = 0u64;
-                    let mut cache_read = 0u64;
-                    let mut cache_write = 0u64;
-                    let mut reasoning = 0u64;
-                    if let Some(d) = v.get("data") {
-                        if let Some(content) = d.get("message").and_then(|x| x.get("content")).and_then(|x| x.as_array()) {
-                            for item in content {
-                                if item.get("type").and_then(|t| t.as_str()) == Some("tool-call") {
-                                    tools += 1;
-                                }
-                            }
-                        }
-                        if let Some(src) = d.get("message").and_then(|x| x.get("source")) {
-                            let p = src.get("provider").and_then(|x| x.as_str()).unwrap_or("");
-                            let mm = src.get("model").and_then(|x| x.as_str()).unwrap_or("");
-                            if !mm.is_empty() {
-                                let full = if p.is_empty() { mm.to_string() } else { format!("{}/{}", p, mm) };
-                                m = pricing::normalize_model(&full);
-                            }
-                        }
-                        if let Some(u) = d.get("usage") {
-                            input = u.get("inputTokens").and_then(|x| x.as_u64()).unwrap_or(0);
-                            output = u.get("outputTokens").and_then(|x| x.as_u64()).unwrap_or(0);
-                            cache_read = u.get("cacheReadTokens").and_then(|x| x.as_u64()).unwrap_or(0);
-                            cache_write = u.get("cacheWriteTokens").and_then(|x| x.as_u64()).unwrap_or(0);
-                            reasoning = u.get("reasoningTokens").and_then(|x| x.as_u64()).unwrap_or(0);
-                        }
-                    }
-                    let d = ms_day(ts);
-                    let d = if d.is_empty() { day.clone() } else { d };
-                    let mut r = Row {
-                        day: d.clone(),
-                        agent: "DSH".into(),
-                        model: m.clone(),
-                        requests: 1,
-                        input,
-                        cache_read,
-                        cache_write,
-                        output,
-                        reasoning,
-                        tools,
-                        ..Default::default()
-                    };
-                    if input + output + cache_read + cache_write > 0 {
-                        if let Some(pr) = pricing.lookup(model_provider(&m), &m) {
-                            r.cost = pr.cost(input, cache_read, cache_write, output);
-                            r.cost_known = true;
-                            r.savings = pr.savings(cache_read, cache_write);
-                        }
-                    }
-                    add(rows, sess, "DSH", &m, &d, r);
-                }
-                _ => {}
-            }
+            uncached.push((file.clone(), path_str, mtime_ns, size));
         }
     }
+
+    if !uncached.is_empty() {
+        cache.dirty = true;
+        let pricing_ref = pricing;
+        for (file, path_str, mtime_ns, size) in uncached {
+            let mut file_rows = Rows::new();
+            let mut file_sess = Sess::new();
+            parse_single_dsh(&file, pricing_ref, &mut file_rows, &mut file_sess);
+            let cached = CachedFile {
+                mtime_ns,
+                size,
+                rows: file_rows.into_values().collect(),
+                sessions: file_sess.into_keys().collect(),
+                ..Default::default()
+            };
+            for r in &cached.rows {
+                add(rows, sess, &r.agent, &r.model, &r.day, r.clone());
+            }
+            for (day, agent) in &cached.sessions {
+                session(sess, agent, day);
+            }
+            cache.files.insert(path_str, cached);
+        }
+    }
+
     files.len() as u64
 }
 
@@ -1131,13 +1533,30 @@ fn lms_tokens(line: &str) -> Option<(bool, u64)> {
     Some((prompt, num.parse().ok()?))
 }
 
-fn parse_lmstudio(home: &Path, rows: &mut Rows, sess: &mut Sess) -> u64 {
+fn parse_lmstudio(
+    home: &Path,
+    cache: &mut ScanCache,
+    rows: &mut Rows,
+    sess: &mut Sess,
+) -> u64 {
     let dir = home.join(".lmstudio").join("conversations");
     let files: Vec<PathBuf> = list_files(&dir, "json", None)
         .into_iter()
         .filter(|p| p.file_name().and_then(|f| f.to_str()).map(|f| f.ends_with(".conversation.json")).unwrap_or(false))
         .collect();
     for file in &files {
+        let path_str = file.to_string_lossy().to_string();
+        if let Some((mtime_ns, size)) = file_stamp(file) {
+            if let Some(entry) = cache.get_file(&path_str, mtime_ns, size) {
+                for r in &entry.rows {
+                    add(rows, sess, &r.agent, &r.model, &r.day, r.clone());
+                }
+                for (day, agent) in &entry.sessions {
+                    session(sess, agent, day);
+                }
+                continue;
+            }
+        }
         let Ok(text) = fs::read_to_string(file) else { continue };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
         let day = v.get("createdAt").and_then(|x| x.as_i64()).map(ms_day).unwrap_or_default();
@@ -1155,15 +1574,33 @@ fn parse_lmstudio(home: &Path, rows: &mut Rows, sess: &mut Sess) -> u64 {
                 }
             }
         }
-        session(sess, "LM Studio", &day);
+        let mut file_rows = Rows::new();
+        let mut file_sess = Sess::new();
+        session(&mut file_sess, "LM Studio", &day);
         if requests > 0 {
-            add(rows, sess, "LM Studio", &model, &day, Row {
+            add(&mut file_rows, &mut file_sess, "LM Studio", &model, &day, Row {
                 day: day.clone(),
                 agent: "LM Studio".into(),
                 model: model.clone(),
                 requests,
                 ..Default::default()
             });
+        }
+        for r in file_rows.values() {
+            add(rows, sess, &r.agent, &r.model, &r.day, r.clone());
+        }
+        for (day, agent) in file_sess.keys() {
+            session(sess, agent, day);
+        }
+        if let Some((mtime_ns, size)) = file_stamp(file) {
+            cache.files.insert(path_str, CachedFile {
+                mtime_ns,
+                size,
+                rows: file_rows.into_values().collect(),
+                sessions: file_sess.into_keys().collect(),
+                ..Default::default()
+            });
+            cache.dirty = true;
         }
     }
     let mut logs = list_files(&home.join(".lmstudio").join("server-logs"), "log", None);
@@ -1239,6 +1676,15 @@ fn get_stats(app: AppHandle) -> Stats {
     })
 }
 
+#[tauri::command(async)]
+fn rescan_stats(app: AppHandle) -> Stats {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    cache::ScanCache::clear(&home);
+    scan(&|stage| {
+        let _ = app.emit("stats-stage", stage);
+    })
+}
+
 fn scan(progress: &dyn Fn(&str)) -> Stats {
     // Serialise concurrent scans (manual refresh + background watcher): each one
     // walks ~5 GB, so overlapping runs just thrash the disk for the same result.
@@ -1252,6 +1698,9 @@ fn scan(progress: &dyn Fn(&str)) -> Stats {
 fn scan_home(home: &Path, progress: &dyn Fn(&str)) -> Stats {
     progress("model prices");
     let pricing = Pricing::load(home);
+    let pricing_fp = (pricing.embedded_count as u64) ^ ((pricing.local_count as u64) << 32);
+    let mut cache = ScanCache::load_for(home, pricing_fp);
+
     let mut rows = Rows::new();
     let mut sess = Sess::new();
     let mut limits = Vec::new();
@@ -1259,24 +1708,25 @@ fn scan_home(home: &Path, progress: &dyn Fn(&str)) -> Stats {
     let mut plan_routes: HashMap<String, u64> = HashMap::new();
 
     progress("Pi logs");
-    let pi_files = parse_pi(home, &pricing, &mut rows, &mut sess, &mut plan_routes);
+    let pi_files = parse_pi(home, &pricing, &mut cache, &mut rows, &mut sess, &mut plan_routes);
     progress("Claude Code logs");
-    let claude_files = parse_claude(home, &pricing, &mut rows, &mut sess);
+    let claude_files = parse_claude(home, &pricing, &mut cache, &mut rows, &mut sess);
     progress("OpenCode database");
-    let opencode_n = parse_opencode(home, &pricing, &mut rows, &mut sess);
+    let opencode_n = parse_opencode(home, &pricing, &mut cache, &mut rows, &mut sess);
     progress("Antigravity logs");
-    let agy_dbs = parse_antigravity(home, &pricing, &mut rows, &mut sess);
+    let agy_dbs = parse_antigravity(home, &pricing, &mut cache, &mut rows, &mut sess);
     progress("T3 logs");
-    let t3_files = parse_t3(home, &mut rows, &mut sess, &mut counted_threads);
+    let t3_files = parse_t3(home, &mut cache, &mut rows, &mut sess, &mut counted_threads);
     progress("T3 usage database");
     let t3_usage_db = parse_t3_usage(home, &pricing, &mut rows, &mut sess, &counted_threads);
     progress("DSH logs");
-    let dsh_files = parse_dsh(home, &pricing, &mut rows, &mut sess);
+    let dsh_files = parse_dsh(home, &pricing, &mut cache, &mut rows, &mut sess);
     progress("LM Studio logs");
-    let lms_files = parse_lmstudio(home, &mut rows, &mut sess);
+    let lms_files = parse_lmstudio(home, &mut cache, &mut rows, &mut sess);
 
     progress("Codex logs");
-    let codex_files = parse_codex(home, &pricing, &mut rows, &mut sess, &mut limits);
+    let codex_files = parse_codex(home, &pricing, &mut cache, &mut rows, &mut sess, &mut limits);
+    cache.save();
     progress("done");
 
     let sources = vec![
@@ -1295,7 +1745,7 @@ fn scan_home(home: &Path, progress: &dyn Fn(&str)) -> Stats {
     ];
 
     let mut rows: Vec<Row> = rows.into_values().collect();
-    rows.sort_by(|a, b| a.day.cmp(&b.day).then(a.agent.cmp(&b.agent)));
+    rows.sort_by(|a, b| a.day.cmp(&b.day).then(a.agent.cmp(&b.agent)).then(a.model.cmp(&b.model)));
     let mut sessions: Vec<SessionRow> = sess
         .into_iter()
         .map(|((day, agent), n)| SessionRow { day, agent, sessions: n })
@@ -1359,6 +1809,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_stats,
+            rescan_stats,
             check_update,
             download_and_install_update,
             get_app_version

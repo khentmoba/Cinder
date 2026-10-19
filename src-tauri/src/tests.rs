@@ -41,6 +41,43 @@ impl Drop for Home {
 }
 
 #[test]
+fn cache_preserves_rows_and_sessions_and_detects_modification() {
+    let home = Home::new();
+    home.lines(".pi/agent/sessions/s1.jsonl", &[
+        json!({"type": "session", "timestamp": "2026-01-01T00:00:00Z"}),
+        json!({"type": "message", "timestamp": "2026-01-01T00:01:00Z", "message": {
+            "role": "assistant", "model": "gpt-5", "usage": {"input": 100, "output": 50}
+        }})
+    ]);
+
+    // Initial scan populates cache
+    let stats1 = scan_home(&home.0, &|_| {});
+    let r1 = stats1.rows.iter().find(|r| r.agent == "Pi").unwrap();
+    assert_eq!(r1.input, 100);
+    assert_eq!(r1.output, 50);
+
+    // Warm scan hits cache
+    let stats2 = scan_home(&home.0, &|_| {});
+    let r2 = stats2.rows.iter().find(|r| r.agent == "Pi").unwrap();
+    assert_eq!(r2.input, 100);
+    assert_eq!(r2.output, 50);
+
+    // File is updated
+    home.lines(".pi/agent/sessions/s1.jsonl", &[
+        json!({"type": "session", "timestamp": "2026-01-01T00:00:00Z"}),
+        json!({"type": "message", "timestamp": "2026-01-01T00:01:00Z", "message": {
+            "role": "assistant", "model": "gpt-5", "usage": {"input": 200, "output": 100}
+        }})
+    ]);
+
+    // Warm scan detects modification
+    let stats3 = scan_home(&home.0, &|_| {});
+    let r3 = stats3.rows.iter().find(|r| r.agent == "Pi").unwrap();
+    assert_eq!(r3.input, 200);
+    assert_eq!(r3.output, 100);
+}
+
+#[test]
 fn local_prices_include_both_catalogs_and_both_pi_formats() {
     let home = Home::new();
     home.write(".pi/agent/models-store.json", &json!({

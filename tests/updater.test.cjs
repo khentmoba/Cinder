@@ -222,3 +222,28 @@ test('checkForUpdates displays update dot on settings button when update availab
   assert.equal(get('settingsUpdateDot').hidden, false);
   assert.equal(get('tabUpdateDot').hidden, false);
 });
+
+test('settingsRescanBtn invokes rescan_stats', async () => {
+  let invokedCmd = null;
+  const mockStats = {
+    rows: [],
+    sessions: [],
+    limits: [],
+    sources: [],
+    pricing: { local: 0, embedded: 10, source: 'embedded' },
+    unpriced: [],
+    plan_routes: [],
+  };
+
+  const { get, handlers } = setupUpdaterContext((cmd) => {
+    invokedCmd = cmd;
+    if (cmd === 'rescan_stats') return Promise.resolve(mockStats);
+    return Promise.resolve();
+  });
+
+  const rescanHandler = handlers['settingsRescanBtn:click'];
+  assert.ok(rescanHandler, 'settingsRescanBtn should have a click listener');
+  await rescanHandler();
+  assert.equal(invokedCmd, 'rescan_stats');
+});
+
