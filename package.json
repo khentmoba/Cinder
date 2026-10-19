@@ -7,7 +7,7 @@
     "dev": "tauri dev",
     "test": "node --test tests/*.test.cjs",
     "build": "tauri build",
-    "install-local": "tauri build && .\\src-tauri\\target\\release\\bundle\\nsis\\Cinder_0.2.0_x64-setup.exe /S",
+    "install-local": "tauri build && .\\src-tauri\\target\\release\\bundle\\nsis\\Cinder_0.2.0_x64-setup.exe /S /UPDATE",
     "tauri": "tauri"
   },
   "devDependencies": {

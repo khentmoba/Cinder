@@ -26,6 +26,11 @@
         <span class="update-dot"></span>
         <span id="updateBadgeText">Update</span>
       </button>
+      <button id="settingsBtn" class="settings-btn" title="Settings">
+        <span class="settings-gear">&#9881;</span>
+        <span>Settings</span>
+        <span id="settingsUpdateDot" class="update-dot" hidden title="Update available"></span>
+      </button>
       <button id="refresh" class="icon" title="Refresh">&#8635;</button>
     </div>
   </header>
@@ -70,54 +75,176 @@
     </div>
     <div class="footer-right">
       <span id="priceinfo"></span>
-      <span id="appVersion" class="app-version" title="Click to check for updates">v0.1.0</span>
+      <button id="footerSettingsBtn" class="footer-settings-btn" title="Open Settings">
+        <span class="settings-gear">&#9881;</span>
+        <span id="appVersion" class="app-version">v0.1.0</span>
+      </button>
     </div>
   </footer>
 
   <div id="updateModal" class="modal-backdrop" hidden>
-    <div class="modal-card">
+    <div class="modal-card settings-card">
       <div class="modal-header">
         <div class="modal-title-group">
-          <span class="modal-title">Cinder Update</span>
+          <span class="settings-gear">&#9881;</span>
+          <span class="modal-title" id="modalTitle">Settings</span>
           <span class="modal-tag" id="modalTag">v0.2.0</span>
         </div>
-        <button id="modalCloseBtn" class="modal-close" title="Close">&times;</button>
+        <button id="modalCloseBtn" class="modal-close" title="Close (Esc)">&times;</button>
       </div>
-      <div class="modal-body">
-        <div class="update-meta">
-          <div class="meta-col">
-            <span class="meta-label">Current</span>
-            <span class="meta-val" id="updateCurrentVer">0.1.0</span>
-          </div>
-          <div class="meta-arrow">&rarr;</div>
-          <div class="meta-col">
-            <span class="meta-label">New Version</span>
-            <span class="meta-val highlight" id="updateNewVer">0.2.0</span>
-          </div>
-          <div class="meta-col right">
-            <span class="meta-label">Published</span>
-            <span class="meta-val" id="updateDate">—</span>
-          </div>
-        </div>
 
-        <div class="notes-section">
-          <div class="notes-header">Release Notes</div>
-          <div id="updateNotes" class="notes-body"></div>
-        </div>
-
-        <div id="updateProgressBox" class="progress-box" hidden>
-          <div class="progress-head">
-            <span id="progressLabel">Downloading update…</span>
-            <span id="progressPercent">0%</span>
-          </div>
-          <div class="progress-bar-bg">
-            <div id="progressBar" class="progress-bar-fill" style="width: 0%"></div>
-          </div>
-          <div class="progress-sub" id="progressSub">0 MB / 0 MB</div>
-        </div>
-
-        <div id="updateMsg" class="update-msg" hidden></div>
+      <div class="settings-tabs" id="settingsTabs">
+        <button class="settings-tab on" data-tab="updates" id="tabUpdates">
+          <span>Updates</span>
+          <span id="tabUpdateDot" class="update-dot" hidden></span>
+        </button>
+        <button class="settings-tab" data-tab="preferences" id="tabPreferences">Preferences</button>
+        <button class="settings-tab" data-tab="sources" id="tabSources">Data Sources</button>
+        <button class="settings-tab" data-tab="about" id="tabAbout">About</button>
       </div>
+
+      <div class="modal-body settings-body">
+        <!-- 1. UPDATES TAB PANEL -->
+        <div class="tab-panel on" id="panelUpdates">
+          <div class="settings-section-card">
+            <div class="section-card-header">
+              <div>
+                <div class="section-card-title">Cinder Updates</div>
+                <div class="section-card-sub" id="settingsUpdateStatus">Check for updates from GitHub releases.</div>
+              </div>
+              <button id="settingsCheckBtn" class="modal-btn secondary">Check for Updates</button>
+            </div>
+          </div>
+
+          <div class="update-meta" id="updateMeta">
+            <div class="meta-col">
+              <span class="meta-label">Current</span>
+              <span class="meta-val" id="updateCurrentVer">0.1.0</span>
+            </div>
+            <div class="meta-arrow">&rarr;</div>
+            <div class="meta-col">
+              <span class="meta-label">New Version</span>
+              <span class="meta-val highlight" id="updateNewVer">0.2.0</span>
+            </div>
+            <div class="meta-col right">
+              <span class="meta-label">Published</span>
+              <span class="meta-val" id="updateDate">—</span>
+            </div>
+          </div>
+
+          <div class="notes-section" id="updateNotesSec">
+            <div class="notes-header">Release Notes</div>
+            <div id="updateNotes" class="notes-body"></div>
+          </div>
+
+          <div id="updateProgressBox" class="progress-box" hidden>
+            <div class="progress-head">
+              <span id="progressLabel">Downloading update…</span>
+              <span id="progressPercent">0%</span>
+            </div>
+            <div class="progress-bar-bg">
+              <div id="progressBar" class="progress-bar-fill" style="width: 0%"></div>
+            </div>
+            <div class="progress-sub" id="progressSub">0 MB / 0 MB</div>
+          </div>
+
+          <div id="updateMsg" class="update-msg" hidden></div>
+        </div>
+
+        <!-- 2. PREFERENCES TAB PANEL -->
+        <div class="tab-panel" id="panelPreferences" hidden>
+          <div class="pref-group">
+            <label class="pref-label">Default Metric on Startup</label>
+            <div class="pref-sub">Choose which metric view activates when Cinder launches.</div>
+            <div class="seg pref-seg" id="prefMetric">
+              <button data-v="cost">Cost</button>
+              <button data-v="tokens" class="on">Tokens</button>
+              <button data-v="requests">Requests</button>
+              <button data-v="limits">Limits</button>
+            </div>
+          </div>
+
+          <div class="pref-group">
+            <label class="pref-label">Default Time Range on Startup</label>
+            <div class="pref-sub">Choose the calendar range loaded when Cinder launches.</div>
+            <div class="seg pref-seg" id="prefRange">
+              <button data-v="1">Today (UTC)</button>
+              <button data-v="7">7 days</button>
+              <button data-v="30">30 days</button>
+              <button data-v="90" class="on">90 days</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 3. DATA SOURCES TAB PANEL -->
+        <div class="tab-panel" id="panelSources" hidden>
+          <div class="sources-intro">Cinder parses local logs and SQLite stores directly on this machine without network transfer:</div>
+          <div class="sources-list">
+            <div class="source-item">
+              <div class="source-name"><b>Pi</b> <code>~/.pi/agent/sessions/</code></div>
+              <div class="source-metrics">Requests, tokens, cost, tool calls, models</div>
+            </div>
+            <div class="source-item">
+              <div class="source-name"><b>Codex</b> <code>~/.codex/sessions/</code></div>
+              <div class="source-metrics">Requests, tokens, tool calls, models (cost estimated)</div>
+            </div>
+            <div class="source-item">
+              <div class="source-name"><b>Claude Code</b> <code>~/.claude/projects/</code></div>
+              <div class="source-metrics">Requests, tokens, tools, models (cost estimated)</div>
+            </div>
+            <div class="source-item">
+              <div class="source-name"><b>OpenCode</b> <code>~/.local/share/opencode/opencode.db</code></div>
+              <div class="source-metrics">Sessions, tokens, cost, tool calls</div>
+            </div>
+            <div class="source-item">
+              <div class="source-name"><b>Antigravity / T3</b> <code>~/.gemini/antigravity*</code> &amp; statev2.sqlite</div>
+              <div class="source-metrics">Requests, tools, sessions, T3 tokens (cost estimated)</div>
+            </div>
+            <div class="source-item">
+              <div class="source-name"><b>DSH</b> <code>~/.dsh/sessions/</code> (session.v4.jsonl.zstd)</div>
+              <div class="source-metrics">Requests, tokens, tools, sessions, models</div>
+            </div>
+            <div class="source-item">
+              <div class="source-name"><b>LM Studio</b> <code>~/.lmstudio/conversations/</code></div>
+              <div class="source-metrics">Requests, sessions, models</div>
+            </div>
+          </div>
+          <div class="sources-actions">
+            <button id="settingsRescanBtn" class="modal-btn secondary">&#8635; Rescan All Sources Now</button>
+          </div>
+        </div>
+
+        <!-- 4. ABOUT TAB PANEL -->
+        <div class="tab-panel" id="panelAbout" hidden>
+          <div class="about-hero">
+            <div class="about-name">Cinder</div>
+            <div class="about-desc">Local coding agent usage statistics, token metrics, and cost intelligence for Windows, macOS, and Linux.</div>
+          </div>
+          <div class="about-table">
+            <div class="about-row">
+              <span class="about-k">App Version</span>
+              <span class="about-v" id="aboutVersion">v0.2.0</span>
+            </div>
+            <div class="about-row">
+              <span class="about-k">Identifier</span>
+              <span class="about-v">com.cinder.usage</span>
+            </div>
+            <div class="about-row">
+              <span class="about-k">Framework</span>
+              <span class="about-v">Tauri v2 + Rust</span>
+            </div>
+            <div class="about-row">
+              <span class="about-k">Update Strategy</span>
+              <span class="about-v">In-Place Overwrite (No Pre-Uninstall)</span>
+            </div>
+            <div class="about-row">
+              <span class="about-k">License</span>
+              <span class="about-v">MIT</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div class="modal-footer">
         <a id="modalGithubBtn" href="#" target="_blank" class="modal-btn secondary">View on GitHub</a>
         <div class="modal-btns-right">

@@ -243,31 +243,14 @@ pub async fn download_and_install_impl(
     install_and_restart(&dest_path, &app)
 }
 
-#[cfg(windows)]
-pub fn install_and_restart(installer_path: &Path, app: &AppHandle) -> Result<(), String> {
-    use std::os::windows::process::CommandExt;
-
-    let target_exe = dirs::data_local_dir()
-        .map(|p| p.join("Cinder").join("cinder.exe"))
-        .filter(|p| p.exists())
-        .or_else(|| std::env::current_exe().ok())
-        .ok_or_else(|| "Could not locate Cinder executable path".to_string())?;
-
-    let temp_dir = std::env::temp_dir();
-    let script_path = temp_dir.join("cinder-update-apply.cmd");
-
-    let is_setup = installer_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|s| s.to_lowercase().contains("setup") || s.to_lowercase().ends_with(".exe"))
-        .unwrap_or(true);
-
-    let script_content = if is_setup && installer_path.to_string_lossy().to_lowercase().contains("setup") {
-        // NSIS setup installer: run with /S (silent) and wait, then relaunch cinder.exe
+/// Generates the Windows cmd script used to apply an update and relaunch Cinder.
+pub fn build_update_script(installer_path: &Path, target_exe: &Path, is_setup: bool) -> String {
+    if is_setup && installer_path.to_string_lossy().to_lowercase().contains("setup") {
+        // NSIS setup installer: run with /S (silent) and /UPDATE (in-place update mode)
         format!(
             "@echo off\r\n\
              ping 127.0.0.1 -n 3 >nul\r\n\
-             start /wait \"\" \"{}\" /S\r\n\
+             start /wait \"\" \"{}\" /S /UPDATE\r\n\
              start \"\" \"{}\"\r\n\
              del \"{}\" >nul 2>&1\r\n\
              (goto) 2>nul & del \"%~f0\"\r\n",
@@ -289,7 +272,29 @@ pub fn install_and_restart(installer_path: &Path, app: &AppHandle) -> Result<(),
             target_exe.display(),
             installer_path.display(),
         )
-    };
+    }
+}
+
+#[cfg(windows)]
+pub fn install_and_restart(installer_path: &Path, app: &AppHandle) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+
+    let target_exe = dirs::data_local_dir()
+        .map(|p| p.join("Cinder").join("cinder.exe"))
+        .filter(|p| p.exists())
+        .or_else(|| std::env::current_exe().ok())
+        .ok_or_else(|| "Could not locate Cinder executable path".to_string())?;
+
+    let temp_dir = std::env::temp_dir();
+    let script_path = temp_dir.join("cinder-update-apply.cmd");
+
+    let is_setup = installer_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_lowercase().contains("setup") || s.to_lowercase().ends_with(".exe"))
+        .unwrap_or(true);
+
+    let script_content = build_update_script(installer_path, &target_exe, is_setup);
 
     fs::write(&script_path, script_content)
         .map_err(|e| format!("Failed to write update script: {}", e))?;
@@ -383,6 +388,15 @@ mod tests {
         assert_eq!(info.latest_version, "0.2.0");
         assert_eq!(info.current_version, "0.1.0");
         assert_eq!(info.asset_name.as_deref(), Some("Cinder_0.2.0_x64-setup.exe"));
+    }
+
+    #[test]
+    fn test_build_update_script_runs_setup_with_update_flag() {
+        let installer = Path::new("C:\\temp\\Cinder_0.2.0_x64-setup.exe");
+        let target = Path::new("C:\\Users\\Admin\\AppData\\Local\\Cinder\\cinder.exe");
+        let script = build_update_script(installer, target, true);
+        assert!(script.contains("/S /UPDATE"));
+        assert!(script.contains("cinder.exe"));
     }
 
     #[test]

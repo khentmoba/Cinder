@@ -479,9 +479,49 @@ function fmtBytes(bytes) {
   return bytes + ' B';
 }
 
+function switchSettingsTab(tabName) {
+  const tabBtn = document.getElementById('tab' + tabName.charAt(0).toUpperCase() + tabName.slice(1));
+  const panel = document.getElementById('panel' + tabName.charAt(0).toUpperCase() + tabName.slice(1));
+  const allTabs = document.querySelectorAll('.settings-tab');
+  const allPanels = document.querySelectorAll('.tab-panel');
+
+  if (allTabs && allTabs.length) {
+    allTabs.forEach(t => t.classList?.remove('on'));
+  }
+  if (allPanels && allPanels.length) {
+    allPanels.forEach(p => {
+      p.hidden = true;
+      p.classList?.remove('on');
+    });
+  }
+
+  if (tabBtn) tabBtn.classList?.add('on');
+  if (panel) {
+    panel.hidden = false;
+    panel.classList?.add('on');
+  }
+
+  const modalTitle = document.getElementById('modalTitle');
+  if (modalTitle) {
+    if (tabName === 'updates' && UPDATE_INFO && UPDATE_INFO.available) {
+      modalTitle.textContent = 'Cinder Update';
+    } else {
+      modalTitle.textContent = 'Settings';
+    }
+  }
+}
+
+function openSettings(tabName = 'updates') {
+  switchSettingsTab(tabName);
+  const modal = document.getElementById('updateModal');
+  if (modal) modal.hidden = false;
+}
+
 function showUpdateModal(info, isUpToDateMessage = false) {
   const modal = document.getElementById('updateModal');
   if (!modal) return;
+
+  switchSettingsTab('updates');
 
   const tag = document.getElementById('modalTag');
   const curVer = document.getElementById('updateCurrentVer');
@@ -494,6 +534,7 @@ function showUpdateModal(info, isUpToDateMessage = false) {
   const msgEl = document.getElementById('updateMsg');
   const metaBox = document.querySelector('.update-meta');
   const notesSec = document.querySelector('.notes-section');
+  const settingsStatus = document.getElementById('settingsUpdateStatus');
 
   if (progressBox) progressBox.hidden = true;
   if (msgEl) msgEl.hidden = true;
@@ -502,6 +543,7 @@ function showUpdateModal(info, isUpToDateMessage = false) {
     if (tag) tag.textContent = 'Latest';
     if (metaBox) metaBox.hidden = true;
     if (notesSec) notesSec.hidden = true;
+    if (settingsStatus) settingsStatus.textContent = 'Cinder is up to date.';
     if (msgEl) {
       msgEl.hidden = false;
       msgEl.textContent = `You are on the latest version of Cinder (v${info.current_version}).`;
@@ -524,6 +566,7 @@ function showUpdateModal(info, isUpToDateMessage = false) {
       notesEl.textContent = info.release_notes || 'No release notes provided.';
     }
     if (ghLink) ghLink.href = info.release_url || 'https://github.com/khentmoba/Cinder/releases';
+    if (settingsStatus) settingsStatus.textContent = `Update v${info.latest_version} available!`;
     if (actionBtn) {
       actionBtn.textContent = 'Update Now';
       actionBtn.disabled = false;
@@ -606,6 +649,8 @@ async function checkForUpdates(interactive = false) {
     const badge = document.getElementById('updateBadge');
     const badgeText = document.getElementById('updateBadgeText');
     const updateLink = document.getElementById('updateStatusText');
+    const settingsDot = document.getElementById('settingsUpdateDot');
+    const tabDot = document.getElementById('tabUpdateDot');
 
     if (info.available) {
       if (badge) {
@@ -616,12 +661,16 @@ async function checkForUpdates(interactive = false) {
         updateLink.textContent = `✦ Update v${info.latest_version}`;
         updateLink.hidden = false;
       }
+      if (settingsDot) settingsDot.hidden = false;
+      if (tabDot) tabDot.hidden = false;
       if (interactive) {
         showUpdateModal(info, false);
       }
     } else {
       if (badge) badge.hidden = true;
       if (updateLink) updateLink.hidden = true;
+      if (settingsDot) settingsDot.hidden = true;
+      if (tabDot) tabDot.hidden = true;
       if (interactive) {
         showUpdateModal(info, true);
       }
@@ -643,6 +692,10 @@ invokeCmd('get_app_version')
   .then(ver => {
     const verEl = document.getElementById('appVersion');
     if (verEl && ver) verEl.textContent = 'v' + ver;
+    const aboutVer = document.getElementById('aboutVersion');
+    if (aboutVer && ver) aboutVer.textContent = 'v' + ver;
+    const modalTag = document.getElementById('modalTag');
+    if (modalTag && ver && (!UPDATE_INFO || !UPDATE_INFO.available)) modalTag.textContent = 'v' + ver;
   })
   .catch(() => {});
 
@@ -651,6 +704,91 @@ window.__TAURI__?.event?.listen('update-download-progress', e => {
   if (p) updateProgressUI(p.downloaded, p.total, p.percent, p.finished);
 });
 
+document.getElementById('settingsBtn')?.addEventListener('click', () => openSettings('updates'));
+document.getElementById('footerSettingsBtn')?.addEventListener('click', () => openSettings('updates'));
+
+document.getElementById('settingsTabs')?.addEventListener('click', e => {
+  const tab = e.target.closest ? e.target.closest('.settings-tab') : e.target;
+  if (tab && tab.dataset && tab.dataset.tab) switchSettingsTab(tab.dataset.tab);
+});
+
+document.getElementById('settingsCheckBtn')?.addEventListener('click', async () => {
+  const btn = document.getElementById('settingsCheckBtn');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Checking…';
+  }
+  await checkForUpdates(true);
+  if (btn) {
+    btn.disabled = false;
+    btn.textContent = 'Check for Updates';
+  }
+});
+
+document.getElementById('settingsRescanBtn')?.addEventListener('click', () => {
+  const refreshBtn = document.getElementById('refresh');
+  if (refreshBtn) refreshBtn.click();
+  const rescanBtn = document.getElementById('settingsRescanBtn');
+  if (rescanBtn) {
+    rescanBtn.textContent = 'Rescanning…';
+    setTimeout(() => {
+      rescanBtn.textContent = '↻ Rescan All Sources Now';
+    }, 1500);
+  }
+});
+
+function initPreferences() {
+  try {
+    if (typeof localStorage === 'undefined') return;
+    const savedMetric = localStorage.getItem('cinder_default_metric');
+    if (savedMetric && ['cost', 'tokens', 'requests', 'limits'].includes(savedMetric)) {
+      const btn = document.querySelector(`#metric button[data-v="${savedMetric}"]`);
+      if (btn) btn.click();
+      updatePrefButtons('prefMetric', savedMetric);
+    }
+    const savedRange = localStorage.getItem('cinder_default_range');
+    if (savedRange && ['1', '7', '30', '90'].includes(savedRange)) {
+      const btn = document.querySelector(`#range button[data-v="${savedRange}"]`);
+      if (btn) btn.click();
+      updatePrefButtons('prefRange', savedRange);
+    }
+  } catch (_) {}
+}
+
+function updatePrefButtons(containerId, activeVal) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  const buttons = container.querySelectorAll ? container.querySelectorAll('button') : [];
+  if (buttons && buttons.forEach) {
+    buttons.forEach(b => {
+      if (b.dataset && b.dataset.v === activeVal) b.classList?.add('on');
+      else b.classList?.remove('on');
+    });
+  }
+}
+
+document.getElementById('prefMetric')?.addEventListener('click', e => {
+  const b = e.target.closest ? e.target.closest('button') : e.target;
+  if (!b || !b.dataset) return;
+  const val = b.dataset.v;
+  if (typeof localStorage !== 'undefined') localStorage.setItem('cinder_default_metric', val);
+  updatePrefButtons('prefMetric', val);
+  const mainBtn = document.querySelector(`#metric button[data-v="${val}"]`);
+  if (mainBtn) mainBtn.click();
+});
+
+document.getElementById('prefRange')?.addEventListener('click', e => {
+  const b = e.target.closest ? e.target.closest('button') : e.target;
+  if (!b || !b.dataset) return;
+  const val = b.dataset.v;
+  if (typeof localStorage !== 'undefined') localStorage.setItem('cinder_default_range', val);
+  updatePrefButtons('prefRange', val);
+  const mainBtn = document.querySelector(`#range button[data-v="${val}"]`);
+  if (mainBtn) mainBtn.click();
+});
+
+initPreferences();
+
 document.getElementById('updateBadge')?.addEventListener('click', () => {
   if (UPDATE_INFO && UPDATE_INFO.available) {
     showUpdateModal(UPDATE_INFO, false);
@@ -658,7 +796,7 @@ document.getElementById('updateBadge')?.addEventListener('click', () => {
     checkForUpdates(true);
   }
 });
-document.getElementById('appVersion')?.addEventListener('click', () => checkForUpdates(true));
+document.getElementById('appVersion')?.addEventListener('click', () => openSettings('updates'));
 document.getElementById('updateStatusText')?.addEventListener('click', () => {
   if (UPDATE_INFO && UPDATE_INFO.available) {
     showUpdateModal(UPDATE_INFO, false);

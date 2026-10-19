@@ -16,12 +16,15 @@ npm run install-local  # build + silently reinstall, so the desktop
 > repo. After any code change, run `npm run install-local` (or re-run the
 > NSIS setup by hand) — otherwise the shortcut keeps opening the stale build.
 
-## In-app updates
+## Settings & in-app updates
 
-Cinder checks GitHub Releases (`khentmoba/Cinder/releases`) for new versions on startup and on demand:
-- **Automatic detection**: When a newer release is published, an update badge (`Update vX.Y.Z`) appears in the header and footer.
-- **Manual check**: Click the version label (`v0.1.0`) in the footer at any time to check for updates.
-- **Native installation**: Clicking **Update Now** downloads the release installer (`.exe`) directly in-app with real-time download progress, runs the silent NSIS installer, and automatically restarts Cinder on the new version.
+Click **⚙ Settings** in the header or the version button in the footer at any time to open the Settings modal:
+- **Updates**: Check for updates on demand via GitHub Releases (`khentmoba/Cinder/releases`), inspect release notes, and install updates directly.
+- **In-place updates**: Installing an update performs an actual in-place update (overwrites updated binaries and assets seamlessly without uninstalling previous versions first).
+- **Preferences**: Customize your preferred default metric (Cost, Tokens, Requests, Limits) and default range (Today, 7 days, 30 days, 90 days) on startup.
+- **Data sources**: Inspect all local log paths and SQLite stores monitored by Cinder, or trigger an immediate full rescan.
+- **Automatic detection**: When a newer release is published on GitHub, a prominent update badge (`Update vX.Y.Z`) appears in the header and an indicator lights up on the Settings button.
+- **Native installation**: Clicking **Update Now** downloads the release installer (`.exe`) directly in-app with real-time download progress, runs the silent NSIS installer in update mode (`/UPDATE`), and automatically restarts Cinder on the new version.
 
 ### Publishing a release
 
