@@ -141,6 +141,26 @@ footer {
 }
 .update-status-link:hover { text-decoration: underline; }
 
+/* Settings button */
+.settings-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: #131418; border: 1px solid var(--line);
+  color: var(--dim); font-size: 12px; font-weight: 500;
+  padding: 4px 10px; border-radius: 8px; cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+  font-family: inherit;
+}
+.settings-btn:hover { color: var(--text); border-color: #2e303a; background: #181920; }
+.settings-gear { font-size: 13px; line-height: 1; opacity: 0.85; }
+
+.footer-settings-btn {
+  display: inline-flex; align-items: center; gap: 5px;
+  background: transparent; border: 0; color: inherit; font-family: inherit;
+  font-size: 11px; cursor: pointer; padding: 2px 6px; border-radius: 4px;
+  transition: color 0.15s, background 0.15s;
+}
+.footer-settings-btn:hover { color: var(--text); background: #16171d; }
+
 /* update badge & modal */
 .update-badge {
   display: inline-flex; align-items: center; gap: 6px;
@@ -181,6 +201,76 @@ footer {
   display: flex; flex-direction: column; overflow: hidden;
   animation: modalIn 0.18s cubic-bezier(0.16, 1, 0.3, 1);
 }
+.modal-card.settings-card {
+  max-width: 560px;
+}
+.settings-tabs {
+  display: flex; gap: 4px; padding: 8px 18px 0; border-bottom: 1px solid var(--line);
+  background: #0d0e12;
+}
+.settings-tab {
+  background: transparent; border: 0; border-bottom: 2px solid transparent;
+  color: var(--dim); font-size: 12px; font-weight: 500; padding: 8px 12px;
+  cursor: pointer; font-family: inherit; display: inline-flex; align-items: center; gap: 6px;
+  transition: color 0.15s, border-color 0.15s;
+}
+.settings-tab:hover { color: var(--text); }
+.settings-tab.on { color: var(--text); border-bottom-color: var(--accent); }
+.tab-panel { display: flex; flex-direction: column; gap: 14px; }
+.tab-panel[hidden] { display: none; }
+
+/* Section cards */
+.settings-section-card {
+  background: #16171d; border: 1px solid var(--line); border-radius: 8px;
+  padding: 12px 14px;
+}
+.section-card-header {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+}
+.section-card-title { font-size: 12px; font-weight: 600; color: var(--text); }
+.section-card-sub { font-size: 11px; color: var(--dim); margin-top: 2px; }
+
+/* Preferences tab */
+.pref-group {
+  background: #16171d; border: 1px solid var(--line); border-radius: 8px;
+  padding: 14px 16px; display: flex; flex-direction: column; gap: 6px;
+}
+.pref-label { font-size: 12px; font-weight: 600; color: var(--text); }
+.pref-sub { font-size: 11px; color: var(--dim); margin-bottom: 6px; }
+.pref-seg { align-self: flex-start; }
+
+/* Sources tab */
+.sources-intro { font-size: 11px; color: var(--dim); line-height: 1.4; }
+.sources-list {
+  display: flex; flex-direction: column; gap: 6px; max-height: 220px; overflow-y: auto;
+}
+.source-item {
+  background: #14151b; border: 1px solid var(--line); border-radius: 6px;
+  padding: 8px 10px; display: flex; flex-direction: column; gap: 2px;
+}
+.source-name { font-size: 12px; color: var(--text); }
+.source-name code { font-size: 11px; color: #8ba5ff; background: rgba(107, 138, 253, 0.08); padding: 1px 4px; border-radius: 3px; font-family: monospace; }
+.source-metrics { font-size: 10px; color: var(--faint); }
+.sources-actions { margin-top: 4px; }
+
+/* About tab */
+.about-hero {
+  background: #16171d; border: 1px solid var(--line); border-radius: 8px;
+  padding: 14px 16px;
+}
+.about-name { font-size: 15px; font-weight: 700; color: var(--text); }
+.about-desc { font-size: 11px; color: var(--dim); margin-top: 4px; line-height: 1.4; }
+.about-table {
+  background: #14151b; border: 1px solid var(--line); border-radius: 8px;
+  padding: 8px 12px; display: flex; flex-direction: column; gap: 6px;
+}
+.about-row {
+  display: flex; justify-content: space-between; align-items: center; font-size: 11px;
+  padding: 4px 0; border-bottom: 1px solid #1a1b22;
+}
+.about-row:last-child { border-bottom: 0; }
+.about-k { color: var(--dim); }
+.about-v { color: var(--text); font-weight: 500; font-family: monospace; }
 @keyframes modalIn {
   from { opacity: 0; transform: scale(0.96) translateY(6px); }
   to { opacity: 1; transform: scale(1) translateY(0); }

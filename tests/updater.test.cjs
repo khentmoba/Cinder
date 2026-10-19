@@ -166,3 +166,59 @@ test('updateProgressUI updates progress bar width and labels', () => {
   assert.equal(get('progressPercent').textContent, '100%');
   assert.match(get('progressLabel').textContent, /restarting/);
 });
+
+test('settings button and openSettings open the modal', () => {
+  const { run, get, handlers } = setupUpdaterContext();
+
+  assert.equal(get('updateModal').hidden, false); // initial default in mock is false, let us hide it
+  run('hideUpdateModal()');
+  assert.equal(get('updateModal').hidden, true);
+
+  // Clicking settingsBtn should open settings
+  const settingsHandler = handlers['settingsBtn:click'];
+  assert.ok(settingsHandler, 'settingsBtn should have a click handler');
+  settingsHandler();
+  assert.equal(get('updateModal').hidden, false);
+});
+
+test('switchSettingsTab activates selected panel and tab', () => {
+  const { run, get } = setupUpdaterContext();
+
+  run("switchSettingsTab('preferences')");
+  assert.equal(get('panelPreferences').hidden, false);
+
+  run("switchSettingsTab('sources')");
+  assert.equal(get('panelSources').hidden, false);
+
+  run("switchSettingsTab('about')");
+  assert.equal(get('panelAbout').hidden, false);
+
+  run("switchSettingsTab('updates')");
+  assert.equal(get('panelUpdates').hidden, false);
+});
+
+test('checkForUpdates displays update dot on settings button when update available', async () => {
+  const mockUpdate = {
+    available: true,
+    current_version: '0.1.0',
+    latest_version: '0.2.0',
+    release_name: 'Cinder v0.2.0',
+    release_notes: 'Exciting new features',
+    published_at: '2026-10-19T12:00:00Z',
+    asset_name: 'Cinder_0.2.0_x64-setup.exe',
+    asset_size: 25000000,
+    download_url: 'https://example.com/Cinder_setup.exe',
+    release_url: 'https://github.com/khentmoba/Cinder/releases/tag/v0.2.0',
+  };
+
+  const { run, get } = setupUpdaterContext((cmd) => {
+    if (cmd === 'check_update') return Promise.resolve(mockUpdate);
+    if (cmd === 'get_app_version') return Promise.resolve('0.1.0');
+    return Promise.resolve();
+  });
+
+  await run('checkForUpdates(false)');
+
+  assert.equal(get('settingsUpdateDot').hidden, false);
+  assert.equal(get('tabUpdateDot').hidden, false);
+});
