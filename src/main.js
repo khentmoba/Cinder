@@ -33,33 +33,39 @@ const agentLogo = a => AGENT_LOGO[a] || 'icons/pi.svg';
 
 // Provider mark for a model string, from its provider prefix.
 const PROVIDER_LOGO = [
-  [/^(opencode|opencode-go|opencode-zen|opencode-go-responses|opencode-free-responses)\//, 'icons/opencode.svg'],
-  [/^(openai|openai-codex|custom)\//, 'icons/openai.svg'],
-  [/^anthropic\//, 'icons/anthropic.svg'],
-  [/^antigravity\//, 'icons/antigravity.png'],
-  [/^meta\//, 'icons/meta.svg'],
-  [/^(deepseek)\//, 'icons/deepseek.svg'],
-  [/^(xiaomi|mimo)\//, 'icons/xiaomi.svg'],
-  [/^(moonshot|kimi)\//, 'icons/kimi.svg'],
-  [/^(qwen|alibaba|dashscope)\//, 'icons/alibabacloud.svg'],
-  [/^(mistral)\//, 'icons/mistralai.svg'],
+  [/^(openai|openai-codex)\//i, 'icons/openai.svg'],
+  [/^anthropic\//i, 'icons/anthropic.svg'],
+  [/^(google|gemini)\//i, 'icons/googlegemini.svg'],
+  [/^antigravity\//i, 'icons/antigravity.png'],
+  [/^meta\//i, 'icons/meta.svg'],
+  [/^(deepseek)\//i, 'icons/deepseek.svg'],
+  [/^(xiaomi|mimo)\//i, 'icons/xiaomi.svg'],
+  [/^(moonshot|kimi)\//i, 'icons/kimi.svg'],
+  [/^(qwen|alibaba|dashscope)\//i, 'icons/alibabacloud.svg'],
+  [/^(z-ai|zai|zhipu|zhipuai|bigmodel|chatglm|glm)\//i, 'icons/glm.svg'],
+  [/^(mistral)\//i, 'icons/mistralai.svg'],
+  [/^(minimax)\//i, 'icons/minimax.svg'],
+  [/^(opencode|opencode-go|opencode-zen|opencode-go-responses|opencode-free-responses)\//i, 'icons/opencode.svg'],
 ];
-// fallback on the model name itself when a log has no provider prefix
+// Model family mark, from keywords in the model name.
 const NAME_LOGO = [
-  [/muse|llama/, 'icons/meta.svg'],
-  [/gemini|antigravity/, 'icons/antigravity.png'],
-  [/deepseek/, 'icons/deepseek.svg'],
-  [/gpt|codex|o3|o4/, 'icons/openai.svg'],
-  [/claude/, 'icons/anthropic.svg'],
-  [/mimo|xiaomi/, 'icons/xiaomi.svg'],
-  [/kimi|moonshot/, 'icons/kimi.svg'],
-  [/qwen|glm/, 'icons/alibabacloud.svg'],
-  [/mistral/, 'icons/mistralai.svg'],
-  [/space-bunny/, 'icons/opencode.svg'],
+  [/muse|llama/i, 'icons/meta.svg'],
+  [/gemini/i, 'icons/googlegemini.svg'],
+  [/antigravity/i, 'icons/antigravity.png'],
+  [/deepseek/i, 'icons/deepseek.svg'],
+  [/gpt|codex|o3|o4/i, 'icons/openai.svg'],
+  [/claude/i, 'icons/anthropic.svg'],
+  [/mimo|xiaomi/i, 'icons/xiaomi.svg'],
+  [/kimi|moonshot/i, 'icons/kimi.svg'],
+  [/qwen/i, 'icons/alibabacloud.svg'],
+  [/glm|chatglm|zhipu/i, 'icons/glm.svg'],
+  [/mistral/i, 'icons/mistralai.svg'],
+  [/minimax/i, 'icons/minimax.svg'],
+  [/space-bunny/i, 'icons/opencode.svg'],
 ];
 function providerLogo(model) {
-  for (const [re, icon] of PROVIDER_LOGO) if (re.test(model)) return icon;
   for (const [re, icon] of NAME_LOGO) if (re.test(model)) return icon;
+  for (const [re, icon] of PROVIDER_LOGO) if (re.test(model)) return icon;
   return null;
 }
 
