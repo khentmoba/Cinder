@@ -10,3 +10,7 @@ src-tauri/gen/
 .DS_Store
 Thumbs.db
 .env
+
+# Local Discord webhook for the release notifier
+scripts/discord_webhook.txt
+discord_webhook.txt

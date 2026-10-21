@@ -1,0 +1,8 @@
+- **Live quotas:** Read the current window from Claude Code, Codex, GitHub Copilot, Gemini CLI and OpenCode, using the token each agent already keeps.
+- **Quota alerts:** Cinder projects a window forward from how fast it is used and tells you when one will run out, with a desktop notification.
+- **Plans and budgets:** Declare a plan to see what the work was worth, or a budget to see what is left.
+- **Project breakdown:** A run is attributed to its repository, and git worktrees roll up into their main checkout.
+- **Billing badges:** Each row says whether it is covered by a plan, billed per token, or local.
+- **More agents:** Cursor, GitHub Copilot, Gemini CLI and Cline are now read.
+- **System tray:** The tooltip carries the live quota percentages.
+- **Faster scans:** FFF's SIMD search screens the log lines, and the OpenCode database is aggregated in SQLite.
