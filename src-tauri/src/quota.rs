@@ -1723,7 +1723,7 @@ mod tests {
     fn a_snapshot_from_another_version_is_not_read() {
         let dir = std::env::temp_dir().join(format!("cinder-quota-cache-v-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(cache_path(&dir).parent().unwrap().to_path_buf()).unwrap();
+        std::fs::create_dir_all(cache_path(&dir).parent().unwrap()).unwrap();
         let value = json!({ "version": 999, "saved_at": 1, "reports": [] });
         std::fs::write(cache_path(&dir), serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(load_cache(&dir).is_none());
