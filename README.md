@@ -266,14 +266,15 @@ the screen is a number that can be accounted for:
 ```bash
 powershell -File scripts/check-logs.ps1                              # Claude Code
 powershell -File scripts/check-logs.ps1 -Agent Codex                 # Codex
+powershell -File scripts/check-logs.ps1 -Agent Pi                    # Pi
 powershell -File scripts/check-logs.ps1 -Agent Codex 2026-10-19 2026-10-20
 ```
 
-`scripts/check-claude-logs.mjs` and `scripts/check-codex-logs.mjs` read the
-agents' own logs with an implementation that shares no code with the
-collector, and the `real_home_day_check` test prints what the collector made
-of the same files. The two have to agree line for line, per model, on
-requests and on every kind of token:
+`scripts/check-claude-logs.mjs`, `scripts/check-codex-logs.mjs` and
+`scripts/check-pi-logs.mjs` read the agents' own logs with an implementation
+that shares no code with the collector, and the `real_home_day_check` test
+prints what the collector made of the same files. The two have to agree line
+for line, per model, on requests and on every kind of token:
 
 ```
 === 2026-10-21 ===

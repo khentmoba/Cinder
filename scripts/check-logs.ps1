@@ -25,6 +25,7 @@ if ($Days.Count -eq 0) {
 $reader = switch -Regex ($Agent) {
     'Claude' { 'check-claude-logs.mjs' }
     'Codex' { 'check-codex-logs.mjs' }
+    'Pi' { 'check-pi-logs.mjs' }
     default { $null }
 }
 if (-not $reader) {
