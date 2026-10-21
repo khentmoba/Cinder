@@ -39,7 +39,7 @@ pub struct CachedDb {
 /// A change to the shape or the meaning of a row bumps it, so a cache written
 /// by an older build is rebuilt instead of being replayed with values that no
 /// longer mean what they say.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct ScanCache {

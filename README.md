@@ -66,6 +66,11 @@ still fully visible: use the **Requests** metric. Cost/tokens views show a `—`
 for them by design, so the agent list also prints the request count next to
 the cost.
 
+Each source is read on its own: one agent whose logs trip the parser up does
+not take the rest of the dashboard with it. The **Data sources** panel says
+which source failed and why, so a gap in the numbers is explained rather than
+just missing.
+
 Daily ranges use UTC dates; **Today** is a UTC calendar day, not a rolling
 24-hour window. Costs marked **≥** exclude some unpriced token usage. Codex
 cache counts are kept as reported, without borrowing ratios from other agents.
@@ -98,26 +103,6 @@ several. A checkout that has since been cleaned up still rolls up through the
 A delegated child run (Claude Code writes it to `<session>/subagents/`) is
 counted once, on its own row, badged as a subagent and tagged with the model
 it actually ran on — which is often a cheaper one than its parent.
-
-## Live quotas
-
-The **Limits** view shows two kinds of window: the ones an agent wrote into
-its own session files, and the ones fetched live from the provider. The live
-ones use the OAuth token the agent already stored on disk, and are refreshed
-every five minutes in the background, so a scan never waits on the network.
-
-| Agent | Where the credential is | Endpoint |
-|---|---|---|
-| Claude Code | `~/.claude/.credentials.json` | `api.anthropic.com/api/oauth/usage` |
-| Codex | `~/.codex/auth.json` | `chatgpt.com/backend-api/wham/usage` |
-| GitHub Copilot | `~/.config/github-copilot/apps.json` | `api.github.com/copilot_internal/user` |
-| Gemini CLI | `~/.gemini/oauth_creds.json` | `cloudcode-pa.googleapis.com` |
-| OpenCode | `OPENCODE_API_KEY` or `~/.local/share/opencode/auth.json` | `opencode.ai/api/usage` |
-
-A provider that is not signed in is skipped; one that is signed in but fails
-says so in the panel instead of showing a stale number. A window whose reset
-time has already passed is dropped rather than shown as if it were still
-running.
 
 ## Alerts
 
@@ -156,8 +141,74 @@ and are read against the current month.
 
 Cinder puts an icon in the tray whose tooltip carries the live quota
 percentages, so the window that matters can be read without opening the app.
-Left-click brings the dashboard back, right-click opens **Open Cinder**,
-**Rescan now** and **Quit Cinder**.
+**Clicking the icon opens a popover** next to it with the whole picture:
+
+- one card per provider that is signed in on this machine, with how much of
+  each quota window is gone, when it resets, and the plan it is on;
+- the alerts that are worth interrupting the user about;
+- the plans the user declared, and what the work was worth against them;
+- what today cost, in tokens and in money.
+
+Right-click opens **Open Cinder**, **Rescan now** and **Quit Cinder**. The
+popover closes when it loses the focus, the way a menu does, and the refresh
+button in its corner asks the providers again.
+
+A provider that cannot be read says so in its card rather than showing a
+number that is not true. A provider whose newest refresh failed keeps the
+last numbers that did come back, badged **stale**, so a flaky network never
+blanks the panel.
+
+> `CINDER_TRAY_POPOVER=1 cinder` opens the popover at start-up, which is how
+> it is checked without a mouse. `CINDER_DEBUG=1` prints what the tray is
+> doing to the console.
+
+## Live quotas, and keeping them true
+
+The **Limits** view shows two kinds of window: the ones an agent wrote into
+its own session files, and the ones fetched live from the provider. The live
+ones use the OAuth token the agent already stored on disk, and are refreshed
+every five minutes in the background, so a scan never waits on the network.
+
+| Agent | Where the credential is | Endpoint |
+|---|---|---|
+| Claude Code | `~/.claude/.credentials.json` | `api.anthropic.com/api/oauth/usage` |
+| Codex | `~/.codex/auth.json` | `chatgpt.com/backend-api/wham/usage` |
+| GitHub Copilot | `~/.config/github-copilot/apps.json` | `api.github.com/copilot_internal/user` |
+| Gemini CLI | `~/.gemini/oauth_creds.json` | `cloudcode-pa.googleapis.com` |
+| OpenCode | `OPENCODE_API_KEY` or `~/.local/share/opencode/auth.json` | `opencode.ai/api/usage` |
+
+A provider that is not signed in is skipped; one that is signed in but fails
+says so in the panel instead of showing a stale number. A window whose reset
+time has already passed is dropped rather than shown as if it were still
+running.
+
+The fetcher is built for a bad day, not only for a good one:
+
+- a request that fails is **tried again** with a backoff — and a rate limit
+  waits longer, because it means "not yet";
+- a provider that keeps failing is **benched** for a while (a minute, then
+  two, then five, then a quarter of an hour) instead of being asked every
+  few minutes;
+- the last windows that did come back are **kept and marked stale**, so a
+  flaky network never blanks the panel;
+- the snapshot is **written to disk**, so a launch shows the last known state
+  instead of an empty tray while the first refresh is in flight;
+- a token that is about to expire is **refreshed** before it is used, and the
+  new token is written back, which also keeps the agent signed in;
+- a machine with two Claude or Codex logins gets a **card for each** of them.
+
+## Prices
+
+Every token is priced against the public list prices, so the dollar figure on
+screen is an *equivalent value*, never an invoice. The bundled price list is
+a snapshot; a fresh one is fetched once a day in the background and kept in
+`~/.cinder/prices.json`, so a model that appeared last week is priced at this
+week's price instead of showing up as unpriced. The bundled list is still
+there underneath, so a fetch that fails changes nothing.
+
+When a model has no price at all, but the agent itself wrote down what the
+call cost, that figure is used instead: the number the agent knows is better
+than no number. Those rows are marked as **reported** rather than estimated.
 
 ## Speed
 
@@ -201,8 +252,9 @@ Tests use temporary home directories, not your real agent logs.
 
 `cargo test --manifest-path src-tauri/Cargo.toml -- --ignored real_home_scan`
 scans the machine you are on and prints what it found, for a human to eyeball.
-`-- --ignored live_quota_check` asks the providers for their live quota, which
-reaches the network.
+`-- --ignored live_quota_check` asks the providers for their live quota, and
+`-- --ignored live_price_refresh` fetches the real price list. Both reach the
+network.
 
 Add agents by extending `parse_*` functions in `src-tauri/src/main.rs` and
 `src-tauri/src/agents.rs`.

@@ -124,14 +124,14 @@ function cardHTML(c) {
       ${stale}
     </div>`;
   if (c.error) {
-    return `<section class="card failed">${head}
+    return `<section class="pcard failed">${head}
       <div class="err">${esc(c.error)}</div>
     </section>`;
   }
   if (!c.windows || !c.windows.length) {
-    return `<section class="card">${head}<div class="err">No windows reported.</div></section>`;
+    return `<section class="pcard">${head}<div class="err">No windows reported.</div></section>`;
   }
-  return `<section class="card">${head}${c.windows.map(windowRow).join('')}</section>`;
+  return `<section class="pcard">${head}${c.windows.map(windowRow).join('')}</section>`;
 }
 
 function alertHTML(a) {
@@ -191,7 +191,10 @@ function render() {
   }
   const today = document.getElementById('today');
   if (today) {
-    const cost = fmtUsd(s.today_cost, s.today_cost_known !== false, s.today_cost_partial);
+    // A partial figure is still worth showing: it says what is known, and
+    // the "≥" says there is more.
+    const known = s.today_cost_known !== false || s.today_cost_partial;
+    const cost = fmtUsd(s.today_cost, known, s.today_cost_partial);
     today.innerHTML = `<b>${esc(cost)}</b> today · ${esc(fmtTok(s.today_tokens))} tokens · ${esc(String(s.today_requests || 0))} requests`;
   }
 }

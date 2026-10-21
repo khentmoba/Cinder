@@ -163,6 +163,9 @@ pub const REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const ATTEMPTS: u32 = 3;
 /// The wait before the second attempt. It doubles from there.
 const RETRY_BASE: Duration = Duration::from_millis(400);
+/// The wait before the second attempt when the provider says it is rate
+/// limiting us. That answer means "not yet", so the wait is longer.
+const RETRY_BASE_LIMITED: Duration = Duration::from_secs(2);
 /// The version of the on-disk snapshot, so an old file is not misread.
 const CACHE_VERSION: u32 = 1;
 
@@ -944,8 +947,13 @@ async fn get_json(
             Ok(v) => return Ok(v),
             Err(e) if e.retryable() && attempt < ATTEMPTS => {
                 // The wait doubles each time, with a little jitter so two
-                // providers failing together do not retry in lockstep.
-                let backoff = RETRY_BASE * 2u32.pow(attempt - 1);
+                // providers failing together do not retry in lockstep. A rate
+                // limit waits longer, because it says "not yet".
+                let base = match &e {
+                    FetchError::Status(429) => RETRY_BASE_LIMITED,
+                    _ => RETRY_BASE,
+                };
+                let backoff = base * 2u32.pow(attempt - 1);
                 let jitter = (attempt as u64 * 37) % 120;
                 tokio::time::sleep(backoff + Duration::from_millis(jitter)).await;
             }
@@ -1723,7 +1731,7 @@ mod tests {
     fn a_snapshot_from_another_version_is_not_read() {
         let dir = std::env::temp_dir().join(format!("cinder-quota-cache-v-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(cache_path(&dir).parent().unwrap().to_path_buf()).unwrap();
+        std::fs::create_dir_all(cache_path(&dir).parent().unwrap()).unwrap();
         let value = json!({ "version": 999, "saved_at": 1, "reports": [] });
         std::fs::write(cache_path(&dir), serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(load_cache(&dir).is_none());
