@@ -264,23 +264,27 @@ The collector and the raw logs are checked against each other, so a number on
 the screen is a number that can be accounted for:
 
 ```bash
-powershell -File scripts/check-logs.ps1 2026-10-19 2026-10-20
+powershell -File scripts/check-logs.ps1                              # Claude Code
+powershell -File scripts/check-logs.ps1 -Agent Codex                 # Codex
+powershell -File scripts/check-logs.ps1 -Agent Codex 2026-10-19 2026-10-20
 ```
 
-`scripts/check-claude-logs.mjs` reads `~/.claude/projects` with an
-implementation that shares no code with the collector, and the
-`real_home_day_check` test prints what the collector made of the same files.
-The two have to agree line for line, per model, on requests and on every kind
-of token:
+`scripts/check-claude-logs.mjs` and `scripts/check-codex-logs.mjs` read the
+agents' own logs with an implementation that shares no code with the
+collector, and the `real_home_day_check` test prints what the collector made
+of the same files. The two have to agree line for line, per model, on
+requests and on every kind of token:
 
 ```
-=== 2026-10-19 ===
-  OK: 4 models, the collector and the raw logs agree
-    ROW	claude-haiku-4-5-20251001	2	20	36522	23756	158
-    ROW	claude-haiku-5-5	52	104	2309489	403728	108105
-    ROW	claude-opus-5-5	501	1012	99476715	2602498	290872
-    ROW	claude-sonnet-5-5	224	454	25167263	539943	184524
+=== 2026-10-21 ===
+  OK: 2 models, the collector and the raw logs agree
+    ROW	gpt-6.1-sol	972	4203575	151414400	0	452778
+    ROW	gpt-6-luna	957	5115851	123688064	0	986159
 ```
+
+The Codex check is the interesting one: it pins down the split between cached
+and uncached input, the model switching in the middle of a file, and the
+forked rollouts that replay their parent's earlier turns.
 
 Add agents by extending `parse_*` functions in `src-tauri/src/main.rs` and
 `src-tauri/src/agents.rs`.

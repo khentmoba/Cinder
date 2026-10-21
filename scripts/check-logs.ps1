@@ -1,13 +1,15 @@
 # Checks Cinder's numbers against the raw logs, with an implementation that
 # shares no code with the collector.
 #
-#   powershell -File scripts/check-logs.ps1 [YYYY-MM-DD ...]
+#   powershell -File scripts/check-logs.ps1                       # Claude Code, two days
+#   powershell -File scripts/check-logs.ps1 -Agent Codex          # Codex, two days
+#   powershell -File scripts/check-logs.ps1 -Agent Codex 2026-10-19 2026-10-20
 #
-# For every day given, it reads ~/.claude/projects the way Claude Code writes
-# it (scripts/check-claude-logs.mjs) and asks the collector for the same
+# For every day given, it reads the agent's own logs the way the agent writes
+# them (scripts/check-<agent>-logs.mjs) and asks the collector for the same
 # numbers (the ignored real_home_day_check test), then compares them line for
 # line. The two have to be identical for the numbers to be right.
-param()
+param([string]$Agent = 'Claude Code')
 
 # With -File, only the first argument binds to a parameter, so the days are
 # read from the argument list itself.
@@ -20,20 +22,32 @@ if ($Days.Count -eq 0) {
     )
 }
 
+$reader = switch -Regex ($Agent) {
+    'Claude' { 'check-claude-logs.mjs' }
+    'Codex' { 'check-codex-logs.mjs' }
+    default { $null }
+}
+if (-not $reader) {
+    Write-Output "there is no independent reader for $Agent yet"
+    exit 1
+}
+
 $failed = $false
 foreach ($day in $Days) {
     Write-Output "=== $day ==="
 
-    $mine = node "$PSScriptRoot\check-claude-logs.mjs" $day |
+    # The array matters: a pipeline that yields one item comes back as the
+    # item itself, and indexing that would index its characters.
+    $mine = @(node "$PSScriptRoot\$reader" $day |
         Where-Object { $_ -like "ROW`t*" } |
-        Sort-Object
-    if (-not $mine) {
-        Write-Output "  no Claude Code usage that day"
+        Sort-Object)
+    if ($mine.Count -eq 0) {
+        Write-Output "  no $Agent usage that day"
         continue
     }
 
     $env:CINDER_CHECK_DAY = $day
-    $env:CINDER_CHECK_AGENT = 'Claude Code'
+    $env:CINDER_CHECK_AGENT = $Agent
     $theirs = cargo test --manifest-path src-tauri\Cargo.toml -- --ignored --nocapture real_home_day_check 2>&1 |
         Where-Object { $_ -like "ROW`t*" } |
         ForEach-Object { $_.Trim() } |
