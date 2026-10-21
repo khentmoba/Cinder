@@ -297,10 +297,12 @@ function render() {
   const cachedInput = grand.cache_read;
   const freshInput = grand.input + grand.cache_write;
   const hit = cachedInput + freshInput ? cachedInput / (cachedInput + freshInput) * 100 : 0;
+  const hitColor = hit > 50 ? 'var(--good)' : hit > 20 ? 'var(--accent)' : 'inherit';
   const items = [
-    ['Cache hit rate', hit ? hit.toFixed(1) + '%' : '—'],
+    ['Cache hit rate', hit ? `<span style="color:${hitColor}">${hit.toFixed(1)}%</span>` : '—'],
     ['Cache savings', grand.savings > 0 ? fmtUsd(grand.savings, true) : '—'],
   ];
+  if (grand.cache_read > 0) items.push(['Prompt cached', fmtTok(grand.cache_read)]);
   if (metric !== 'cost') items.push(['Cost', fmtUsd(grand.cost, grand.cost_known, grand.cost_partial)]);
   document.getElementById('totals').innerHTML = items.map(([l, v]) =>
     `<div class="t"><div class="l">${l}</div><div class="v">${v}</div></div>`).join('');
@@ -308,10 +310,14 @@ function render() {
   const total = tok(grand) || 1;
   const segs = [['Input', grand.input, '#3f3f46'], ['Cache read', grand.cache_read, '#8b5cf6'],
     ['Cache write', grand.cache_write, '#c084fc'], ['Output', grand.output, '#e8e8ea']];
-  document.getElementById('stacked').innerHTML = segs.map(([, v, c]) =>
-    `<div style="width:${v / total * 100}%;background:${c}"></div>`).join('');
-  document.getElementById('stackLegend').innerHTML = segs.map(([l, v, c]) =>
-    `<span><i style="background:${c}"></i>${l} <b>${fmtTok(v)}</b></span>`).join('');
+  document.getElementById('stacked').innerHTML = segs.map(([l, v, c]) => {
+    const pct = (v / total * 100).toFixed(1);
+    return `<div style="width:${v / total * 100}%;background:${c}" title="${l}: ${fmtTok(v)} (${pct}%)"></div>`;
+  }).join('');
+  document.getElementById('stackLegend').innerHTML = segs.map(([l, v, c]) => {
+    const pct = (v / total * 100).toFixed(1);
+    return `<span title="${l}: ${fmtTok(v)} (${pct}%)"><i style="background:${c}"></i>${l} <b>${fmtTok(v)}</b> <span class="legend-pct">(${pct}%)</span></span>`;
+  }).join('');
 
   renderBreakdown();
   renderChart(list);
@@ -344,12 +350,60 @@ function breakdownData() {
     const total = days.reduce((t, d) => t + mval(d), 0) || 1;
     return {
       label: 'Day',
+      costHeader: 'Cost',
       num: metric === 'cost' ? 'Requests' : 'Tokens',
       rows: days.map(d => ({
         key: d.day, name: d.day, logo: null, share: mval(d) / total * 100, value: mval(d),
         cost: d.cost, costKnown: d.cost_known, costPartial: d.cost_partial, priced: d.cost_known,
         num: metric === 'cost' ? d.requests.toLocaleString() : fmtTok(tok(d)),
+        savings: d.savings,
       })),
+    };
+  }
+  if (breakMode === 'agent') {
+    const { list, grand } = byAgent();
+    const grandVal = mval(grand) || 1;
+    return {
+      label: 'Agent',
+      costHeader: 'Cost',
+      num: metric === 'requests' ? 'Requests' : 'Tokens',
+      rows: list.map(a => ({
+        key: a.agent, name: a.agent, logo: agentLogo(a.agent), share: mval(a) / grandVal * 100, value: mval(a),
+        cost: a.cost, costKnown: a.cost_known, costPartial: a.cost_partial, priced: a.cost_known,
+        num: metric === 'requests' ? a.requests.toLocaleString() : fmtTok(tok(a)),
+        extra: a.sessions ? `${a.sessions} sess` : '',
+        savings: a.savings,
+        requests: a.requests,
+      })),
+    };
+  }
+  if (breakMode === 'cache') {
+    const { list } = byModel();
+    const { grand } = byAgent();
+    const grandSavings = grand.savings || 1;
+    const sorted = [...list].sort((a, b) => (b.savings - a.savings) || (b.cache_read - a.cache_read));
+    return {
+      label: 'Model (Cache)',
+      costHeader: 'Saved',
+      num: 'Hit % · Read',
+      rows: sorted.map(a => {
+        const cached = a.cache_read;
+        const fresh = a.input + a.cache_write;
+        const hit = (cached + fresh > 0) ? (cached / (cached + fresh) * 100) : 0;
+        return {
+          key: a.model, name: a.model, logo: providerLogo(a.model),
+          share: grand.savings > 0 ? (a.savings / grandSavings * 100) : hit,
+          value: a.savings,
+          cost: a.savings,
+          costKnown: true,
+          costPartial: false,
+          priced: true,
+          num: (hit > 0 ? hit.toFixed(1) + '%' : '0%') + ' · ' + fmtTok(a.cache_read),
+          rawSavings: a.savings,
+          hitRate: hit,
+          cacheRead: a.cache_read,
+        };
+      }),
     };
   }
   const { list } = byModel();
@@ -359,30 +413,37 @@ function breakdownData() {
     : list.reduce((t, a) => t + a.requests, 0)) || 1;
   return {
     label: 'Model',
+    costHeader: 'Cost',
     num: metric === 'requests' ? 'Requests' : 'Tokens',
     rows: list.map(a => ({
       key: a.model, name: a.model, logo: providerLogo(a.model), share: mval(a) / totalBase * 100, value: mval(a),
       cost: a.cost, costKnown: a.cost_known, costPartial: a.cost_partial,
       priced: a.cost_known && (a.input + a.output + a.cache_read + a.cache_write) > 0,
       num: metric === 'requests' ? a.requests.toLocaleString() : fmtTok(tok(a)),
+      savings: a.savings,
+      requests: a.requests,
+      cacheRead: a.cache_read,
     })),
   };
 }
 
 function renderBreakdown() {
   const el = document.getElementById('breakdown');
-  const { rows, label, num } = breakdownData();
+  const { rows, label, costHeader = 'Cost', num } = breakdownData();
   const shown = breakAll ? rows : rows.slice(0, 10);
-  const head = `<div class="bd-head"><span>#</span><span></span><span>${label}</span><span>Cost</span><span>${num}</span></div>`;
+  const head = `<div class="bd-head"><span>#</span><span></span><span>${label}</span><span>${costHeader}</span><span>${num}</span></div>`;
   const body = shown.map((r, i) => {
-    const cost = r.priced || r.costKnown ? fmtUsd(r.cost, true, r.costPartial) : 'Unpriced';
-    const active = breakMode === 'model' && selectedModel === r.key;
-    return `<button class="bd-row${active ? ' sel' : ''}" data-key="${esc(r.key)}"${breakMode === 'model' ? ' data-model="1"' : ''}>
+    const cost = breakMode === 'cache'
+      ? (r.rawSavings > 0 ? fmtUsd(r.cost, true) : (r.cacheRead > 0 ? '$0.00' : '—'))
+      : (r.priced || r.costKnown ? fmtUsd(r.cost, true, r.costPartial) : 'Unpriced');
+    const active = (breakMode === 'model' || breakMode === 'cache') ? (selectedModel === r.key)
+      : (breakMode === 'agent') ? (selectedAgent === r.key) : false;
+    return `<button class="bd-row${active ? ' sel' : ''}" data-key="${esc(r.key)}"${(breakMode === 'model' || breakMode === 'cache') ? ' data-model="1"' : breakMode === 'agent' ? ' data-agent="1"' : ''}>
       <span class="share" style="width:${Math.min(100, r.share)}%"></span>
       <span class="rank">${i + 1}</span>
       <span class="cell-logo">${r.logo ? `<img class="logo sm" src="${r.logo}" alt="" onerror="this.remove()">` : ''}</span>
-      <span class="bd-name">${esc(r.name)}</span>
-      <span class="bd-cost${r.priced || r.costKnown ? '' : ' unpriced'}">${cost}</span>
+      <span class="bd-name">${esc(r.name)}${r.extra ? ` <span class="cnt">${esc(r.extra)}</span>` : ''}</span>
+      <span class="bd-cost${(r.priced || r.costKnown || breakMode === 'cache') ? '' : ' unpriced'}">${cost}</span>
       <span class="bd-num">${r.num}</span>
     </button>`;
   }).join('');
@@ -391,9 +452,13 @@ function renderBreakdown() {
   el.innerHTML = head + body + more;
   document.getElementById('bdMore')?.addEventListener('click', () => { breakAll = true; renderBreakdown(); });
   el.querySelectorAll('.bd-row').forEach(row => row.addEventListener('click', () => {
-    if (breakMode !== 'model') return;
-    selectedModel = selectedModel === row.dataset.key ? null : row.dataset.key;
-    render();
+    if (breakMode === 'model' || breakMode === 'cache') {
+      selectedModel = selectedModel === row.dataset.key ? null : row.dataset.key;
+      render();
+    } else if (breakMode === 'agent') {
+      selectedAgent = selectedAgent === row.dataset.key ? null : row.dataset.key;
+      render();
+    }
   }));
 }
 
@@ -411,10 +476,37 @@ function renderSources() {
 // the visible breakdown, as CSV
 function exportCSV() {
   const { rows } = breakdownData();
-  const csv = ['rank,name,cost_usd,tokens,share_percent']
-    .concat(rows.map((r, i) => [i + 1, `"${String(r.name).replace(/"/g, '""')}"`,
-      (r.priced || r.costKnown) ? r.cost.toFixed(4) : '', r.num, r.share.toFixed(2)].join(',')))
-    .join('\n');
+  let headers = 'rank,name,cost_usd,tokens,share_percent';
+  let lines;
+  if (breakMode === 'cache') {
+    headers = 'rank,model,savings_usd,hit_rate_percent,cache_read_tokens';
+    lines = rows.map((r, i) => [
+      i + 1,
+      `"${String(r.name).replace(/"/g, '""')}"`,
+      r.rawSavings ? r.rawSavings.toFixed(4) : '0.0000',
+      r.hitRate ? r.hitRate.toFixed(2) : '0.00',
+      r.cacheRead || 0
+    ].join(','));
+  } else if (breakMode === 'agent') {
+    headers = 'rank,agent,cost_usd,metric_value,share_percent,cache_savings_usd';
+    lines = rows.map((r, i) => [
+      i + 1,
+      `"${String(r.name).replace(/"/g, '""')}"`,
+      (r.priced || r.costKnown) ? r.cost.toFixed(4) : '',
+      `"${String(r.num).replace(/"/g, '""')}"`,
+      r.share.toFixed(2),
+      r.savings ? r.savings.toFixed(4) : '0.0000'
+    ].join(','));
+  } else {
+    lines = rows.map((r, i) => [
+      i + 1,
+      `"${String(r.name).replace(/"/g, '""')}"`,
+      (r.priced || r.costKnown) ? r.cost.toFixed(4) : '',
+      `"${String(r.num).replace(/"/g, '""')}"`,
+      r.share.toFixed(2)
+    ].join(','));
+  }
+  const csv = [headers].concat(lines).join('\n');
   const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
   const a = document.createElement('a');
   a.href = url;
@@ -624,29 +716,91 @@ function renderLimits() {
   const box = document.getElementById('limitsView');
   const limits = [...(DATA.limits || [])].sort((a, b) => b.used_percent - a.used_percent);
   if (!limits.length) {
-    box.innerHTML = `<div class="limits"><h3 style="margin-top:0">Limits</h3>
+    box.innerHTML = `<div class="limits"><h3 style="margin-top:0">Rate limits</h3>
       <p style="color:var(--dim)">No agent reported rate-limit usage in the scanned logs.<br>
       Only Codex writes plan limits into its session files (5h / weekly windows).</p></div>`;
     return;
   }
   box.innerHTML = `<div class="limits"><h3 style="margin-top:0">Rate limits</h3>` + limits.map(l => {
-    const pct = Math.min(100, l.used_percent);
+    const pct = Math.min(100, Math.max(0, l.used_percent));
     const colour = pct > 80 ? 'var(--bad)' : pct > 50 ? 'var(--warn)' : 'var(--accent)';
+
     // Burn-rate projection: how much of the window is gone vs how much of the
     // allowance is gone. Only worth stating once the window is under way.
     const span = (l.window_minutes || 0) * 60000;
-    const elapsed = span ? 1 - (l.resets_at * 1000 - Date.now()) / span : 0;
+    const now = Date.now();
+    const resetMs = (l.resets_at || 0) * 1000;
+    const elapsed = span ? Math.max(0, Math.min(1, 1 - (resetMs - now) / span)) : 0;
     const projected = elapsed > 0.15 && elapsed < 1 ? l.used_percent / elapsed : null;
-    const note = projected === null ? ''
-      : projected >= 100 ? ` · on track to hit 100% before reset` : ` · on track for ${Math.round(projected)}%`;
+
+    // Burn velocity (% / hr)
+    const elapsedHours = (span * elapsed) / 3600000;
+    const burnRatePerHour = elapsedHours > 0.1 && l.used_percent > 0 ? (l.used_percent / elapsedHours) : null;
+
+    // Health / Pacing badge
+    let badge = '';
+    if (pct >= 90) {
+      badge = `<span class="badge-pace pace-bad">Cap Imminent</span>`;
+    } else if (projected !== null) {
+      if (projected >= 100) {
+        badge = `<span class="badge-pace pace-bad">Exhaustion Risk</span>`;
+      } else if (projected > 75) {
+        badge = `<span class="badge-pace pace-warn">Elevated</span>`;
+      } else {
+        badge = `<span class="badge-pace pace-good">On Pace</span>`;
+      }
+    } else if (pct > 50) {
+      badge = `<span class="badge-pace pace-warn">Moderate</span>`;
+    }
+
+    // Depletion ETA calculation if projected >= 100
+    let note = '';
+    if (projected !== null) {
+      if (projected >= 100) {
+        if (burnRatePerHour && burnRatePerHour > 0) {
+          const hoursLeft = (100 - pct) / burnRatePerHour;
+          const eta = hoursLeft < 1
+            ? `~${Math.max(1, Math.round(hoursLeft * 60))}m`
+            : `~${hoursLeft < 10 ? hoursLeft.toFixed(1) : Math.round(hoursLeft)}h`;
+          note = ` · <b style="color:var(--bad)">exhaustion in ${eta} at current pace</b>`;
+        } else {
+          note = ` · on track to hit 100% before reset`;
+        }
+      } else {
+        note = ` · on track for ${Math.round(projected)}%`;
+      }
+    }
+
     const reset = l.resets_at
       ? `resets ${untilReset(l.resets_at)} <span class="lm-when">(${new Date(l.resets_at * 1000).toLocaleString()})</span>`
       : 'reset time unknown';
+
+    // Linear pace marker: expected % usage if burning evenly across the window
+    const paceMarker = (elapsed > 0.05 && elapsed < 0.95)
+      ? `<span class="pace-marker" style="left:${(elapsed * 100).toFixed(1)}%" title="Target pace for elapsed time (${Math.round(elapsed * 100)}%)"></span>`
+      : '';
+
+    const velText = burnRatePerHour
+      ? `<span class="burn-vel" title="Observed consumption pace">⚡ ${burnRatePerHour.toFixed(1)}%/hr</span>`
+      : '';
+
     return `<div class="lrow">
-      <div class="lh"><span>${esc(l.agent)} · ${esc(l.window)} window${l.plan ? ' · ' + esc(l.plan) : ''}</span>
-        <span class="pct" style="color:${colour}">${pct.toFixed(0)}%</span></div>
-      <div class="track"><i style="width:${pct}%;background:${colour}"></i></div>
-      <div class="lm">${windowLabel(l.window_minutes)} · ${reset}${note}</div>
+      <div class="lh">
+        <div class="lh-left">
+          <img class="logo sm" src="${agentLogo(l.agent)}" alt="" onerror="this.style.visibility='hidden'">
+          <span>${esc(l.agent)} · ${esc(l.window)} window${l.plan ? ' · ' + esc(l.plan) : ''}</span>
+          ${badge}
+        </div>
+        <span class="pct" style="color:${colour}">${pct.toFixed(0)}%</span>
+      </div>
+      <div class="track">
+        <i class="bar" style="width:${pct}%;background:${colour}"></i>
+        ${paceMarker}
+      </div>
+      <div class="lm">
+        <span>${windowLabel(l.window_minutes)} · ${reset}${note}</span>
+        ${velText}
+      </div>
     </div>`;
   }).join('') + `</div>`;
 }
