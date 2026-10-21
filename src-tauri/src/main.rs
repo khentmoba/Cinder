@@ -12,7 +12,11 @@ mod prefilter;
 mod pricing;
 mod project;
 mod quota;
+mod tray;
 mod updater;
+
+#[cfg(test)]
+mod testserver;
 
 use alerts::Alert;
 use budget::{Plan, PlanStatus};
@@ -2232,7 +2236,7 @@ fn scan(progress: &dyn Fn(&str)) -> Stats {
 fn scan_home(home: &Path, progress: &dyn Fn(&str)) -> Stats {
     // The live quota snapshot is read from the background refresher, so a scan
     // never waits on the network.
-    let (reports, quota_checked_at) = quota::snapshot();
+    let (reports, quota_checked_at, _, _) = quota::snapshot();
     scan_home_with(home, progress, reports, quota_checked_at)
 }
 
@@ -2354,7 +2358,9 @@ fn scan_home_with(
                 window_minutes: w.window_minutes,
                 resets_at: w.resets_at,
                 plan: w.plan.clone(),
-                source: "live".into(),
+                // A window that is not fresh is marked as such: it is the last
+                // number that came back, not the current state.
+                source: if report.stale { "stale".into() } else { "live".into() },
                 detail: w.detail.clone(),
                 used_amount: w.used_amount,
                 limit_amount: w.limit_amount,
@@ -2389,6 +2395,21 @@ fn scan_home_with(
     let month = budget::month_of(&unix_day(now));
     let plans = budget::statuses(&rows, &budget::load(home), &month);
     let alerts = alerts::evaluate(&live_windows, &plans, now);
+
+    // The tray popover answers from what the last scan found, so opening it
+    // never has to walk the logs again.
+    let today = unix_day(now);
+    let today_rows: Vec<&Row> = rows.iter().filter(|r| r.day == today).collect();
+    tray::remember(tray::ScanSummary {
+        today_cost: today_rows.iter().map(|r| r.cost).sum(),
+        today_cost_known: today_rows.iter().all(|r| r.cost_known),
+        today_cost_partial: today_rows.iter().any(|r| r.cost_partial),
+        today_tokens: today_rows.iter().map(|r| r.tokens()).sum(),
+        today_requests: today_rows.iter().map(|r| r.requests).sum(),
+        alerts: alerts.clone(),
+        plans: plans.clone(),
+        scanned_at: quota::now_iso(),
+    });
 
     Stats {
         rows,
@@ -2465,89 +2486,62 @@ fn set_plans(app: AppHandle, plans: Vec<Plan>) -> Result<Vec<Plan>, String> {
     Ok(budget::load(&home))
 }
 
+/// What the tray popover shows.
+#[tauri::command]
+fn get_tray_summary() -> tray::TraySummary {
+    tray::summary()
+}
+
+/// Do something the popover asked for.
+#[tauri::command]
+fn tray_action(app: AppHandle, action: String) {
+    match action.as_str() {
+        "open" => tray::show_window(&app),
+        "rescan" => tray::rescan(&app),
+        "quit" => app.exit(0),
+        "hide" => tray::hide_popover(&app),
+        // A refresh of the live quotas, without waiting for the timer.
+        "refresh-quota" => request_quota_refresh(),
+        _ => {}
+    }
+}
+
 // ---------------- System tray ----------------
 // The tray shows how close the tightest live quota window is to its ceiling,
-// so the number that matters is visible without opening the window.
-static TRAY: std::sync::LazyLock<std::sync::Mutex<Option<tauri::tray::TrayIcon>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+// so the number that matters is visible without opening the window, and a
+// click opens a popover with the whole picture. The tray itself lives in
+// `tray.rs`.
 
-/// The tray tooltip: the tightest window first, then the rest.
-fn tray_tooltip(reports: &[quota::QuotaReport]) -> String {
-    let mut windows: Vec<&quota::LiveQuota> = reports
-        .iter()
-        .filter(|r| !r.skipped)
-        .flat_map(|r| r.windows.iter())
-        .collect();
-    if windows.is_empty() {
-        return "Cinder — no live quota available".into();
-    }
-    windows.sort_by(|a, b| b.used_percent.partial_cmp(&a.used_percent).unwrap_or(std::cmp::Ordering::Equal));
-    let mut parts = vec![format!("Cinder — {} windows", windows.len())];
-    for w in windows.iter().take(3) {
-        parts.push(format!("{} {} {:.0}%", w.agent, w.window, w.used_percent));
-    }
-    parts.join(" | ")
+/// Wakes the quota refresher, so a refresh asked for by hand does not wait
+/// for the timer.
+static QUOTA_WAKE: (std::sync::Mutex<bool>, std::sync::Condvar) =
+    (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+/// Ask the background refresher to run now.
+fn request_quota_refresh() {
+    let (lock, cvar) = &QUOTA_WAKE;
+    let mut flag = lock.lock().unwrap_or_else(|e| e.into_inner());
+    *flag = true;
+    cvar.notify_all();
 }
 
-/// Refresh the tray tooltip from the latest snapshot.
-fn update_tray_tooltip() {
-    let (reports, _) = quota::snapshot();
-    let tip = tray_tooltip(&reports);
-    let mut guard = TRAY.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(tray) = guard.as_mut() {
-        let _ = tray.set_tooltip(Some(tip));
+/// Wait for the next tick, or until somebody asks for a refresh.
+fn wait_for_quota_tick() {
+    let (lock, cvar) = &QUOTA_WAKE;
+    let mut flag = lock.lock().unwrap_or_else(|e| e.into_inner());
+    // A little jitter, so machines that were started at the same time do not
+    // all ask the providers at the same moment.
+    let jitter = std::time::Duration::from_secs((now_secs() % 30) as u64);
+    while !*flag {
+        let (guard, timeout) = cvar
+            .wait_timeout(flag, quota::REFRESH_INTERVAL + jitter)
+            .unwrap_or_else(|e| e.into_inner());
+        flag = guard;
+        if timeout.timed_out() {
+            break;
+        }
     }
-}
-
-/// Build the tray icon and its menu.
-fn build_tray(app: &AppHandle) -> tauri::Result<()> {
-    use tauri::menu::{Menu, MenuItem};
-    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-
-    let show = MenuItem::with_id(app, "show", "Open Cinder", true, None::<&str>)?;
-    let refresh = MenuItem::with_id(app, "refresh", "Rescan now", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "Quit Cinder", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &refresh, &quit])?;
-
-    let mut builder = TrayIconBuilder::with_id("cinder-tray")
-        .tooltip(tray_tooltip(&[]))
-        .menu(&menu)
-        .show_menu_on_left_click(false)
-        .on_menu_event(|app, event| match event.id.as_ref() {
-            "show" => show_window(app),
-            "refresh" => {
-                let app = app.clone();
-                std::thread::spawn(move || {
-                    let stats = scan(&|_| {});
-                    let _ = app.emit("stats-updated", &stats);
-                });
-            }
-            "quit" => app.exit(0),
-            _ => {}
-        })
-        .on_tray_icon_event(|tray, event| {
-            // A left click brings the window back; the menu is for the right
-            // button, so it stays out of the way.
-            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
-                show_window(tray.app_handle());
-            }
-        });
-    if let Some(icon) = app.default_window_icon() {
-        builder = builder.icon(icon.clone());
-    }
-    let tray = builder.build(app)?;
-    let mut guard = TRAY.lock().unwrap_or_else(|e| e.into_inner());
-    *guard = Some(tray);
-    Ok(())
-}
-
-/// Bring the dashboard back to the front.
-fn show_window(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
-    }
+    *flag = false;
 }
 
 /// Ask the providers for their quota windows, over and over.
@@ -2558,6 +2552,10 @@ fn show_window(app: &AppHandle) {
 fn spawn_quota_refresher(app: AppHandle) {
     std::thread::spawn(move || {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        // The numbers from the last run are on disk, so a launch shows them
+        // while the first refresh is still in flight.
+        quota::restore_cache(&home);
+        tray::refresh();
         loop {
             let reports = match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt.block_on(quota::fetch_all(&home)),
@@ -2565,13 +2563,14 @@ fn spawn_quota_refresher(app: AppHandle) {
             };
             if !reports.is_empty() {
                 quota::publish(reports);
-                update_tray_tooltip();
+                quota::save_cache(&home, &quota::snapshot().0);
+                tray::refresh();
                 // The window shows the limits too, so it gets the new numbers.
                 let stats = scan(&|_| {});
                 announce(&app, &stats.alerts);
                 let _ = app.emit("stats-updated", &stats);
             }
-            std::thread::sleep(quota::REFRESH_INTERVAL);
+            wait_for_quota_tick();
         }
     });
 }
@@ -2602,9 +2601,15 @@ pub fn run() {
         .setup(|app| {
             spawn_log_watcher(app.handle().clone());
             spawn_quota_refresher(app.handle().clone());
-            if let Err(e) = build_tray(app.handle()) {
+            if let Err(e) = tray::build(app.handle()) {
                 // A missing tray is not a reason to refuse to start.
                 eprintln!("system tray unavailable: {e}");
+            }
+            tray::open_on_start(app.handle());
+            // The popover hides itself when it loses the focus, the way a
+            // menu does.
+            if let Some(window) = app.get_webview_window(tray::POPOVER) {
+                tray::watch_popover(&window);
             }
             Ok(())
         })
@@ -2615,7 +2620,9 @@ pub fn run() {
             download_and_install_update,
             get_app_version,
             get_plans,
-            set_plans
+            set_plans,
+            get_tray_summary,
+            tray_action
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

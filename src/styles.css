@@ -108,6 +108,7 @@ h3 { font-size: 13px; font-weight: 600; margin: 26px 0 12px; }
 .badge-local { color: var(--good); background: rgba(86, 211, 100, 0.12); }
 .badge-sub { color: var(--dim); background: rgba(163, 163, 173, 0.12); }
 .badge-live { color: var(--accent); background: rgba(107, 138, 253, 0.12); }
+.badge-stale { color: var(--warn); background: rgba(210, 153, 34, 0.12); }
 .bd-row .bd-name .badge { margin-left: 5px; }
 .bd-row .bd-cost .badge { margin-left: 5px; }
 .big-row .badge { margin-left: 0; }

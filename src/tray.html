@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cinder — Subscriptions</title>
+  <link rel="stylesheet" href="tray.css" />
+</head>
+<body>
+  <div class="card">
+    <header>
+      <div class="brand">
+        <span class="name">Cinder</span>
+        <span class="sub">subscriptions</span>
+      </div>
+      <div class="head-right">
+        <span class="fresh" id="fresh"></span>
+        <button id="refresh" class="icon" title="Ask the providers again">&#8635;</button>
+      </div>
+    </header>
+
+    <div class="body" id="body">
+      <div class="empty">Reading the providers…</div>
+    </div>
+
+    <div class="today" id="today"></div>
+
+    <footer>
+      <button id="openBtn" class="btn primary">Open dashboard</button>
+      <button id="rescanBtn" class="btn">Rescan logs</button>
+      <button id="quitBtn" class="btn ghost">Quit</button>
+    </footer>
+  </div>
+  <script src="tray.js"></script>
+</body>
+</html>

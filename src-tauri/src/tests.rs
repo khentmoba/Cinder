@@ -523,21 +523,16 @@ fn a_scan_reports_the_alerts_the_current_numbers_justify() {
     let now = now_secs();
     // A window that is 40% used with a fifth of its time gone: on pace for
     // 200%, so it will run out before it resets.
-    let reports = vec![quota::QuotaReport {
+    let reports = vec![quota::QuotaReport::ok("Claude Code", vec![quota::LiveQuota {
         agent: "Claude Code".into(),
-        windows: vec![quota::LiveQuota {
-            agent: "Claude Code".into(),
-            window: "5h".into(),
-            used_percent: 40.0,
-            window_minutes: 300,
-            resets_at: now + 300 * 60 * 4 / 5,
-            plan: "pro".into(),
-            detail: "5-hour session window".into(),
-            ..Default::default()
-        }],
-        error: String::new(),
-        skipped: false,
-    }];
+        window: "5h".into(),
+        used_percent: 40.0,
+        window_minutes: 300,
+        resets_at: now + 300 * 60 * 4 / 5,
+        plan: "pro".into(),
+        detail: "5-hour session window".into(),
+        ..Default::default()
+    }])];
     let stats = scan_home_with(&home.0, &|_| {}, reports, "2026-10-21T00:00:00Z".into());
     assert_eq!(stats.alerts.len(), 1);
     assert_eq!(stats.alerts[0].severity, alerts::Severity::Critical);

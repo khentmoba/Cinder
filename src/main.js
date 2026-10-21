@@ -1092,10 +1092,14 @@ function renderLimits() {
       : '';
 
     // a live window comes from the provider, so it carries its own badge and
-    // the provider's own description of the window.
-    const live = l.source === 'live';
-    const liveBadge = live
-      ? `<span class="badge badge-live" title="Read from the provider's live quota API">live</span>` : '';
+    // the provider's own description of the window. A stale one is the last
+    // number that came back, which is worth saying out loud.
+    const live = l.source === 'live' || l.source === 'stale';
+    const liveBadge = l.source === 'live'
+      ? `<span class="badge badge-live" title="Read from the provider's live quota API">live</span>`
+      : l.source === 'stale'
+        ? `<span class="badge badge-stale" title="The newest refresh did not come back. These are the last numbers that did.">stale</span>`
+        : '';
     const windowText = live ? (l.detail || `${l.window} window`) : `${l.window} window`;
     const taken = live && snapshot ? ` · updated ${snapshot}` : '';
 
