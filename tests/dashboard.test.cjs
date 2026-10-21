@@ -182,3 +182,77 @@ test('a 90-day chart buckets into weeks and the model filter narrows every panel
   assert.equal(rows.length, 1);
   assert.equal(rows[0].requests, 2);
 });
+
+test('agent and cache breakdown modes render metrics and support filtering', () => {
+  const { run, get } = dashboard();
+  run(`DATA.rows = [
+    {...blank(), day: '2026-01-01', agent: 'Pi', model: 'claude-3-7-sonnet', input: 1000, cache_read: 4000, cache_write: 500, output: 500, requests: 10, cost: 2.50, cost_known: true, savings: 5.20},
+    {...blank(), day: '2026-01-01', agent: 'Codex', model: 'gpt-4o', input: 2000, cache_read: 1000, cache_write: 0, output: 1000, requests: 5, cost: 1.50, cost_known: true, savings: 1.10}
+  ];
+  DATA.sessions = [{day: '2026-01-01', agent: 'Pi', sessions: 3}, {day: '2026-01-01', agent: 'Codex', sessions: 2}];
+  `);
+
+  // Test Agent breakdown mode
+  run("breakMode = 'agent'; renderBreakdown();");
+  let html = get('breakdown').innerHTML;
+  assert.match(html, /Pi/);
+  assert.match(html, /Codex/);
+  assert.match(html, /3 sess/);
+  assert.match(html, /Agent/);
+
+  // Test Cache breakdown mode
+  run("breakMode = 'cache'; renderBreakdown();");
+  html = get('breakdown').innerHTML;
+  assert.match(html, /claude-3-7-sonnet/);
+  assert.match(html, /gpt-4o/);
+  assert.match(html, /Saved/);
+  assert.match(html, /Hit % · Read/);
+  // Claude had 4000 read out of 5500 prompt tokens (4000/(1000+4000+500)) = 72.7%
+  assert.match(html, /72\.7% · 4\.0K/);
+  assert.match(html, /\$5\.20/);
+
+  // Cache mode data structure
+  const cacheData = run('breakdownData()');
+  assert.equal(cacheData.label, 'Model (Cache)');
+  assert.equal(cacheData.rows[0].key, 'claude-3-7-sonnet');
+  assert.equal(cacheData.rows[0].rawSavings, 5.20);
+});
+
+test('rate limits render Tokemon-style health badges, pace markers, and burn velocity', () => {
+  const { run, get } = dashboard();
+  const nowSec = Math.floor(Date.now() / 1000);
+  run(`DATA.limits = [
+    { agent: 'Codex', window: '5h', used_percent: 85, window_minutes: 300, resets_at: ${nowSec + 3600}, plan: 'Plus' },
+    { agent: 'Codex', window: 'weekly', used_percent: 15, window_minutes: 10080, resets_at: ${nowSec + 86400 * 5}, plan: 'Plus' }
+  ];
+  renderLimits();`);
+
+  const html = get('limitsView').innerHTML;
+  assert.match(html, /badge-pace/);
+  assert.match(html, /Exhaustion Risk|Cap Imminent/);
+  assert.match(html, /On Pace/);
+  assert.match(html, /pace-marker/);
+  assert.match(html, /⚡/);
+  assert.match(html, /exhaustion in/);
+});
+
+test('dashboard totals and stacked bar display prompt cache stats and percentages', () => {
+  const { run, get } = dashboard();
+  run(`DATA.rows = [
+    {...blank(), day: '2026-01-01', agent: 'Pi', model: 'claude-3-7-sonnet', input: 2000, cache_read: 8000, cache_write: 1000, output: 1000, cost: 4.0, cost_known: true, savings: 9.50}
+  ];
+  DATA.sessions = [{day: '2026-01-01', agent: 'Pi', sessions: 1}];
+  render();`);
+
+  const totalsHtml = get('totals').innerHTML;
+  assert.match(totalsHtml, /Cache hit rate/);
+  assert.match(totalsHtml, /72\.7%/);
+  assert.match(totalsHtml, /Cache savings/);
+  assert.match(totalsHtml, /\$9\.50/);
+  assert.match(totalsHtml, /Prompt cached/);
+  assert.match(totalsHtml, /8\.0K/);
+
+  const legendHtml = get('stackLegend').innerHTML;
+  assert.match(legendHtml, /Cache read/);
+  assert.match(legendHtml, /legend-pct/);
+});

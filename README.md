@@ -72,11 +72,8 @@ cache counts are kept as reported, without borrowing ratios from other agents.
   at once. The breadcrumb has one click per segment to undo it.
 - **Chart**: click a legend chip to hide an agent. Ranges over six weeks bucket
   into weeks, and the dashed line is the previous period of the same length.
-- **Breakdown**: rows are clickable filters; **Show all** lists every row and
-  **CSV** exports the visible table.
-- **Limits**: a *view* (`Usage | Limits`), not a metric. Each card shows how much
-  of the window is gone, when it resets, and — once the window is under way —
-  where the current burn rate lands by reset.
+- **Breakdown**: switch between **Model**, **Day**, **Agent**, and **Cache** views; rows are clickable filters, **Show all** lists every row, and **CSV** exports the tailored dataset.
+- **Limits**: a *view* (`Usage | Limits`), not a metric. Features burn-rate pacing (`⚡ %/hr`), visual quota health badges (`On Pace`, `Elevated`, `Exhaustion Risk`), linear pace markers on the progress track, and depletion ETA forecasts.
 - **Keys**: `1`–`4` cost / tokens / requests / limits, `R` refresh, `S` settings,
   `Esc` closes a modal. Window size and position are remembered between launches.
 
