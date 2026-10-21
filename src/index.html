@@ -43,9 +43,13 @@
 
   <main id="dash">
     <section class="hero">
-      <div id="bigTotal" class="big">—</div>
+      <div class="big-row">
+        <div id="bigTotal" class="big">—</div>
+        <span id="bigBadge" class="badge" hidden></span>
+      </div>
       <div id="bigSub" class="sub">&nbsp;</div>
       <div id="bigDelta" class="delta"></div>
+      <div id="bigSaved" class="saved" hidden></div>
     </section>
 
     <section class="left">
@@ -65,6 +69,7 @@
             <button data-v="model" class="on">Model</button>
             <button data-v="day">Day</button>
             <button data-v="agent">Agent</button>
+            <button data-v="project">Project</button>
             <button data-v="cache">Cache</button>
           </div>
           <button id="exportBtn" class="mini-btn" title="Export as CSV">CSV</button>
@@ -77,6 +82,11 @@
       <h3 id="chartTitle">Daily processed tokens</h3>
       <div id="chartLegend" class="chart-legend"></div>
       <div id="chart" class="chart"></div>
+    </section>
+
+    <section class="artifacts" id="artifacts" hidden>
+      <h3>Artifacts</h3>
+      <div id="artifactList" class="artifact-list"></div>
     </section>
   </main>
 

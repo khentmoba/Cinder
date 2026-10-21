@@ -1,4 +1,4 @@
-use crate::{LimitRow, Row};
+use crate::{Artifact, LimitRow, Row};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -20,6 +20,9 @@ pub struct CachedFile {
     pub plan_routes: Vec<(String, u64)>,
     pub limits: Vec<CachedLimit>,
     pub thread_id: Option<String>,
+    /// Artifacts the file published, kept so a cached file can hand them back.
+    #[serde(default)]
+    pub artifacts: Vec<Artifact>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -31,9 +34,19 @@ pub struct CachedDb {
     pub sessions: Vec<(String, String)>,
 }
 
+/// The version of the row format the cache holds.
+///
+/// A change to the shape or the meaning of a row bumps it, so a cache written
+/// by an older build is rebuilt instead of being replayed with values that no
+/// longer mean what they say.
+pub const FORMAT_VERSION: u32 = 2;
+
 #[derive(Serialize, Deserialize, Default)]
 pub struct ScanCache {
     pub pricing_fingerprint: u64,
+    /// The format version this cache was written with.
+    #[serde(default)]
+    pub format_version: u32,
     pub files: HashMap<String, CachedFile>,
     pub opencode_db: Option<CachedDb>,
     pub t3_state_db: Option<CachedDb>,
@@ -61,7 +74,7 @@ impl ScanCache {
         if let Ok(file) = fs::File::open(&p) {
             let reader = std::io::BufReader::with_capacity(128 * 1024, file);
             if let Ok(mut c) = serde_json::from_reader::<_, ScanCache>(reader) {
-                if c.pricing_fingerprint == pricing_fp {
+                if c.pricing_fingerprint == pricing_fp && c.format_version == FORMAT_VERSION {
                     c.cache_path = p;
                     c.dirty = false;
                     return c;
@@ -70,6 +83,7 @@ impl ScanCache {
         }
         ScanCache {
             pricing_fingerprint: pricing_fp,
+            format_version: FORMAT_VERSION,
             cache_path: p,
             dirty: true,
             ..Default::default()

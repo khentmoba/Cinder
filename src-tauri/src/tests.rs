@@ -372,7 +372,192 @@ fn empty_home_is_a_valid_scan() {
     assert!(stats.rows.is_empty());
     assert!(stats.sessions.is_empty());
     assert!(stats.limits.is_empty());
-    assert_eq!(stats.sources.len(), 7);
+    assert_eq!(stats.sources.len(), 13);
     assert!(stats.sources.iter().all(|s| !s.found));
     assert!(stats.pricing.embedded > 0);
+    // Every source is named and located, so the panel can list them all.
+    assert!(stats.sources.iter().all(|s| !s.agent.is_empty() && !s.path.is_empty()));
+    let mut names: Vec<&str> = stats.sources.iter().map(|s| s.agent.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), stats.sources.len());
+}
+
+#[test]
+fn the_billing_mode_comes_from_the_agent_credential_files() {
+    let home = Home::new();
+    // Nothing signed in: the mode is unknown rather than a guess.
+    assert_eq!(claude_route(&home.0), Route::Unknown);
+    assert_eq!(codex_route(&home.0), Route::Unknown);
+
+    // A Claude subscription.
+    home.write(
+        ".claude/.credentials.json",
+        r#"{"claudeAiOauth":{"accessToken":"x","subscriptionType":"pro"}}"#,
+    );
+    assert_eq!(claude_route(&home.0), Route::Plan);
+
+    // A ChatGPT plan for Codex.
+    home.write(
+        ".codex/auth.json",
+        r#"{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{"access_token":"x"}}"#,
+    );
+    assert_eq!(codex_route(&home.0), Route::Plan);
+
+    // An API key bills per token.
+    home.write(".codex/auth.json", r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-x"}"#);
+    assert_eq!(codex_route(&home.0), Route::Api);
+}
+
+#[test]
+fn a_reported_cost_says_how_a_row_is_billed() {
+    // A real charge is per token.
+    assert_eq!(billing_of(Some(1.5), true, false), Billing::Api);
+    // A reported zero with no public price means the route is on a plan.
+    assert_eq!(billing_of(Some(0.0), false, false), Billing::Subscription);
+    // Our own estimate of an API-billed run.
+    assert_eq!(billing_of(None, true, false), Billing::Api);
+    // Nothing to go on.
+    assert_eq!(billing_of(None, false, false), Billing::Unknown);
+    // A local model costs nobody anything.
+    assert_eq!(billing_of(None, false, true), Billing::Local);
+}
+
+#[test]
+fn a_claude_subagent_run_is_tagged_and_counted_once() {
+    let home = Home::new();
+    let usage = json!({
+        "type": "assistant", "cwd": "C:/repo", "timestamp": "2026-01-01T00:00:00Z",
+        "message": {"role": "assistant", "model": "claude-haiku-4-5",
+            "usage": {"input_tokens": 10, "output_tokens": 5}}
+    });
+    // The parent session.
+    home.lines(".claude/projects/-C--repo/parent.jsonl", std::slice::from_ref(&usage));
+    // The delegated child run, in its own file.
+    home.lines(
+        ".claude/projects/-C--repo/parent/subagents/agent-1.jsonl",
+        &[json!({"type": "user", "isSidechain": true, "timestamp": "2026-01-01T00:01:00Z"}), usage],
+    );
+
+    let stats = scan_home(&home.0, &|_| {});
+    let rows: Vec<&Row> = stats.rows.iter().filter(|r| r.agent == "Claude Code").collect();
+    // Both runs are counted, and only the child is marked as delegated.
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.iter().filter(|r| r.subagent).count(), 1);
+    assert_eq!(rows.iter().map(|r| r.requests).sum::<u64>(), 2);
+    // Both belong to the same project.
+    assert!(rows.iter().all(|r| r.project == "repo"));
+}
+
+#[test]
+fn a_1h_cache_write_is_priced_at_its_own_rate() {
+    let home = Home::new();
+    home.lines(".claude/projects/-C--repo/s.jsonl", &[json!({
+        "type": "assistant", "cwd": "C:/repo", "timestamp": "2026-01-01T00:00:00Z",
+        "message": {"role": "assistant", "model": "claude-sonnet-4-5",
+            "usage": {"input_tokens": 0, "output_tokens": 0,
+                "cache_creation_input_tokens": 1000,
+                "cache_creation": {"ephemeral_1h_input_tokens": 1000},
+                "cache_read_input_tokens": 0}}
+    })]);
+
+    let stats = scan_home(&home.0, &|_| {});
+    let r = stats.rows.iter().find(|r| r.agent == "Claude Code").unwrap();
+    assert_eq!(r.cache_write, 1000);
+    assert_eq!(r.cache_write_1h, 1000);
+    assert!(r.cost_known);
+    // The 1-hour write costs twice the 5-minute rate, and the 5-minute rate
+    // is 1.25x the base input price when the catalog has no cache-write
+    // price of its own.
+    let expected = 1000.0 * (3.0 * 1.25 * 2.0) / 1e6;
+    assert!((r.cost - expected).abs() < 1e-9, "cost {} expected {expected}", r.cost);
+}
+
+#[test]
+fn a_published_artifact_is_collected_once() {
+    let home = Home::new();
+    let turn = json!({
+        "type": "assistant", "cwd": "C:/repo", "timestamp": "2026-01-01T00:00:00Z",
+        "message": {"role": "assistant", "model": "claude-sonnet-4-5",
+            "content": [{"type": "tool_use", "name": "Artifact",
+                "input": {"id": "abc123", "title": "A chart"}}],
+            "usage": {"input_tokens": 10, "output_tokens": 5}}
+    });
+    home.lines(".claude/projects/-C--repo/s.jsonl", &[turn.clone(), turn]);
+
+    let stats = scan_home(&home.0, &|_| {});
+    assert_eq!(stats.artifacts.len(), 1);
+    assert_eq!(stats.artifacts[0].url, "https://claude.ai/code/artifact/abc123");
+    assert_eq!(stats.artifacts[0].title, "A chart");
+    assert_eq!(stats.artifacts[0].day, "2026-01-01");
+}
+
+#[test]
+fn a_worktree_rolls_up_into_its_repository() {
+    let home = Home::new();
+    let repo = home.0.join("mainrepo");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    let worktree = home.0.join("worktrees").join("mainrepo").join("feature");
+    fs::create_dir_all(&worktree).unwrap();
+    fs::write(
+        worktree.join(".git"),
+        format!("gitdir: {}\n", repo.join(".git").join("worktrees").join("feature").to_string_lossy()),
+    )
+    .unwrap();
+    let cwd = worktree.to_string_lossy().to_string();
+    home.lines(".pi/agent/sessions/s.jsonl", &[
+        json!({"type": "session", "timestamp": "2026-01-01T00:00:00Z", "cwd": cwd}),
+        json!({"type": "message", "timestamp": "2026-01-01T00:01:00Z", "message": {
+            "role": "assistant", "model": "gpt-5", "usage": {"input": 10, "output": 5}
+        }})
+    ]);
+
+    let stats = scan_home(&home.0, &|_| {});
+    let r = stats.rows.iter().find(|r| r.agent == "Pi").unwrap();
+    assert_eq!(r.project, "mainrepo");
+}
+
+/// A scan of the machine this test runs on, for a human to eyeball.
+///
+/// Ignored by default because it reads gigabytes of real logs:
+/// `cargo test --bin cinder -- --ignored --nocapture real_home_scan`.
+#[test]
+#[ignore]
+fn real_home_scan() {
+    let home = dirs::home_dir().unwrap();
+    let started = std::time::Instant::now();
+    let stats = scan_home(&home, &|_| {});
+    println!("scan took {:?}", started.elapsed());
+    for s in &stats.sources {
+        println!("  {:<18} {:>6} files  {:>7} ms  {}", s.agent, s.files, s.scan_ms, s.path);
+    }
+    let mut projects: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut billing: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut subagents = 0u64;
+    for r in &stats.rows {
+        *projects.entry(r.project.clone()).or_default() += r.requests;
+        *billing.entry(format!("{:?}", r.billing)).or_default() += r.requests;
+        if r.subagent {
+            subagents += 1;
+        }
+    }
+    println!("projects: {projects:?}");
+    println!("billing: {billing:?}");
+    println!("subagent rows: {subagents}");
+    println!("limits: {:?}", stats.limits);
+    println!("rows: {}", stats.rows.len());
+    // How a git worktree resolves.
+    for cwd in [
+        r"C:\Users\Admin\.t3\worktrees\Cinder\t3-1e48cab7",
+        r"C:\APPLICATIONS\Cinder",
+        r"C:\Users\Admin\.t3\scratch\2026-10-03-can-you-check-and-see-447f1a0f",
+    ] {
+        println!("  {cwd} -> {:?}", project::canonical_repo(std::path::Path::new(cwd)));
+    }
+    for r in stats.rows.iter().filter(|r| r.project.starts_with("t3-")).take(6) {
+        println!("  row agent={} model={} project={}", r.agent, r.model, r.project);
+    }
+    for r in stats.rows.iter().filter(|r| r.subagent).take(8) {
+        println!("  subagent row agent={} model={} project={}", r.agent, r.model, r.project);
+    }
 }
