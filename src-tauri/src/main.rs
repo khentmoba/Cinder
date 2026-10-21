@@ -4,18 +4,169 @@
 // and emits per-day, per-agent, per-model rows. The UI aggregates by time range.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agents;
+mod alerts;
+mod budget;
 mod cache;
+mod prefilter;
 mod pricing;
+mod project;
+mod quota;
 mod updater;
 
+use alerts::Alert;
+use budget::{Plan, PlanStatus};
 use cache::{file_stamp, CachedDb, CachedFile, CachedLimit, ScanCache};
+use prefilter::Prefilter;
 use pricing::Pricing;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
+
+/// How the money behind a row is actually paid for.
+///
+/// Cinder prices every token against public list prices, so the dollar figure on
+/// screen is an *equivalent* value, never an invoice. A flat-rate plan shows up
+/// as a subscription even though the card is not charged per token, and a local
+/// model costs nothing at all.
+#[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Billing {
+    /// No route information was available, so the mode is unknown.
+    #[default]
+    Unknown,
+    /// Covered by a flat-rate plan (Claude Pro/Max, ChatGPT, Copilot, ...).
+    Subscription,
+    /// Billed per token through a provider API key.
+    Api,
+    /// Local inference: no provider bill at all.
+    Local,
+}
+
+impl Billing {
+    /// The short badge the UI puts next to a cost figure.
+    pub fn label(self) -> &'static str {
+        match self {
+            Billing::Unknown => "",
+            Billing::Subscription => "Plan",
+            Billing::Api => "API",
+            Billing::Local => "Local",
+        }
+    }
+}
+
+/// How an agent's own route is paid for.
+///
+/// Claude Code and Codex both record in their credential file whether they run
+/// on a flat-rate plan (Claude Pro/Max, ChatGPT) or on an API key, so the
+/// answer is read from the machine rather than guessed from the agent name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Route {
+    /// A flat-rate plan covers the usage.
+    Plan,
+    /// Billed per token through an API key.
+    Api,
+    /// The machine holds no credential that says either way.
+    Unknown,
+}
+
+impl Route {
+    pub fn billing(self) -> Billing {
+        match self {
+            Route::Plan => Billing::Subscription,
+            Route::Api => Billing::Api,
+            Route::Unknown => Billing::Unknown,
+        }
+    }
+}
+
+/// Read a small JSON file, if it is there and it parses.
+fn read_json_file(path: &Path) -> Option<serde_json::Value> {
+    let text = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// How Claude Code is signed in on this machine.
+fn claude_route(home: &Path) -> Route {
+    // An API key in the environment bills every run per token.
+    if std::env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty())
+    {
+        return Route::Api;
+    }
+    // Claude Code keeps a key in its settings when one is configured.
+    for settings in [
+        home.join(".claude").join("settings.json"),
+        home.join(".claude").join("settings.local.json"),
+    ] {
+        if let Some(v) = read_json_file(&settings) {
+            let key = v
+                .get("env")
+                .and_then(|e| e.get("ANTHROPIC_API_KEY"))
+                .and_then(|x| x.as_str());
+            if key.is_some_and(|k| !k.trim().is_empty()) {
+                return Route::Api;
+            }
+        }
+    }
+    let Some(v) = read_json_file(&home.join(".claude").join(".credentials.json")) else {
+        return Route::Unknown;
+    };
+    if v.get("claudeAiOauth").is_some() {
+        return Route::Plan;
+    }
+    if v.get("apiKey").and_then(|x| x.as_str()).is_some_and(|k| !k.trim().is_empty()) {
+        return Route::Api;
+    }
+    Route::Unknown
+}
+
+/// How Codex is signed in on this machine.
+fn codex_route(home: &Path) -> Route {
+    let mut candidates = vec![home.join(".codex").join("auth.json")];
+    if let Ok(dir) = std::env::var("CODEX_HOME") {
+        if !dir.trim().is_empty() {
+            candidates.push(PathBuf::from(dir).join("auth.json"));
+        }
+    }
+    for path in candidates {
+        let Some(v) = read_json_file(&path) else { continue };
+        match v.get("auth_mode").and_then(|x| x.as_str()) {
+            Some("chatgpt") => return Route::Plan,
+            Some(m) if m.contains("apikey") || m.contains("api_key") => return Route::Api,
+            _ => {}
+        }
+        if v
+            .get("OPENAI_API_KEY")
+            .and_then(|x| x.as_str())
+            .is_some_and(|k| !k.trim().is_empty())
+        {
+            return Route::Api;
+        }
+    }
+    Route::Unknown
+}
+
+/// The billing mode of a row, from the evidence the log carries.
+///
+/// A reported cost above zero is a real charge. A reported zero with no public
+/// price means the route is covered by a plan. A missing report with a public
+/// price is our own estimate of an API-billed run.
+pub fn billing_of(reported: Option<f64>, priced: bool, local: bool) -> Billing {
+    if local {
+        return Billing::Local;
+    }
+    match reported {
+        Some(c) if c > 0.0 => Billing::Api,
+        Some(_) if !priced => Billing::Subscription,
+        Some(_) => Billing::Api,
+        None if priced => Billing::Api,
+        None => Billing::Unknown,
+    }
+}
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 pub struct Row {
@@ -26,6 +177,10 @@ pub struct Row {
     pub input: u64,
     pub cache_read: u64,
     pub cache_write: u64,
+    /// The subset of `cache_write` billed at the 1-hour ephemeral cache rate
+    /// (2x the base input price). Kept apart so the 5-minute and 1-hour
+    /// write prices can both be applied.
+    pub cache_write_1h: u64,
     pub output: u64,
     pub reasoning: u64,
     pub tools: u64,
@@ -33,6 +188,18 @@ pub struct Row {
     pub cost_known: bool,
     pub cost_partial: bool,
     pub savings: f64,
+    /// Canonical repository (or project) the run happened in. Git worktrees
+    /// roll up into their main checkout, so every branch of a repo is one row
+    /// group instead of a separate one.
+    pub project: String,
+    /// How this row is billed. See `Billing`.
+    pub billing: Billing,
+    /// True when the usage came from a delegated subagent run rather than
+    /// from the parent session.
+    pub subagent: bool,
+    /// For local models: what the same tokens would have cost on a cloud
+    /// provider, i.e. the money running locally saved.
+    pub cloud_savings: f64,
 }
 
 impl Row {
@@ -56,6 +223,20 @@ pub struct LimitRow {
     pub window_minutes: i64,
     pub resets_at: i64,
     pub plan: String,
+    /// "log" when the window was read out of a session file, "live" when it was
+    /// fetched from the provider.
+    #[serde(default)]
+    pub source: String,
+    /// Human description of the window, e.g. "5-hour session window".
+    #[serde(default)]
+    pub detail: String,
+    /// How much of the allowance is gone, in dollars, when the provider counts
+    /// its allowance in money.
+    #[serde(default)]
+    pub used_amount: f64,
+    /// The size of that allowance, in dollars.
+    #[serde(default)]
+    pub limit_amount: f64,
 }
 
 #[derive(Serialize)]
@@ -64,6 +245,18 @@ struct Source {
     path: String,
     found: bool,
     files: u64,
+    /// How long this source took to scan, in milliseconds.
+    scan_ms: u64,
+}
+
+/// A usage row produced by one agent, for one model, on one day, in one
+/// project. The same model used in two repositories is two rows.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Artifact {
+    pub agent: String,
+    pub url: String,
+    pub day: String,
+    pub title: String,
 }
 
 #[derive(Serialize)]
@@ -76,6 +269,17 @@ struct Stats {
     unpriced: Vec<String>,
     /// providers covered by a subscription/plan instead of per-token billing
     plan_routes: Vec<String>,
+    /// Live quota windows fetched from the providers, merged into `limits`.
+    /// `limits[].source` says which ones came from the network.
+    quota_error: String,
+    /// When the live quotas were last refreshed (ISO-8601, UTC).
+    quota_checked_at: String,
+    /// Artifacts the agents published during the scanned period.
+    artifacts: Vec<Artifact>,
+    /// The things worth interrupting the user about.
+    alerts: Vec<Alert>,
+    /// How each declared plan looks against the usage it covered.
+    plans: Vec<PlanStatus>,
 }
 
 #[derive(Serialize)]
@@ -85,26 +289,40 @@ struct PricingInfo {
     local: usize,
 }
 
-type Rows = HashMap<(String, String, String), Row>;
-type Sess = HashMap<(String, String), u64>;
+/// (day, agent, model, project, delegated)
+pub type Rows = HashMap<(String, String, String, String, bool), Row>;
+pub type Sess = HashMap<(String, String), u64>;
 
 /// Provider prefix of a model string ("opencode-go/deepseek-v4-flash" -> "opencode-go").
-fn model_provider(model: &str) -> Option<&str> {
+pub(crate) fn model_provider(model: &str) -> Option<&str> {
     model.split_once('/').map(|(p, _)| p).filter(|p| !p.is_empty() && !p.contains(' '))
 }
 
-fn add(rows: &mut Rows, sess: &mut Sess, agent: &str, model: &str, day: &str, r: Row) {
-    let key = (day.to_string(), agent.to_string(), model.to_string());
+pub fn add(rows: &mut Rows, sess: &mut Sess, agent: &str, model: &str, day: &str, r: Row) {
+    // The project and the delegated flag are part of the key: the same model
+    // used in two repositories is two different rows, and a delegated run is
+    // counted apart from the session that spawned it.
+    let key = (
+        day.to_string(),
+        agent.to_string(),
+        model.to_string(),
+        r.project.clone(),
+        r.subagent,
+    );
     let e = rows.entry(key).or_insert_with(|| Row {
         day: day.to_string(),
         agent: agent.to_string(),
         model: model.to_string(),
+        project: r.project.clone(),
+        billing: r.billing,
+        subagent: r.subagent,
         ..Default::default()
     });
     e.requests += r.requests;
     e.input += r.input;
     e.cache_read += r.cache_read;
     e.cache_write += r.cache_write;
+    e.cache_write_1h += r.cache_write_1h;
     e.output += r.output;
     e.reasoning += r.reasoning;
     e.tools += r.tools;
@@ -112,14 +330,21 @@ fn add(rows: &mut Rows, sess: &mut Sess, agent: &str, model: &str, day: &str, r:
     e.cost_known = e.cost_known || r.cost_known;
     e.cost_partial |= r.cost_partial || (!r.cost_known && r.tokens() > 0);
     e.savings += r.savings;
+    e.cloud_savings += r.cloud_savings;
+    // A route that turned out to be billed per token wins over a guess made
+    // before the route was known.
+    if e.billing == Billing::Unknown {
+        e.billing = r.billing;
+    }
+    e.subagent |= r.subagent;
     let _ = sess;
 }
 
-fn session(sess: &mut Sess, agent: &str, day: &str) {
+pub fn session(sess: &mut Sess, agent: &str, day: &str) {
     *sess.entry((day.to_string(), agent.to_string())).or_insert(0) += 1;
 }
 
-fn day_of(ts: &str) -> String {
+pub(crate) fn day_of(ts: &str) -> String {
     ts.chars().take(10).filter(|c| *c != '\u{0}').collect()
 }
 
@@ -173,33 +398,39 @@ fn each_line(path: &Path, mut f: impl FnMut(&str)) {
     }
 }
 
-/// True when a line carries at least one of `keys`. A JSONL line that carries none
-/// of them cannot change the collected stats, so it is never handed to serde_json.
-/// The logs are ~1.6 GB across ~1000 files; skipping half of the lines halves the
-/// parse work, which is what a cold start (empty page cache) spends its time on.
-fn has_key(line: &str, keys: &[&str]) -> bool {
-    keys.iter().any(|k| line.contains(k))
-}
-
 /// Every line that can contribute a Pi row: the session header (day marker) or an
 /// assistant message carrying a usage block.
-const PI_KEYS: &[&str] = &["usage", "session"];
+static PI_KEYS: std::sync::LazyLock<Prefilter> =
+    std::sync::LazyLock::new(|| Prefilter::new(&["usage", "session"]));
 /// Every line that can contribute a Codex row: the header/context lines, tool calls
 /// and token-count events. Response items and turn events are ignored.
-const CODEX_KEYS: &[&str] = &[
-    "session_meta",
-    "turn_context",
-    "response_item",
-    "event_msg",
-    "function_call",
-    "custom_tool_call",
-    "token_count",
-];
+static CODEX_KEYS: std::sync::LazyLock<Prefilter> = std::sync::LazyLock::new(|| {
+    Prefilter::new(&[
+        "session_meta",
+        "turn_context",
+        "response_item",
+        "event_msg",
+        "function_call",
+        "custom_tool_call",
+        "token_count",
+    ])
+});
 /// Claude assistant messages carrying usage blocks. Without this prefilter every
 /// line of every project jsonl goes through serde_json for nothing.
-const CLAUDE_KEYS: &[&str] = &["assistant", "usage"];
+static CLAUDE_KEYS: std::sync::LazyLock<Prefilter> =
+    std::sync::LazyLock::new(|| Prefilter::new(&["assistant", "usage"]));
 /// Planner responses, plus the lines that switch the model.
-const AGY_KEYS: &[&str] = &["PLANNER_RESPONSE", "Model Selection"];
+static AGY_KEYS: std::sync::LazyLock<Prefilter> =
+    std::sync::LazyLock::new(|| Prefilter::new(&["PLANNER_RESPONSE", "Model Selection"]));
+
+/// True when a line carries at least one of the markers. A JSONL line that carries
+/// none of them cannot change the collected stats, so it is never handed to
+/// serde_json. The logs are ~1.6 GB across ~1000 files; skipping half of the lines
+/// halves the parse work, which is what a cold start (empty page cache) spends its
+/// time on. The screen itself is FFF's SIMD substring search.
+fn has_key(line: &str, keys: &std::sync::LazyLock<Prefilter>) -> bool {
+    keys.matches(line)
+}
 
 // ---------------- Pi ----------------
 fn parse_single_pi(
@@ -210,14 +441,22 @@ fn parse_single_pi(
     plan_routes: &mut HashMap<String, u64>,
 ) {
     let mut day = String::new();
+    let mut project = String::new();
     each_line(file, |line| {
-        if !has_key(line, PI_KEYS) {
+        if !has_key(line, &PI_KEYS) {
             return;
         }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return };
         let ts = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
-        if v.get("type").and_then(|t| t.as_str()) == Some("session") && day.is_empty() {
-            day = day_of(ts);
+        if v.get("type").and_then(|t| t.as_str()) == Some("session") {
+            if day.is_empty() {
+                day = day_of(ts);
+            }
+            // The session header names the working directory, which is what
+            // ties the run to a repository.
+            if project.is_empty() {
+                project = project::label_for_cwd(v.get("cwd").and_then(|c| c.as_str()));
+            }
         }
         if v.get("type").and_then(|t| t.as_str()) != Some("message") {
             return;
@@ -256,6 +495,7 @@ fn parse_single_pi(
             output,
             reasoning,
             tools,
+            project: project.clone(),
             ..Default::default()
         };
         // pi accounts for its own routes. A reported zero is meaningful: it means the
@@ -263,6 +503,7 @@ fn parse_single_pi(
         // so it must not be re-priced with a same-named model from another provider.
         let reported = u.get("cost").and_then(|c| c.get("total")).and_then(|x| x.as_f64());
         let priced = pricing.lookup(provider.as_deref(), &model);
+        r.billing = billing_of(reported, priced.is_some(), false);
         match reported {
             Some(c) if c > 0.0 => {
                 r.cost = c;
@@ -386,6 +627,7 @@ fn parse_pi(
 fn parse_single_codex(
     file: &Path,
     pricing: &Pricing,
+    route: Route,
     rows: &mut Rows,
     sess: &mut Sess,
     limits_out: &mut Vec<CachedLimit>,
@@ -393,9 +635,14 @@ fn parse_single_codex(
     let mut model = String::from("unknown");
     let mut day = String::new();
     let mut plan = String::new();
+    let mut project = String::new();
     let mut file_latest: HashMap<String, (String, LimitRow)> = HashMap::new();
+    // A forked rollout replays the parent's earlier turns, so the same
+    // (timestamp, usage) pair can appear twice. Keeping the pairs that were
+    // already seen counts the fork's own work only once.
+    let mut seen_usage: HashSet<(String, u64, u64, u64)> = HashSet::new();
     each_line(file, |line| {
-        if !has_key(line, CODEX_KEYS) {
+        if !has_key(line, &CODEX_KEYS) {
             return;
         }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return };
@@ -404,6 +651,9 @@ fn parse_single_codex(
         let ts = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
         if day.is_empty() && ty == "session_meta" {
             day = day_of(ts);
+        }
+        if project.is_empty() && ty == "session_meta" {
+            project = project::label_for_cwd(p.get("cwd").and_then(|c| c.as_str()));
         }
         match ty {
             "turn_context" => {
@@ -419,6 +669,8 @@ fn parse_single_codex(
                         agent: "Codex".into(),
                         model: model.clone(),
                         tools: 1,
+                        project: project.clone(),
+                        billing: route.billing(),
                         ..Default::default()
                     };
                     if r.day.is_empty() { r.day = day.clone(); }
@@ -444,6 +696,13 @@ fn parse_single_codex(
                                         window_minutes: w.get("window_minutes").and_then(|x| x.as_i64()).unwrap_or(0),
                                         resets_at: w.get("resets_at").and_then(|x| x.as_i64()).unwrap_or(0),
                                         plan: plan.clone(),
+                                        source: "log".into(),
+                                        detail: if key == "primary" {
+                                            "5-hour session window".into()
+                                        } else {
+                                            "7-day window".into()
+                                        },
+                                        ..Default::default()
                                     }));
                                 }
                             }
@@ -459,6 +718,12 @@ fn parse_single_codex(
                 if input + output == 0 {
                     return;
                 }
+                // A forked rollout replays the parent's earlier turns, so the
+                // same usage can show up twice. A pair that was already counted
+                // in this file is the parent's, not the fork's own work.
+                if !seen_usage.insert((ts.to_string(), input, output, cached)) {
+                    return;
+                }
                 let uncached = input.saturating_sub(cached);
                 let mut r = Row {
                     day: day_of(ts),
@@ -470,6 +735,8 @@ fn parse_single_codex(
                     cache_write: 0,
                     output,
                     reasoning,
+                    project: project.clone(),
+                    billing: route.billing(),
                     ..Default::default()
                 };
                 if let Some(pr) = pricing.lookup(model_provider(&model), &model) {
@@ -500,6 +767,7 @@ fn parse_codex(
     limits: &mut Vec<LimitRow>,
 ) -> u64 {
     let mut latest: HashMap<String, (String, LimitRow)> = HashMap::new();
+    let route = codex_route(home);
     let mut files = list_files(&home.join(".codex").join("sessions"), "jsonl", None);
     files.extend(list_files(&home.join(".codex").join("archived_sessions"), "jsonl", None));
     if files.is_empty() {
@@ -542,7 +810,7 @@ fn parse_codex(
                         let mut file_rows = Rows::new();
                         let mut file_sess = Sess::new();
                         let mut file_limits = Vec::new();
-                        parse_single_codex(file, pricing_ref, &mut file_rows, &mut file_sess, &mut file_limits);
+                        parse_single_codex(file, pricing_ref, route, &mut file_rows, &mut file_sess, &mut file_limits);
                         let cached = CachedFile {
                             mtime_ns: *mtime_ns,
                             size: *size,
@@ -581,21 +849,58 @@ fn parse_codex(
 }
 
 // ---------------- Claude Code ----------------
+// A Claude Code session lives in <project>/<session-id>.jsonl, and a delegated
+// child run lives in <project>/<session-id>/subagents/agent-*.jsonl. The child's
+// own transcript is the only place its usage appears, so counting every file
+// once counts each run exactly once.
+fn claude_subagent_file(file: &Path) -> bool {
+    file.components()
+        .any(|c| c.as_os_str().to_string_lossy().eq_ignore_ascii_case("subagents"))
+}
+
+/// The URL of a published artifact, when a tool call carries one.
+fn artifact_url(input: &serde_json::Value) -> Option<String> {
+    if let Some(url) = input.get("url").and_then(|x| x.as_str()) {
+        if url.contains("claude.ai/code/artifact/") {
+            return Some(url.to_string());
+        }
+    }
+    // The Artifact tool publishes under the id it was given.
+    if let Some(id) = input.get("id").and_then(|x| x.as_str()) {
+        if !id.is_empty() {
+            return Some(format!("https://claude.ai/code/artifact/{}", id));
+        }
+    }
+    None
+}
+
 fn parse_single_claude(
     file: &Path,
     pricing: &Pricing,
+    route: Route,
     rows: &mut Rows,
     sess: &mut Sess,
+    artifacts: &mut Vec<Artifact>,
 ) {
     let mut day = String::new();
+    let mut project = String::new();
+    // A file under a subagents/ directory is a delegated child run. The
+    // transcript also flags the chain with isSidechain.
+    let mut subagent = claude_subagent_file(file);
     each_line(file, |line| {
-        if !has_key(line, CLAUDE_KEYS) {
+        if !has_key(line, &CLAUDE_KEYS) {
             return;
         }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return };
         let ts = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
         if day.is_empty() && !day_of(ts).is_empty() {
             day = day_of(ts);
+        }
+        if project.is_empty() {
+            project = project::label_for_cwd(v.get("cwd").and_then(|c| c.as_str()));
+        }
+        if v.get("isSidechain").and_then(|x| x.as_bool()) == Some(true) {
+            subagent = true;
         }
         if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
             return;
@@ -606,6 +911,19 @@ fn parse_single_claude(
         let output = u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
         let cache_read = u.get("cache_read_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
         let cache_write = u.get("cache_creation_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+        // A 1-hour cache write is billed at twice the 5-minute rate, so the two
+        // have to be kept apart to price them correctly.
+        let cache_write_1h = u
+            .get("cache_creation")
+            .and_then(|c| c.get("ephemeral_1h_input_tokens"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0)
+            .min(cache_write);
+        let reasoning = u
+            .get("output_tokens_details")
+            .and_then(|d| d.get("thinking_tokens"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
         if input + output + cache_read + cache_write == 0 {
             return;
         }
@@ -614,6 +932,21 @@ fn parse_single_claude(
             for item in content {
                 if item.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                     tools += 1;
+                    if item.get("name").and_then(|n| n.as_str()) == Some("Artifact") {
+                        if let Some(url) = item.get("input").and_then(artifact_url) {
+                            artifacts.push(Artifact {
+                                agent: "Claude Code".into(),
+                                url,
+                                day: day_of(ts),
+                                title: item
+                                    .get("input")
+                                    .and_then(|i| i.get("title"))
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -626,15 +959,19 @@ fn parse_single_claude(
             input,
             cache_read,
             cache_write,
+            cache_write_1h,
             output,
-            reasoning: 0,
+            reasoning,
             tools,
+            project: project.clone(),
+            subagent,
+            billing: route.billing(),
             ..Default::default()
         };
         if let Some(pr) = pricing.lookup(model_provider(&model), &model) {
-            r.cost = pr.cost(input, cache_read, cache_write, output);
+            r.cost = pr.cost_split(input, cache_read, cache_write, cache_write_1h, output);
             r.cost_known = true;
-            r.savings = pr.savings(cache_read, cache_write);
+            r.savings = pr.savings_split(cache_read, cache_write, cache_write_1h);
         }
         if r.day.is_empty() { r.day = day.clone(); }
         add(rows, sess, "Claude Code", &model, &r.day.clone(), r);
@@ -650,6 +987,7 @@ fn parse_claude(
     cache: &mut ScanCache,
     rows: &mut Rows,
     sess: &mut Sess,
+    artifacts: &mut Vec<Artifact>,
 ) -> u64 {
     let projects = home.join(".claude").join("projects");
     if !projects.exists() {
@@ -671,6 +1009,8 @@ fn parse_claude(
                 for (day, agent) in &entry.sessions {
                     session(sess, agent, day);
                 }
+                // The artifacts were collected when the file was first read.
+                artifacts.extend(entry.artifacts.iter().cloned());
                 continue;
             }
             uncached.push((file.clone(), path_str, mtime_ns, size));
@@ -680,17 +1020,28 @@ fn parse_claude(
     if !uncached.is_empty() {
         cache.dirty = true;
         let pricing_ref = pricing;
+        let route = claude_route(home);
         for (file, path_str, mtime_ns, size) in uncached {
             let mut file_rows = Rows::new();
             let mut file_sess = Sess::new();
-            parse_single_claude(&file, pricing_ref, &mut file_rows, &mut file_sess);
+            let mut file_artifacts = Vec::new();
+            parse_single_claude(
+                &file,
+                pricing_ref,
+                route,
+                &mut file_rows,
+                &mut file_sess,
+                &mut file_artifacts,
+            );
             let cached = CachedFile {
                 mtime_ns,
                 size,
                 rows: file_rows.into_values().collect(),
                 sessions: file_sess.into_keys().collect(),
+                artifacts: file_artifacts.clone(),
                 ..Default::default()
             };
+            artifacts.extend(file_artifacts);
             for r in &cached.rows {
                 add(rows, sess, &r.agent, &r.model, &r.day, r.clone());
             }
@@ -742,6 +1093,28 @@ fn parse_opencode(
     let mut db_rows = Rows::new();
     let mut db_sess = Sess::new();
 
+    // The session table knows which directory a session ran in and whether it
+    // was a delegated child run. Older schemas have one column but not the
+    // other, so each is read on its own.
+    let mut session_dirs: HashMap<String, String> = HashMap::new();
+    let mut subagent_sessions: HashSet<String> = HashSet::new();
+    if let Ok(mut stmt) = conn.prepare(&format!("SELECT id, directory FROM {}", table)) {
+        if let Ok(it) = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        }) {
+            for (id, dir) in it.flatten() {
+                session_dirs.insert(id, dir.unwrap_or_default());
+            }
+        }
+    }
+    if let Ok(mut stmt) = conn.prepare(&format!("SELECT id FROM {} WHERE parent_id IS NOT NULL", table)) {
+        if let Ok(it) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+            for id in it.flatten() {
+                subagent_sessions.insert(id);
+            }
+        }
+    }
+
     if let Ok(mut stmt) = conn.prepare(&format!("SELECT time_created FROM {}", table)) {
         if let Ok(it) = stmt.query_map([], |r| r.get::<_, i64>(0)) {
             for ts in it.flatten() {
@@ -753,9 +1126,122 @@ fn parse_opencode(
     }
     // Session totals have no daily attribution. Messages keep the actual model,
     // request time, and usage even when a session is resumed with another model.
-    if let Ok(mut stmt) = conn.prepare("SELECT data, time_created FROM message") {
-        if let Ok(it) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) {
-            for (data, ts) in it.flatten() {
+    //
+    // The aggregation runs inside SQLite: pulling every message's JSON across
+    // the wire and parsing it in Rust took twenty seconds on a database with a
+    // few hundred thousand messages, while SQLite does the same sum in well
+    // under a second. Messages that report a cost are kept apart from those
+    // that do not, because the two are priced differently.
+    let day_expr = "date(CASE WHEN m.time_created > 1000000000000 THEN m.time_created/1000 ELSE m.time_created END,'unixepoch')";
+    let columns = "json_extract(m.data,'$.providerID'), json_extract(m.data,'$.modelID'),
+                   COUNT(*),
+                   SUM(COALESCE(json_extract(m.data,'$.tokens.input'),0)),
+                   SUM(COALESCE(json_extract(m.data,'$.tokens.output'),0)),
+                   SUM(COALESCE(json_extract(m.data,'$.tokens.cache.read'),0)),
+                   SUM(COALESCE(json_extract(m.data,'$.tokens.cache.write'),0)),
+                   SUM(COALESCE(json_extract(m.data,'$.tokens.reasoning'),0)),
+                   SUM(COALESCE(json_extract(m.data,'$.cost'),0)),
+                   json_extract(m.data,'$.cost') IS NOT NULL";
+    // One grouped row of assistant messages.
+    struct MsgGroup {
+        day: String,
+        provider: Option<String>,
+        model: Option<String>,
+        requests: u64,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+        reasoning: u64,
+        cost: f64,
+        has_cost: bool,
+        directory: Option<String>,
+        subagent: bool,
+    }
+    let mut grouped: Vec<MsgGroup> = Vec::new();
+    // The session table carries the working directory, but an older schema does
+    // not have that column, so the join is only used when it works.
+    let candidates = [
+        format!(
+            "SELECT {day_expr} AS d, {columns}, s.directory, s.parent_id IS NOT NULL
+             FROM message m LEFT JOIN {} s ON m.session_id = s.id
+             WHERE json_valid(m.data) AND json_extract(m.data,'$.role') = 'assistant'
+             GROUP BY d, 1, 2, 3, 11, 12",
+            table
+        ),
+        format!(
+            "SELECT {day_expr} AS d, {columns}, NULL, NULL
+             FROM message m
+             WHERE json_valid(m.data) AND json_extract(m.data,'$.role') = 'assistant'
+             GROUP BY d, 1, 2, 3"
+        ),
+    ];
+    for sql in candidates {
+        let Ok(mut stmt) = conn.prepare(&sql) else { continue };
+        let Ok(it) = stmt.query_map([], |r| {
+            Ok(MsgGroup {
+                day: r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                provider: r.get::<_, Option<String>>(1)?,
+                model: r.get::<_, Option<String>>(2)?,
+                requests: r.get::<_, u64>(3)?,
+                input: r.get::<_, u64>(4)?,
+                output: r.get::<_, u64>(5)?,
+                cache_read: r.get::<_, u64>(6)?,
+                cache_write: r.get::<_, u64>(7)?,
+                reasoning: r.get::<_, u64>(8)?,
+                cost: r.get::<_, f64>(9)?,
+                has_cost: r.get::<_, bool>(10)?,
+                directory: r.get::<_, Option<String>>(11)?,
+                subagent: r.get::<_, Option<bool>>(12)?.unwrap_or(false),
+            })
+        }) else { continue };
+        grouped = it.flatten().collect();
+        break;
+    }
+    if !grouped.is_empty() {
+        for g in grouped {
+            if g.day.is_empty() {
+                continue;
+            }
+            let model = opencode_model(&serde_json::json!({"providerID": g.provider, "modelID": g.model}));
+            let price = pricing.lookup(model_provider(&model), &model);
+            let reported = if g.has_cost { Some(g.cost) } else { None };
+            let mut r = Row {
+                day: g.day.clone(),
+                requests: g.requests,
+                input: g.input,
+                output: g.output,
+                cache_read: g.cache_read,
+                cache_write: g.cache_write,
+                reasoning: g.reasoning,
+                project: project::label_for_cwd(g.directory.as_deref()),
+                subagent: g.subagent,
+                billing: billing_of(reported, price.is_some(), false),
+                ..Default::default()
+            };
+            if let Some(c) = reported {
+                r.cost = c;
+                r.cost_known = true;
+            } else if let Some(p) = price {
+                r.cost = p.cost(r.input, r.cache_read, r.cache_write, r.output);
+                r.cost_known = true;
+            }
+            if let Some(p) = price {
+                r.savings = p.savings(r.cache_read, r.cache_write);
+            }
+            add(&mut db_rows, &mut db_sess, "OpenCode", &model, &g.day, r);
+        }
+    } else if let Ok(mut stmt) = conn.prepare("SELECT data, time_created, session_id FROM message") {
+        // An older schema without the token fields: fall back to reading the
+        // messages one by one.
+        if let Ok(it) = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        }) {
+            for (data, ts, session_id) in it.flatten() {
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else { continue };
                 if v.get("role").and_then(|x| x.as_str()) != Some("assistant") {
                     continue;
@@ -764,6 +1250,7 @@ fn parse_opencode(
                 let day = unix_day(if ts > 1_000_000_000_000 { ts / 1000 } else { ts });
                 let u = &v["tokens"];
                 let mut r = Row {
+                    day: day.clone(),
                     requests: 1,
                     input: u["input"].as_u64().unwrap_or(0),
                     output: u["output"].as_u64().unwrap_or(0),
@@ -772,8 +1259,17 @@ fn parse_opencode(
                     reasoning: u["reasoning"].as_u64().unwrap_or(0),
                     ..Default::default()
                 };
+                if let Some(sid) = &session_id {
+                    r.project = session_dirs
+                        .get(sid)
+                        .map(|d| project::label_for_cwd(Some(d)))
+                        .unwrap_or_default();
+                    r.subagent = subagent_sessions.contains(sid);
+                }
                 let price = pricing.lookup(model_provider(&model), &model);
-                if let Some(cost) = v.get("cost").and_then(|x| x.as_f64()).filter(|c| *c >= 0.0) {
+                let reported = v.get("cost").and_then(|x| x.as_f64()).filter(|c| *c >= 0.0);
+                r.billing = billing_of(reported, price.is_some(), false);
+                if let Some(cost) = reported {
                     r.cost = cost;
                     r.cost_known = true;
                 } else if let Some(p) = price {
@@ -787,23 +1283,46 @@ fn parse_opencode(
             }
         }
     }
-    // Group tools in SQLite instead of transferring each call's JSON.
-    let sql = "SELECT json_extract(m.data, '$.providerID'), json_extract(m.data, '$.modelID'),
-                      date(p.time_created/1000,'unixepoch'), COUNT(*)
+    // Group tools in SQLite instead of transferring each call's JSON. The
+    // session table carries the working directory, but an older schema does
+    // not have that column, so the join is only used when it works.
+    let joined = format!(
+        "SELECT json_extract(m.data, '$.providerID'), json_extract(m.data, '$.modelID'),
+                      date(p.time_created/1000,'unixepoch'), s.directory, COUNT(*)
                FROM part p JOIN message m ON p.message_id = m.id
+               LEFT JOIN {} s ON m.session_id = s.id
                WHERE json_valid(p.data) AND json_valid(m.data) AND json_extract(p.data, '$.type') = 'tool'
-               GROUP BY 1, 2, 3";
-    if let Ok(mut stmt) = conn.prepare(sql) {
-        if let Ok(it) = stmt.query_map([], |r| Ok((
-            r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?,
-            r.get::<_, Option<String>>(2)?, r.get::<_, u64>(3)?,
-        ))) {
-            for (provider, model, day, tools) in it.flatten() {
-                let Some(day) = day else { continue };
-                let model = opencode_model(&serde_json::json!({"providerID": provider, "modelID": model}));
-                add(&mut db_rows, &mut db_sess, "OpenCode", &model, &day, Row { tools, ..Default::default() });
-            }
-        }
+               GROUP BY 1, 2, 3, 4",
+        table
+    );
+    let plain = "SELECT json_extract(m.data, '$.providerID'), json_extract(m.data, '$.modelID'),
+                        date(p.time_created/1000,'unixepoch'), NULL, COUNT(*)
+                 FROM part p JOIN message m ON p.message_id = m.id
+                 WHERE json_valid(p.data) AND json_valid(m.data) AND json_extract(p.data, '$.type') = 'tool'
+                 GROUP BY 1, 2, 3";
+    // One grouped row of tool calls: (provider, model, day, directory, calls).
+    type ToolRow = (Option<String>, Option<String>, Option<String>, Option<String>, u64);
+    let mut tools_by_row: Vec<ToolRow> = Vec::new();
+    for sql in [joined.as_str(), plain] {
+        let Ok(mut stmt) = conn.prepare(sql) else { continue };
+        let Ok(it) = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?, r.get::<_, Option<String>>(3)?,
+                r.get::<_, u64>(4)?,
+            ))
+        }) else { continue };
+        tools_by_row = it.flatten().collect();
+        break;
+    }
+    for (provider, model, day, directory, tools) in tools_by_row {
+        let Some(day) = day else { continue };
+        let model = opencode_model(&serde_json::json!({"providerID": provider, "modelID": model}));
+        add(&mut db_rows, &mut db_sess, "OpenCode", &model, &day, Row {
+            tools,
+            project: project::label_for_cwd(directory.as_deref()),
+            ..Default::default()
+        });
     }
 
     for r in db_rows.values() {
@@ -873,7 +1392,7 @@ fn parse_antigravity(
             // index so a re-appended tail does not double-count requests.
             let mut seen_steps = std::collections::HashSet::new();
             each_line(file, |line| {
-                if !has_key(line, AGY_KEYS) {
+                if !has_key(line, &AGY_KEYS) {
                     return;
                 }
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return };
@@ -915,6 +1434,7 @@ fn parse_antigravity(
                     let mut r = Row {
                         day: day_of(ts),
                         agent: "Antigravity".into(),
+                        billing: Billing::Subscription,
                         model: model.clone(),
                         requests: 1,
                         input,
@@ -1072,7 +1592,7 @@ fn parse_t3(
         let mut file_rows = Rows::new();
         let mut file_sess = Sess::new();
         each_line(file, |line| {
-            if !has_key(line, AGY_KEYS) {
+            if !has_key(line, &AGY_KEYS) {
                 return;
             }
             let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return };
@@ -1090,6 +1610,7 @@ fn parse_t3(
             let mut r = Row {
                 day: day_of(ts),
                 agent: "Antigravity".into(),
+                billing: Billing::Subscription,
                 model: model.clone(),
                 requests: 1,
                 tools,
@@ -1175,6 +1696,7 @@ fn parse_t3(
                 add(rows, sess, "Antigravity", model, d, Row {
                     day: d.clone(),
                     agent: "Antigravity".into(),
+                    billing: Billing::Subscription,
                     model: model.clone(),
                     requests: 1,
                     ..Default::default()
@@ -1185,6 +1707,7 @@ fn parse_t3(
                 add(rows, sess, "Antigravity", &model, d, Row {
                     day: d.clone(),
                     agent: "Antigravity".into(),
+                    billing: Billing::Subscription,
                     model: model.clone(),
                     tools: *n,
                     ..Default::default()
@@ -1274,6 +1797,7 @@ fn parse_t3_usage(home: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut Se
         let mut r = Row {
             day: day.clone(),
             agent: "Antigravity".into(),
+            billing: Billing::Subscription,
             model: model.clone(),
             requests: if counted { 0 } else { 1 },
             input,
@@ -1418,6 +1942,7 @@ fn parse_single_dsh(file: &Path, pricing: &Pricing, rows: &mut Rows, sess: &mut 
                     output,
                     reasoning,
                     tools,
+                    billing: Billing::Api,
                     ..Default::default()
                 };
                 if input + output + cache_read + cache_write > 0 {
@@ -1535,6 +2060,7 @@ fn lms_tokens(line: &str) -> Option<(bool, u64)> {
 
 fn parse_lmstudio(
     home: &Path,
+    pricing: &Pricing,
     cache: &mut ScanCache,
     rows: &mut Rows,
     sess: &mut Sess,
@@ -1583,6 +2109,7 @@ fn parse_lmstudio(
                 agent: "LM Studio".into(),
                 model: model.clone(),
                 requests,
+                billing: Billing::Local,
                 ..Default::default()
             });
         }
@@ -1609,6 +2136,9 @@ fn parse_lmstudio(
     logs.sort();
     let mut day = String::new();
     let mut model = String::from("unknown");
+    // What the same tokens would have cost on a cloud provider: running the
+    // model locally is what saved the money.
+    let cloud = pricing.reference_cloud();
     for file in &logs {
         each_line(file, |line| {
             if line.starts_with('[') && line.len() > 11 && line.as_bytes().get(11) == Some(&b' ') {
@@ -1635,12 +2165,16 @@ fn parse_lmstudio(
                     day: day.clone(),
                     agent: "LM Studio".into(),
                     model: model.clone(),
+                    billing: Billing::Local,
                     ..Default::default()
                 };
                 if is_prompt {
                     r.input = n;
                 } else {
                     r.output = n;
+                }
+                if let Some(p) = cloud {
+                    r.cloud_savings = p.cost(r.input, r.cache_read, r.cache_write, r.output);
                 }
                 add(rows, sess, "LM Studio", &model, &day, r);
             }
@@ -1649,7 +2183,7 @@ fn parse_lmstudio(
     (files.len() + logs.len()) as u64
 }
 
-fn unix_day(secs: i64) -> String {
+pub(crate) fn unix_day(secs: i64) -> String {
     if secs <= 0 {
         return String::new();
     }
@@ -1696,6 +2230,18 @@ fn scan(progress: &dyn Fn(&str)) -> Stats {
 }
 
 fn scan_home(home: &Path, progress: &dyn Fn(&str)) -> Stats {
+    // The live quota snapshot is read from the background refresher, so a scan
+    // never waits on the network.
+    let (reports, quota_checked_at) = quota::snapshot();
+    scan_home_with(home, progress, reports, quota_checked_at)
+}
+
+fn scan_home_with(
+    home: &Path,
+    progress: &dyn Fn(&str),
+    reports: Vec<quota::QuotaReport>,
+    quota_checked_at: String,
+) -> Stats {
     progress("model prices");
     let pricing = Pricing::load(home);
     let pricing_fp = (pricing.embedded_count as u64) ^ ((pricing.local_count as u64) << 32);
@@ -1706,46 +2252,119 @@ fn scan_home(home: &Path, progress: &dyn Fn(&str)) -> Stats {
     let mut limits = Vec::new();
     let mut counted_threads = HashSet::new();
     let mut plan_routes: HashMap<String, u64> = HashMap::new();
+    let mut artifacts: Vec<Artifact> = Vec::new();
+    // (agent, path, files, milliseconds) for the sources panel.
+    let mut sources: Vec<Source> = Vec::new();
 
     progress("Pi logs");
+    let started = std::time::Instant::now();
     let pi_files = parse_pi(home, &pricing, &mut cache, &mut rows, &mut sess, &mut plan_routes);
+    sources.push(Source { agent: "Pi".into(), path: "~/.pi/agent/sessions".into(), found: pi_files > 0, files: pi_files, scan_ms: started.elapsed().as_millis() as u64 });
+
     progress("Claude Code logs");
-    let claude_files = parse_claude(home, &pricing, &mut cache, &mut rows, &mut sess);
+    let started = std::time::Instant::now();
+    let claude_files = parse_claude(home, &pricing, &mut cache, &mut rows, &mut sess, &mut artifacts);
+    sources.push(Source { agent: "Claude Code".into(), path: "~/.claude/projects".into(), found: claude_files > 0, files: claude_files, scan_ms: started.elapsed().as_millis() as u64 });
+
     progress("OpenCode database");
+    let started = std::time::Instant::now();
     let opencode_n = parse_opencode(home, &pricing, &mut cache, &mut rows, &mut sess);
+    sources.push(Source { agent: "OpenCode".into(), path: "~/.local/share/opencode/opencode.db".into(), found: opencode_n > 0, files: opencode_n, scan_ms: started.elapsed().as_millis() as u64 });
+
     progress("Antigravity logs");
+    let started = std::time::Instant::now();
     let agy_dbs = parse_antigravity(home, &pricing, &mut cache, &mut rows, &mut sess);
+    sources.push(Source {
+        agent: "Antigravity".into(),
+        path: "~/.gemini/antigravity* + ~/.t3/userdata/statev2.sqlite + providers/antigravity/*/antigravity-acp".into(),
+        found: agy_dbs > 0,
+        files: agy_dbs,
+        scan_ms: started.elapsed().as_millis() as u64,
+    });
+
     progress("T3 logs");
+    let started = std::time::Instant::now();
     let t3_files = parse_t3(home, &mut cache, &mut rows, &mut sess, &mut counted_threads);
+    sources.push(Source { agent: "T3".into(), path: "~/.t3/userdata/providers/antigravity".into(), found: t3_files > 0, files: t3_files, scan_ms: started.elapsed().as_millis() as u64 });
+
     progress("T3 usage database");
+    let started = std::time::Instant::now();
     let t3_usage_db = parse_t3_usage(home, &pricing, &mut rows, &mut sess, &counted_threads);
+    sources.push(Source { agent: "T3 usage".into(), path: "~/.t3/userdata/statev2.sqlite".into(), found: t3_usage_db, files: t3_usage_db as u64, scan_ms: started.elapsed().as_millis() as u64 });
+
     progress("DSH logs");
+    let started = std::time::Instant::now();
     let dsh_files = parse_dsh(home, &pricing, &mut cache, &mut rows, &mut sess);
+    sources.push(Source { agent: "DSH".into(), path: "~/.dsh/sessions".into(), found: dsh_files > 0, files: dsh_files, scan_ms: started.elapsed().as_millis() as u64 });
+
     progress("LM Studio logs");
-    let lms_files = parse_lmstudio(home, &mut cache, &mut rows, &mut sess);
+    let started = std::time::Instant::now();
+    let lms_files = parse_lmstudio(home, &pricing, &mut cache, &mut rows, &mut sess);
+    sources.push(Source { agent: "LM Studio".into(), path: "~/.lmstudio/conversations + server-logs".into(), found: lms_files > 0, files: lms_files, scan_ms: started.elapsed().as_millis() as u64 });
 
     progress("Codex logs");
+    let started = std::time::Instant::now();
     let codex_files = parse_codex(home, &pricing, &mut cache, &mut rows, &mut sess, &mut limits);
+    sources.push(Source { agent: "Codex".into(), path: "~/.codex/sessions + archived_sessions".into(), found: codex_files > 0, files: codex_files, scan_ms: started.elapsed().as_millis() as u64 });
+
+    // The agents Cinder learned to read later.
+    progress("Cursor logs");
+    let started = std::time::Instant::now();
+    let cursor_files = agents::parse_cursor(home, &pricing, &mut cache, &mut rows, &mut sess);
+    sources.push(Source { agent: "Cursor".into(), path: "~/.cursor/chats + cli-chats".into(), found: cursor_files > 0, files: cursor_files, scan_ms: started.elapsed().as_millis() as u64 });
+
+    progress("GitHub Copilot logs");
+    let started = std::time::Instant::now();
+    let copilot_files = agents::parse_copilot(home, &pricing, &mut cache, &mut rows, &mut sess);
+    sources.push(Source { agent: "GitHub Copilot".into(), path: "~/.copilot/history-session-state + logs".into(), found: copilot_files > 0, files: copilot_files, scan_ms: started.elapsed().as_millis() as u64 });
+
+    progress("Gemini CLI logs");
+    let started = std::time::Instant::now();
+    let gemini_files = agents::parse_gemini(home, &pricing, &mut cache, &mut rows, &mut sess);
+    sources.push(Source { agent: "Gemini CLI".into(), path: "~/.gemini/tmp + sessions".into(), found: gemini_files > 0, files: gemini_files, scan_ms: started.elapsed().as_millis() as u64 });
+
+    progress("Cline logs");
+    let started = std::time::Instant::now();
+    let cline_files = agents::parse_cline(home, &pricing, &mut cache, &mut rows, &mut sess);
+    sources.push(Source { agent: "Cline".into(), path: "VS Code globalStorage/saoudrizwan.claude-dev".into(), found: cline_files > 0, files: cline_files, scan_ms: started.elapsed().as_millis() as u64 });
+
     cache.save();
     progress("done");
 
-    let sources = vec![
-        Source { agent: "Pi".into(), path: "~/.pi/agent/sessions".into(), found: pi_files > 0, files: pi_files },
-        Source { agent: "Codex".into(), path: "~/.codex/sessions + archived_sessions".into(), found: codex_files > 0, files: codex_files },
-        Source { agent: "Claude Code".into(), path: "~/.claude/projects".into(), found: claude_files > 0, files: claude_files },
-        Source { agent: "OpenCode".into(), path: "~/.local/share/opencode/opencode.db".into(), found: opencode_n > 0, files: opencode_n },
-        Source {
-            agent: "Antigravity".into(),
-            path: "~/.gemini/antigravity* + ~/.t3/userdata/statev2.sqlite + providers/antigravity/*/antigravity-acp".into(),
-            found: agy_dbs + t3_files > 0 || t3_usage_db,
-            files: agy_dbs + t3_files + (t3_usage_db as u64),
-        },
-        Source { agent: "DSH".into(), path: "~/.dsh/sessions".into(), found: dsh_files > 0, files: dsh_files },
-        Source { agent: "LM Studio".into(), path: "~/.lmstudio/conversations".into(), found: lms_files > 0, files: lms_files },
-    ];
+    // The live quota snapshot was handed in, so a scan never waits on the
+    // network.
+    let mut quota_error = String::new();
+    let mut live_windows: Vec<quota::LiveQuota> = Vec::new();
+    for report in reports {
+        if report.skipped {
+            continue;
+        }
+        if !report.error.is_empty() {
+            if !quota_error.is_empty() {
+                quota_error.push_str("; ");
+            }
+            quota_error.push_str(&format!("{}: {}", report.agent, report.error));
+            continue;
+        }
+        for w in report.windows {
+            limits.push(LimitRow {
+                agent: w.agent.clone(),
+                window: w.window.clone(),
+                used_percent: w.used_percent,
+                window_minutes: w.window_minutes,
+                resets_at: w.resets_at,
+                plan: w.plan.clone(),
+                source: "live".into(),
+                detail: w.detail.clone(),
+                used_amount: w.used_amount,
+                limit_amount: w.limit_amount,
+            });
+            live_windows.push(w);
+        }
+    }
 
     let mut rows: Vec<Row> = rows.into_values().collect();
-    rows.sort_by(|a, b| a.day.cmp(&b.day).then(a.agent.cmp(&b.agent)).then(a.model.cmp(&b.model)));
+    rows.sort_by(|a, b| a.day.cmp(&b.day).then(a.agent.cmp(&b.agent)).then(a.model.cmp(&b.model)).then(a.project.cmp(&b.project)));
     let mut sessions: Vec<SessionRow> = sess
         .into_iter()
         .map(|((day, agent), n)| SessionRow { day, agent, sessions: n })
@@ -1759,6 +2378,18 @@ fn scan_home(home: &Path, progress: &dyn Fn(&str)) -> Stats {
     let mut unpriced: Vec<_> = unpriced.into_iter().collect();
     unpriced.sort_by_key(|a| std::cmp::Reverse(a.1));
 
+    // The same artifact can be published by several turns; keep one of each.
+    artifacts.sort_by(|a, b| a.url.cmp(&b.url));
+    artifacts.dedup_by(|a, b| a.url == b.url);
+
+    // The plans the user declared, and how this month's usage looks against
+    // them. A plan says what the work was worth; a budget says how much of
+    // the limit is gone.
+    let now = now_secs();
+    let month = budget::month_of(&unix_day(now));
+    let plans = budget::statuses(&rows, &budget::load(home), &month);
+    let alerts = alerts::evaluate(&live_windows, &plans, now);
+
     Stats {
         rows,
         sessions,
@@ -1770,12 +2401,25 @@ fn scan_home(home: &Path, progress: &dyn Fn(&str)) -> Stats {
             v.sort_by(|a, b| a.0.cmp(&b.0));
             v.into_iter().map(|(p, _)| p).collect()
         },
+        quota_error,
+        quota_checked_at,
+        artifacts,
+        alerts,
+        plans,
         pricing: PricingInfo {
             source: pricing.source.clone(),
             embedded: pricing.embedded_count,
             local: pricing.local_count,
         },
     }
+}
+
+/// The current time in unix seconds.
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[tauri::command]
@@ -1800,14 +2444,168 @@ fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+/// The plans the user declared, if any.
+#[tauri::command]
+fn get_plans() -> Vec<Plan> {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    budget::load(&home)
+}
+
+/// Remember what the user declared.
+#[tauri::command(async)]
+fn set_plans(app: AppHandle, plans: Vec<Plan>) -> Result<Vec<Plan>, String> {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    budget::save(&home, &plans)?;
+    // A budget that just crossed its limit is worth saying out loud, so the
+    // announcements start over.
+    alerts::reset_announcements();
+    let stats = scan(&|_| {});
+    announce(&app, &stats.alerts);
+    let _ = app.emit("stats-updated", &stats);
+    Ok(budget::load(&home))
+}
+
+// ---------------- System tray ----------------
+// The tray shows how close the tightest live quota window is to its ceiling,
+// so the number that matters is visible without opening the window.
+static TRAY: std::sync::LazyLock<std::sync::Mutex<Option<tauri::tray::TrayIcon>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+/// The tray tooltip: the tightest window first, then the rest.
+fn tray_tooltip(reports: &[quota::QuotaReport]) -> String {
+    let mut windows: Vec<&quota::LiveQuota> = reports
+        .iter()
+        .filter(|r| !r.skipped)
+        .flat_map(|r| r.windows.iter())
+        .collect();
+    if windows.is_empty() {
+        return "Cinder — no live quota available".into();
+    }
+    windows.sort_by(|a, b| b.used_percent.partial_cmp(&a.used_percent).unwrap_or(std::cmp::Ordering::Equal));
+    let mut parts = vec![format!("Cinder — {} windows", windows.len())];
+    for w in windows.iter().take(3) {
+        parts.push(format!("{} {} {:.0}%", w.agent, w.window, w.used_percent));
+    }
+    parts.join(" | ")
+}
+
+/// Refresh the tray tooltip from the latest snapshot.
+fn update_tray_tooltip() {
+    let (reports, _) = quota::snapshot();
+    let tip = tray_tooltip(&reports);
+    let mut guard = TRAY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(tray) = guard.as_mut() {
+        let _ = tray.set_tooltip(Some(tip));
+    }
+}
+
+/// Build the tray icon and its menu.
+fn build_tray(app: &AppHandle) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+    let show = MenuItem::with_id(app, "show", "Open Cinder", true, None::<&str>)?;
+    let refresh = MenuItem::with_id(app, "refresh", "Rescan now", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit Cinder", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &refresh, &quit])?;
+
+    let mut builder = TrayIconBuilder::with_id("cinder-tray")
+        .tooltip(tray_tooltip(&[]))
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => show_window(app),
+            "refresh" => {
+                let app = app.clone();
+                std::thread::spawn(move || {
+                    let stats = scan(&|_| {});
+                    let _ = app.emit("stats-updated", &stats);
+                });
+            }
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            // A left click brings the window back; the menu is for the right
+            // button, so it stays out of the way.
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+                show_window(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    }
+    let tray = builder.build(app)?;
+    let mut guard = TRAY.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = Some(tray);
+    Ok(())
+}
+
+/// Bring the dashboard back to the front.
+fn show_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+/// Ask the providers for their quota windows, over and over.
+///
+/// The first run happens immediately so the tray and the limits view have real
+/// numbers early; later runs wait out the interval. A failed refresh leaves
+/// the previous snapshot in place rather than blanking the panel.
+fn spawn_quota_refresher(app: AppHandle) {
+    std::thread::spawn(move || {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        loop {
+            let reports = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt.block_on(quota::fetch_all(&home)),
+                Err(_) => Vec::new(),
+            };
+            if !reports.is_empty() {
+                quota::publish(reports);
+                update_tray_tooltip();
+                // The window shows the limits too, so it gets the new numbers.
+                let stats = scan(&|_| {});
+                announce(&app, &stats.alerts);
+                let _ = app.emit("stats-updated", &stats);
+            }
+            std::thread::sleep(quota::REFRESH_INTERVAL);
+        }
+    });
+}
+
+/// Tell the user about an alert the first time it shows up.
+///
+/// The same alert is not announced twice, and one that clears is forgotten so
+/// it can fire again later.
+fn announce(app: &AppHandle, alerts: &[Alert]) {
+    use tauri_plugin_notification::NotificationExt;
+    for alert in alerts::take_new(alerts) {
+        let _ = app
+            .notification()
+            .builder()
+            .title(&alert.title)
+            .body(&alert.detail)
+            .show();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         // Remember where the user put the window instead of resetting to the
         // config default on every launch.
         .plugin(tauri_plugin_window_state::Builder::default().build())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             spawn_log_watcher(app.handle().clone());
+            spawn_quota_refresher(app.handle().clone());
+            if let Err(e) = build_tray(app.handle()) {
+                // A missing tray is not a reason to refuse to start.
+                eprintln!("system tray unavailable: {e}");
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1815,7 +2613,9 @@ pub fn run() {
             rescan_stats,
             check_update,
             download_and_install_update,
-            get_app_version
+            get_app_version,
+            get_plans,
+            set_plans
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

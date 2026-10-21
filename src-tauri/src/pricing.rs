@@ -20,11 +20,49 @@ impl Price {
     pub fn cost(&self, input: u64, cache_read: u64, cache_write: u64, output: u64) -> f64 {
         (input as f64 * self.i + cache_read as f64 * self.cr + cache_write as f64 * self.cw + output as f64 * self.o) / 1e6
     }
+    /// The 1-hour ephemeral cache write rate: twice the 5-minute rate.
+    ///
+    /// Anthropic bills a 1-hour cache write at twice what the 5-minute write
+    /// costs, and the 5-minute write costs 1.25x the base input price when the
+    /// catalog has no cache-write price of its own.
+    pub fn cache_write_1h_rate(&self) -> f64 {
+        let five_min = if self.cw > 0.0 { self.cw } else { self.i * 1.25 };
+        five_min * 2.0
+    }
+    /// The cost of a request where part of the cache writes are billed at the
+    /// 1-hour ephemeral rate. `cache_write` is the total written, of which
+    /// `cache_write_1h` uses the longer lifetime.
+    pub fn cost_split(
+        &self,
+        input: u64,
+        cache_read: u64,
+        cache_write: u64,
+        cache_write_1h: u64,
+        output: u64,
+    ) -> f64 {
+        let five_min = cache_write.saturating_sub(cache_write_1h);
+        (input as f64 * self.i
+            + cache_read as f64 * self.cr
+            + five_min as f64 * self.cw
+            + cache_write_1h as f64 * self.cache_write_1h_rate()
+            + output as f64 * self.o)
+            / 1e6
+    }
     /// What caching saved versus sending the same tokens as plain input.
     pub fn savings(&self, cache_read: u64, cache_write: u64) -> f64 {
         let read = if self.cr > 0.0 { self.cr } else { self.i };
         let write = if self.cw > 0.0 { self.cw } else { self.i };
         (cache_read as f64 * (self.i - read) + cache_write as f64 * (self.i - write)).max(0.0) / 1e6
+    }
+    /// What caching saved, where part of the writes use the 1-hour rate and
+    /// therefore cost more than plain input rather than less.
+    pub fn savings_split(&self, cache_read: u64, cache_write: u64, cache_write_1h: u64) -> f64 {
+        let five_min = cache_write.saturating_sub(cache_write_1h);
+        let read = if self.cr > 0.0 { self.cr } else { self.i };
+        let write = if self.cw > 0.0 { self.cw } else { self.i };
+        let saved = cache_read as f64 * (self.i - read) + five_min as f64 * (self.i - write);
+        let spent = cache_write_1h as f64 * (self.cache_write_1h_rate() - self.i);
+        (saved - spent).max(0.0) / 1e6
     }
 }
 
@@ -264,6 +302,21 @@ impl Pricing {
                 if let Some(p) = self.embedded.get(*canon) {
                     return Some(*p);
                 }
+            }
+        }
+        None
+    }
+
+    /// The price of a stand-in cloud model, used to put a number on what a
+    /// local run saved.
+    ///
+    /// `gpt-4o` is the baseline because its list price is one most readers
+    /// can check; the others are fallbacks for a catalog that does not carry
+    /// it.
+    pub fn reference_cloud(&self) -> Option<Price> {
+        for id in ["gpt-4o", "claude-sonnet-4-5", "gpt-4.1", "gemini-2.5-flash"] {
+            if let Some(p) = self.embedded.get(id) {
+                return Some(*p);
             }
         }
         None

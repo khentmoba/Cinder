@@ -7,9 +7,10 @@ let LOADING = false;         // a scan is in flight
 let metric = 'tokens';       // cost | tokens | requests | limits
 let lastMetric = 'tokens';   // the metric to fall back to when leaving Limits
 let rangeDays = 90;          // 1 | 7 | 30 | 90 | 0 = all
-let breakMode = 'model';     // model | day
+let breakMode = 'model';     // model | day | agent | cache | project
 let selectedAgent = null;    // null = all agents
 let selectedModel = null;    // null = all models
+let selectedProject = null;  // null = all projects, '' = the runs without one
 let hiddenAgents = new Set();// series switched off in the chart legend
 let breakAll = false;        // breakdown lists every row, not just the top ones
 let chart = null;            // last drawn chart geometry, for the hover tooltip
@@ -86,7 +87,44 @@ const fmtUsd = (n, known, partial = false) => known
   ? (partial ? '≥ ' : '') + '$' + n.toLocaleString('en-US', n >= 100
       ? { maximumFractionDigits: 0 } : { minimumFractionDigits: 2, maximumFractionDigits: 2 })
   : '—';
+// fmtUsd drops the cents above a hundred, which is right for a headline
+// figure but wrong for a plan price or a budget, where the exact amount is
+// the whole point of the number.
+const fmtUsdCents = n => '$' + Number(n || 0).toLocaleString('en-US',
+  { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+// How the money behind a figure is actually paid for. Every dollar number on
+// screen is an equivalent value priced at public list prices, never an invoice,
+// so the badge says which reading applies.
+const BILLING_MODES = ['subscription', 'api', 'local', 'unknown'];
+const BILLING_BADGE = { subscription: 'Plan', api: 'API', local: 'Local' };
+const BILLING_BADGE_CLASS = { subscription: 'badge-plan', api: 'badge-api', local: 'badge-local' };
+const BILLING_BADGE_TITLE = {
+  subscription: 'Covered by a flat-rate plan — the card is not charged per token',
+  api: 'Billed per token through a provider API key',
+  local: 'Local inference — no provider bill at all',
+};
+// What the hero says the big number means.
+const BILLING_READING = {
+  subscription: 'API-equivalent value — covered by your plan',
+  api: 'Direct API spend',
+  local: 'Local inference — zero API cost',
+};
+const billingMode = v => {
+  const m = String(v || '').toLowerCase();
+  return BILLING_MODES.includes(m) ? m : 'unknown';
+};
+// The badge that says how a figure is paid for. Unknown rows get none.
+const billingBadge = mode => {
+  const m = billingMode(mode);
+  const label = BILLING_BADGE[m];
+  if (!label) return '';
+  return `<span class="badge ${BILLING_BADGE_CLASS[m]}" title="${esc(BILLING_BADGE_TITLE[m])}">${label}</span>`;
+};
+// The project name a run belongs to; runs without a working directory are
+// grouped under one honest name instead of an empty row.
+const projectLabel = project => project || 'No project';
 
 function todayStr(offsetDays = 0) {
   const d = new Date();
@@ -108,10 +146,12 @@ function filtered() {
   const cutoff = rangeDays === 0 ? null : todayStr(-(rangeDays - 1));
   return rowsInRange(cutoff, null);
 }
-// One place where the model breadcrumb narrows every panel at once.
+// One place where the model and project breadcrumbs narrow every panel at once.
 function applyModelFilter(rows) {
-  if (!selectedModel) return rows;
-  return rows.filter(r => modelKey(r) === selectedModel);
+  let out = rows;
+  if (selectedProject !== null) out = out.filter(r => (r.project || '') === selectedProject);
+  if (selectedModel) out = out.filter(r => modelKey(r) === selectedModel);
+  return out;
 }
 function sessionCount() {
   if (rangeDays === 0) return DATA.sessions;
@@ -120,7 +160,32 @@ function sessionCount() {
 }
 
 function blank() {
-  return { requests: 0, input: 0, cache_read: 0, cache_write: 0, output: 0, reasoning: 0, tools: 0, cost: 0, cost_known: false, cost_partial: false, savings: 0 };
+  return { requests: 0, input: 0, cache_read: 0, cache_write: 0, output: 0, reasoning: 0, tools: 0,
+    cost: 0, cost_known: false, cost_partial: false, savings: 0,
+    project: '', billing: 'unknown', subagent: false, subagent_requests: 0,
+    cloud_savings: 0, local_savings: 0 };
+}
+// One reading for a whole total: the billing mode that covers the most money
+// wins, where the money is the equivalent list value a row contributes to the
+// big number, so the reading always describes how that number is made up. A
+// local run costs nobody anything, so it weighs nothing here and says so on
+// the "saved vs cloud" line instead; when every mode prices at zero, the mode
+// with the most requests breaks the tie.
+function dominantBilling(a) {
+  const cost = (a && a.billingCost) || {};
+  const req = (a && a.billingRequests) || {};
+  let best = 'unknown';
+  let bestCost = -1;
+  let bestReq = -1;
+  for (const mode of BILLING_MODES) {
+    const c = cost[mode] || 0;
+    const r = req[mode] || 0;
+    if (c > bestCost || (c === bestCost && r > bestReq)) {
+      best = mode; bestCost = c; bestReq = r;
+    }
+  }
+  if (bestCost <= 0 && bestReq <= 0) return 'unknown';
+  return best;
 }
 function acc(r, a) {
   a.requests += r.requests; a.input += r.input; a.cache_read += r.cache_read; a.cache_write += r.cache_write;
@@ -128,6 +193,31 @@ function acc(r, a) {
   a.cost_known = a.cost_known || r.cost_known;
   a.cost_partial ||= !!r.cost_partial || (!r.cost_known && tok(r) > 0);
   a.savings += r.savings;
+  a.cloud_savings += r.cloud_savings || 0;
+  a.subagent = a.subagent || !!r.subagent;
+  if (!a.billingCost) {
+    a.billingCost = {};
+    a.billingRequests = {};
+    for (const mode of BILLING_MODES) { a.billingCost[mode] = 0; a.billingRequests[mode] = 0; }
+  }
+  if (r.billingCost) {
+    // the source is an aggregate of its own: carry its split and counts over
+    a.subagent_requests += r.subagent_requests || 0;
+    a.local_savings += r.local_savings || 0;
+    for (const mode of BILLING_MODES) {
+      a.billingCost[mode] += r.billingCost[mode] || 0;
+      a.billingRequests[mode] += r.billingRequests[mode] || 0;
+    }
+  } else {
+    a.subagent_requests += r.subagent ? (r.requests || 0) : 0;
+    const mode = billingMode(r.billing);
+    // the weight is the equivalent value the row contributes to the big number,
+    // so the dominant mode always describes how that number is composed
+    a.billingCost[mode] += r.cost || 0;
+    a.billingRequests[mode] += r.requests || 0;
+    if (mode === 'local') a.local_savings += r.cloud_savings || 0;
+  }
+  a.billing = dominantBilling(a);
   return a;
 }
 const tok = a => a.input + a.cache_read + a.cache_write + a.output;
@@ -177,6 +267,24 @@ function byModel() {
   return { list, totalTok };
 }
 
+// Grouped by the repository the run happened in. Runs without a working
+// directory land in one group of their own.
+function byProject() {
+  const m = new Map();
+  const agents = new Map();
+  for (const r of filtered()) {
+    if (selectedAgent && r.agent !== selectedAgent) continue;
+    const key = r.project || '';
+    if (!m.has(key)) m.set(key, blank());
+    acc(r, m.get(key));
+    if (!agents.has(key)) agents.set(key, new Set());
+    agents.get(key).add(r.agent);
+  }
+  const list = [...m.entries()].map(([project, a]) => ({ ...a, project, agentCount: agents.get(project).size }));
+  list.sort((x, y) => mval(y) - mval(x));
+  return { list };
+}
+
 function byDay(rows = filtered()) {
   const m = new Map();
   for (const r of rows) {
@@ -201,7 +309,8 @@ function previousDays() {
 function renderSkeleton() {
   const sk = c => `<i class="sk ${c}"></i>`;
   document.querySelector('.hero').innerHTML =
-    `<div id="bigTotal" class="big sk h1"></div><div id="bigSub" class="sub sk w3"></div><div id="bigDelta" class="delta"></div>`;
+    `<div class="big-row"><div id="bigTotal" class="big sk h1"></div><span id="bigBadge" class="badge" hidden></span></div>` +
+    `<div id="bigSub" class="sub sk w3"></div><div id="bigDelta" class="delta"></div><div id="bigSaved" class="saved" hidden></div>`;
   document.getElementById('agentList').innerHTML = [0, 1, 2, 3].map(() =>
     `<div class="agent-row">${sk('dot')}${sk('sq')}${sk('w1')}${sk('w2')}</div>`).join('');
   document.getElementById('totals').innerHTML = [0, 1, 2, 3, 4].map(() =>
@@ -234,6 +343,7 @@ function renderDelta() {
 function render() {
   if (!DATA) return;          // still scanning: nothing to draw yet
   renderLimits();
+  renderAlertBadge();
   renderSources();
   renderCrumb();
   const dash = document.getElementById('dash');
@@ -260,27 +370,52 @@ function render() {
   const big = document.getElementById('bigTotal');
   big.className = 'big';
   big.textContent = bigVal;
+  const mode = billingMode(grand.billing);
+  const heroBadge = document.getElementById('bigBadge');
+  if (heroBadge) {
+    const label = BILLING_BADGE[mode];
+    heroBadge.textContent = label || '';
+    heroBadge.className = label ? 'badge ' + BILLING_BADGE_CLASS[mode] : 'badge';
+    heroBadge.title = label ? BILLING_BADGE_TITLE[mode] : '';
+    heroBadge.hidden = !(metric === 'cost' && label);
+  }
   const sub = document.getElementById('bigSub');
   sub.className = 'sub';
-  sub.textContent = grand.sessions + ' sessions · ' + grand.requests.toLocaleString() + ' requests · ' + fmtTok(grand.tools) + ' tool calls';
+  // the subtitle names the reading of the total: the cost figure is an
+  // equivalent value, so it says which way it is paid for.
+  const reading = metric === 'cost' ? BILLING_READING[mode] : '';
+  const parts = [];
+  if (reading) parts.push(reading);
+  parts.push(grand.sessions + ' sessions', grand.requests.toLocaleString() + ' requests', fmtTok(grand.tools) + ' tool calls');
+  sub.textContent = parts.join(' · ');
   renderDelta();
+  const savedEl = document.getElementById('bigSaved');
+  if (savedEl) {
+    const local = grand.local_savings || 0;
+    savedEl.hidden = !(local > 0);
+    savedEl.innerHTML = local > 0 ? `Saved vs cloud <b>${fmtUsd(local, true)}</b>` : '';
+  }
 
   const grandVal = mval(grand);
   const agentList = document.getElementById('agentList');
   agentList.innerHTML = list.map(a => {
     const v = mval(a);
     const share = grandVal ? (v / grandVal * 100).toFixed(1) : '0.0';
+    const badge = billingBadge(a.billing);
     // Cost is redundant when it is the selected metric; the request count never
     // is, and it is the only volume signal for agents that log no tokens.
     const extra = metric === 'cost' ? ''
-      : ` · ${fmtUsd(a.cost, a.cost_known, a.cost_partial)} · ${a.requests.toLocaleString()} req`;
+      : ` · ${fmtUsd(a.cost, a.cost_known, a.cost_partial)}${badge} · ${a.requests.toLocaleString()} req`;
+    // a delegated run is still real usage, so it only gets counted, never hidden
+    const delegated = a.subagent_requests > 0 ? ` · ${a.subagent_requests.toLocaleString()} delegated` : '';
+    const saved = a.local_savings > 0 ? ` · saved ${fmtUsd(a.local_savings, true)} vs cloud` : '';
     return `<button class="agent-row${selectedAgent === a.agent ? ' sel' : ''}" data-agent="${esc(a.agent)}"
       style="box-shadow:inset 2px 0 0 ${color(a.agent)}" title="Filter to ${esc(a.agent)}">
       <span class="radio"></span>
       <img class="logo" src="${agentLogo(a.agent)}" alt="" onerror="this.style.visibility='hidden'">
       <span class="name">${esc(a.agent)} <span class="cnt">${a.sessions} sessions</span></span>
-      <span class="val">${mfmt(v, a.cost_known, a.cost_partial)}</span>
-      <span class="meta">${share}% of ${METRICS[metric].label}${extra}</span>
+      <span class="val">${mfmt(v, a.cost_known, a.cost_partial)}${metric === 'cost' ? badge : ''}</span>
+      <span class="meta">${share}% of ${METRICS[metric].label}${extra}${delegated}${saved}</span>
       <span class="bar" style="width:${grandVal ? Math.max(1.5, v / grandVal * 100) : 0}%;background:${color(a.agent)}"></span>
     </button>`;
   }).join('') || (DATA.rows.length
@@ -303,7 +438,7 @@ function render() {
     ['Cache savings', grand.savings > 0 ? fmtUsd(grand.savings, true) : '—'],
   ];
   if (grand.cache_read > 0) items.push(['Prompt cached', fmtTok(grand.cache_read)]);
-  if (metric !== 'cost') items.push(['Cost', fmtUsd(grand.cost, grand.cost_known, grand.cost_partial)]);
+  if (metric !== 'cost') items.push(['Cost', fmtUsd(grand.cost, grand.cost_known, grand.cost_partial) + billingBadge(grand.billing)]);
   document.getElementById('totals').innerHTML = items.map(([l, v]) =>
     `<div class="t"><div class="l">${l}</div><div class="v">${v}</div></div>`).join('');
 
@@ -320,6 +455,7 @@ function render() {
   }).join('');
 
   renderBreakdown();
+  renderArtifacts();
   renderChart(list);
   renderRangeLabel();
 }
@@ -333,6 +469,10 @@ function renderCrumb() {
     parts.push(`<span class="sep">/</span><b>${esc(selectedAgent)}</b>`);
   } else {
     parts.push(`<span class="sep">/</span><b>All environments</b>`);
+  }
+  if (selectedProject !== null) {
+    parts.push(`<span class="sep">/</span><b>${esc(projectLabel(selectedProject))}</b>`);
+    parts.push(`<button class="crumb-link" data-clear="project" title="Clear project filter">×</button>`);
   }
   if (selectedModel) {
     parts.push(`<span class="sep">/</span><b>${esc(selectedModel)}</b>`);
@@ -357,6 +497,28 @@ function breakdownData() {
         cost: d.cost, costKnown: d.cost_known, costPartial: d.cost_partial, priced: d.cost_known,
         num: metric === 'cost' ? d.requests.toLocaleString() : fmtTok(tok(d)),
         savings: d.savings,
+        billing: d.billing,
+        subagentRequests: d.subagent_requests,
+      })),
+    };
+  }
+  if (breakMode === 'project') {
+    const { list } = byProject();
+    const total = list.reduce((t, p) => t + mval(p), 0) || 1;
+    return {
+      label: 'Project',
+      costHeader: 'Cost',
+      num: metric === 'requests' ? 'Requests' : 'Tokens',
+      rows: list.map(p => ({
+        key: p.project, name: projectLabel(p.project), logo: null, share: mval(p) / total * 100, value: mval(p),
+        cost: p.cost, costKnown: p.cost_known, costPartial: p.cost_partial, priced: p.cost_known,
+        num: metric === 'requests' ? p.requests.toLocaleString() : fmtTok(tok(p)),
+        extra: `${p.agentCount} agent${p.agentCount === 1 ? '' : 's'}`,
+        savings: p.savings,
+        requests: p.requests,
+        billing: p.billing,
+        subagentRequests: p.subagent_requests,
+        project: p.project,
       })),
     };
   }
@@ -374,6 +536,8 @@ function breakdownData() {
         extra: a.sessions ? `${a.sessions} sess` : '',
         savings: a.savings,
         requests: a.requests,
+        billing: a.billing,
+        subagentRequests: a.subagent_requests,
       })),
     };
   }
@@ -423,6 +587,8 @@ function breakdownData() {
       savings: a.savings,
       requests: a.requests,
       cacheRead: a.cache_read,
+      billing: a.billing,
+      subagentRequests: a.subagent_requests,
     })),
   };
 }
@@ -437,13 +603,22 @@ function renderBreakdown() {
       ? (r.rawSavings > 0 ? fmtUsd(r.cost, true) : (r.cacheRead > 0 ? '$0.00' : '—'))
       : (r.priced || r.costKnown ? fmtUsd(r.cost, true, r.costPartial) : 'Unpriced');
     const active = (breakMode === 'model' || breakMode === 'cache') ? (selectedModel === r.key)
-      : (breakMode === 'agent') ? (selectedAgent === r.key) : false;
-    return `<button class="bd-row${active ? ' sel' : ''}" data-key="${esc(r.key)}"${(breakMode === 'model' || breakMode === 'cache') ? ' data-model="1"' : breakMode === 'agent' ? ' data-agent="1"' : ''}>
+      : (breakMode === 'agent') ? (selectedAgent === r.key)
+      : (breakMode === 'project') ? (selectedProject === r.key) : false;
+    const badge = breakMode === 'cache' ? '' : billingBadge(r.billing);
+    // delegated runs are part of the row, so the row says so instead of
+    // quietly mixing a child run into the parent session.
+    const sub = r.subagentRequests > 0
+      ? `<span class="badge badge-sub" title="${r.subagentRequests.toLocaleString()} delegated requests">subagent</span>` : '';
+    const marker = (breakMode === 'model' || breakMode === 'cache') ? ' data-model="1"'
+      : breakMode === 'agent' ? ' data-agent="1"'
+      : breakMode === 'project' ? ' data-project="1"' : '';
+    return `<button class="bd-row${active ? ' sel' : ''}" data-key="${esc(r.key)}"${marker}>
       <span class="share" style="width:${Math.min(100, r.share)}%"></span>
       <span class="rank">${i + 1}</span>
       <span class="cell-logo">${r.logo ? `<img class="logo sm" src="${r.logo}" alt="" onerror="this.remove()">` : ''}</span>
-      <span class="bd-name">${esc(r.name)}${r.extra ? ` <span class="cnt">${esc(r.extra)}</span>` : ''}</span>
-      <span class="bd-cost${(r.priced || r.costKnown || breakMode === 'cache') ? '' : ' unpriced'}">${cost}</span>
+      <span class="bd-name">${esc(r.name)}${r.extra ? ` <span class="cnt">${esc(r.extra)}</span>` : ''}${sub}</span>
+      <span class="bd-cost${(r.priced || r.costKnown || breakMode === 'cache') ? '' : ' unpriced'}">${cost}${badge}</span>
       <span class="bd-num">${r.num}</span>
     </button>`;
   }).join('');
@@ -452,14 +627,23 @@ function renderBreakdown() {
   el.innerHTML = head + body + more;
   document.getElementById('bdMore')?.addEventListener('click', () => { breakAll = true; renderBreakdown(); });
   el.querySelectorAll('.bd-row').forEach(row => row.addEventListener('click', () => {
-    if (breakMode === 'model' || breakMode === 'cache') {
-      selectedModel = selectedModel === row.dataset.key ? null : row.dataset.key;
-      render();
-    } else if (breakMode === 'agent') {
-      selectedAgent = selectedAgent === row.dataset.key ? null : row.dataset.key;
-      render();
-    }
+    selectBreakdownRow(row.dataset.key);
   }));
+}
+
+// A breakdown row is a filter: clicking it narrows the dashboard to that
+// model, agent or project, clicking it again lets go.
+function selectBreakdownRow(key) {
+  if (breakMode === 'model' || breakMode === 'cache') {
+    selectedModel = selectedModel === key ? null : key;
+  } else if (breakMode === 'agent') {
+    selectedAgent = selectedAgent === key ? null : key;
+  } else if (breakMode === 'project') {
+    selectedProject = selectedProject === key ? null : key;
+  } else {
+    return;
+  }
+  render();
 }
 
 // Data Sources reads the last scan, so "not installed" is truthful instead of
@@ -467,46 +651,76 @@ function renderBreakdown() {
 function renderSources() {
   const el = document.getElementById('sourcesList');
   if (!el || !DATA) return;
-  el.innerHTML = (DATA.sources || []).map(s => `<div class="source-item${s.found ? '' : ' off'}">
+  el.innerHTML = (DATA.sources || []).map(s => {
+    const files = s.found ? (s.files ? s.files.toLocaleString() + ' files' : 'found') : 'not installed';
+    // how long the scan of this source took, when the collector measured it
+    const scan = s.scan_ms ? ' · ' + Math.round(s.scan_ms).toLocaleString() + ' ms' : '';
+    return `<div class="source-item${s.found ? '' : ' off'}">
     <div class="source-name"><span class="dot"></span><b>${esc(s.agent)}</b> <code>${esc(s.path)}</code></div>
-    <div class="source-metrics">${s.found ? (s.files ? s.files.toLocaleString() + ' files' : 'found') : 'not installed'}</div>
-  </div>`).join('') || '<div class="source-metrics">No sources reported by the last scan.</div>';
+    <div class="source-metrics">${files}${scan}</div>
+  </div>`;
+  }).join('') || '<div class="source-metrics">No sources reported by the last scan.</div>';
+}
+
+// Artifacts the agents published: a plain list of links, hidden when there
+// are none so the dashboard does not carry an empty section.
+function renderArtifacts() {
+  const sec = document.getElementById('artifacts');
+  if (!sec || !DATA) return;
+  const list = DATA.artifacts || [];
+  sec.hidden = !list.length;
+  if (!list.length) return;
+  document.getElementById('artifactList').innerHTML = list.map(a =>
+    `<a class="artifact" href="${esc(a.url)}" target="_blank" rel="noopener noreferrer">
+      <img class="logo sm" src="${agentLogo(a.agent)}" alt="" onerror="this.style.visibility='hidden'">
+      <span class="atitle">${esc(a.title || a.url)}</span>
+      <span class="ameta">${esc(a.agent)} · ${esc(a.day)}</span>
+    </a>`).join('');
 }
 
 // the visible breakdown, as CSV
-function exportCSV() {
+function breakdownCSV() {
   const { rows } = breakdownData();
-  let headers = 'rank,name,cost_usd,tokens,share_percent';
+  const quote = v => `"${String(v).replace(/"/g, '""')}"`;
+  let headers = 'rank,name,cost_usd,tokens,share_percent,billing';
   let lines;
   if (breakMode === 'cache') {
     headers = 'rank,model,savings_usd,hit_rate_percent,cache_read_tokens';
     lines = rows.map((r, i) => [
       i + 1,
-      `"${String(r.name).replace(/"/g, '""')}"`,
+      quote(r.name),
       r.rawSavings ? r.rawSavings.toFixed(4) : '0.0000',
       r.hitRate ? r.hitRate.toFixed(2) : '0.00',
       r.cacheRead || 0
     ].join(','));
-  } else if (breakMode === 'agent') {
-    headers = 'rank,agent,cost_usd,metric_value,share_percent,cache_savings_usd';
+  } else if (breakMode === 'agent' || breakMode === 'project') {
+    headers = breakMode === 'project'
+      ? 'rank,project,cost_usd,metric_value,share_percent,cache_savings_usd,billing'
+      : 'rank,agent,cost_usd,metric_value,share_percent,cache_savings_usd,billing';
     lines = rows.map((r, i) => [
       i + 1,
-      `"${String(r.name).replace(/"/g, '""')}"`,
+      quote(r.name),
       (r.priced || r.costKnown) ? r.cost.toFixed(4) : '',
-      `"${String(r.num).replace(/"/g, '""')}"`,
+      quote(r.num),
       r.share.toFixed(2),
-      r.savings ? r.savings.toFixed(4) : '0.0000'
+      r.savings ? r.savings.toFixed(4) : '0.0000',
+      billingMode(r.billing)
     ].join(','));
   } else {
     lines = rows.map((r, i) => [
       i + 1,
-      `"${String(r.name).replace(/"/g, '""')}"`,
+      quote(r.name),
       (r.priced || r.costKnown) ? r.cost.toFixed(4) : '',
-      `"${String(r.num).replace(/"/g, '""')}"`,
-      r.share.toFixed(2)
+      quote(r.num),
+      r.share.toFixed(2),
+      billingMode(r.billing)
     ].join(','));
   }
-  const csv = [headers].concat(lines).join('\n');
+  return [headers].concat(lines).join('\n');
+}
+
+function exportCSV() {
+  const csv = breakdownCSV();
   const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
   const a = document.createElement('a');
   a.href = url;
@@ -712,17 +926,110 @@ function untilReset(seconds) {
   return 'in ' + Math.round(hours / 24) + 'd';
 }
 
+// The same vocabulary the reset countdown uses, pointing back instead of
+// forward: how old the live quota snapshot is.
+function sinceAgo(iso) {
+  const then = Date.parse(iso || '');
+  if (!Number.isFinite(then)) return '';
+  const secs = (Date.now() - then) / 1000;
+  if (secs < 60) return 'just now';
+  const mins = secs / 60;
+  if (mins < 60) return Math.round(mins) + 'm ago';
+  const hours = mins / 60;
+  if (hours < 48) return (hours < 10 ? hours.toFixed(1) : Math.round(hours)) + 'h ago';
+  return Math.round(hours / 24) + 'd ago';
+}
+
+// The things worth interrupting the user about, worst first. Nothing is drawn
+// when there is nothing wrong: an empty section would only add noise.
+function renderAlerts() {
+  const alerts = (DATA && DATA.alerts) || [];
+  if (!alerts.length) return '';
+  return `<div class="alerts">` + alerts.map(a => {
+    const critical = a.severity === 'critical';
+    const colour = critical ? 'var(--bad)' : 'var(--warn)';
+    return `<div class="alert-row ${critical ? 'crit' : 'warn'}">
+      <div class="alert-title" style="color:${colour}">${esc(a.title || '')}</div>
+      <div class="alert-detail">${esc(a.detail || '')}</div>
+    </div>`;
+  }).join('') + '</div>';
+}
+
+// The count of active alerts rides on the Limits button, so a quota problem
+// is visible without opening the view.
+function renderAlertBadge() {
+  const n = ((DATA && DATA.alerts) || []).length;
+  const btn = document.querySelector('#view button[data-v="limits"]');
+  if (btn) {
+    btn.innerHTML = n ? `Limits <span id="limitsAlertBadge" class="alert-badge">${n}</span>` : 'Limits';
+    btn.title = n ? `${n} active alert${n === 1 ? '' : 's'}` : '';
+  }
+  const badge = document.getElementById('limitsAlertBadge');
+  if (badge) {
+    badge.textContent = n ? String(n) : '';
+    badge.hidden = !n;
+  }
+}
+
+// What the declared plans look like against this month's usage. A budget is
+// a limit on spending and burns down, so it gets a bar. A plan is a flat
+// rate the user pays: the work is worth more than the plan costs, and it
+// must never be drawn as something that is being used up.
+function renderPlanStatus() {
+  const plans = (DATA && DATA.plans) || [];
+  if (!plans.length) return '';
+  const rows = plans.map(p => {
+    const logo = `<img class="logo sm" src="${agentLogo(p.agent)}" alt="" onerror="this.style.visibility='hidden'">`;
+    if (p.kind === 'budget') {
+      const pct = Math.min(100, Math.max(0, p.percent || 0));
+      const colour = pct > 80 ? 'var(--bad)' : pct > 50 ? 'var(--warn)' : 'var(--accent)';
+      return `<div class="lrow plan-row budget">
+        <div class="lh">
+          <div class="lh-left">${logo}<span>${esc(p.agent)}</span>
+            <span class="badge badge-budget" title="A limit on spending: it burns down as the month goes on">Budget</span>
+          </div>
+          <span class="pct" style="color:${colour}">${Math.round(pct)}%</span>
+        </div>
+        <div class="track"><i class="bar" style="width:${pct}%;background:${colour}"></i></div>
+        <div class="lm"><span>${fmtUsdCents(p.used)} of your ${fmtUsdCents(p.limit)} budget (${Math.round(pct)}%)</span></div>
+      </div>`;
+    }
+    const multiple = p.multiple || 0;
+    const label = p.label || p.agent;
+    return `<div class="lrow plan-row subscription">
+      <div class="lh">
+        <div class="lh-left">${logo}<span>${esc(p.agent)}</span>
+          <span class="badge badge-plan" title="A flat rate you pay: the provider's quota window is the limit, not the price">Plan</span>
+        </div>
+        <span class="pct" style="color:var(--accent)">${multiple.toFixed(1)}x</span>
+      </div>
+      <div class="lm"><span>${esc(label)} · ${fmtUsdCents(p.limit)} a month · the work was worth ${fmtUsdCents(p.used)} (${multiple.toFixed(1)}x the plan)</span></div>
+      <div class="plan-note">The plan price is what you pay each month. ${fmtUsdCents(p.used)} is what the work was worth at list prices, not an amount you pay.</div>
+    </div>`;
+  }).join('');
+  return `<h3 style="margin-top:0">Plans &amp; budgets</h3>${rows}`;
+}
+
 function renderLimits() {
   const box = document.getElementById('limitsView');
   const limits = [...(DATA.limits || [])].sort((a, b) => b.used_percent - a.used_percent);
+  const quotaError = DATA.quota_error || '';
+  const snapshot = sinceAgo(DATA.quota_checked_at);
+  // a provider that could not be read is worth saying out loud: the window
+  // below is then the last thing the logs knew, not the current state.
+  const quotaNote = quotaError
+    ? `<p class="limits-note">Live quotas could not be read: ${esc(quotaError)}</p>` : '';
+  // the alerts and the declared plans come first: they are what the user
+  // came to this view for.
+  const head = renderAlerts() + renderPlanStatus();
+  const rateTitle = `<h3${head ? '' : ' style="margin-top:0"'}>Rate limits</h3>`;
   if (!limits.length) {
-    box.innerHTML = `<div class="limits"><h3 style="margin-top:0">Rate limits</h3>
+    box.innerHTML = `<div class="limits">${head}${rateTitle}${quotaNote}
       <p style="color:var(--dim)">No agent reported rate-limit usage in the scanned logs.<br>
       Only Codex writes plan limits into its session files (5h / weekly windows).</p></div>`;
     return;
   }
-  box.innerHTML = `<div class="limits"><h3 style="margin-top:0">Rate limits</h3>` + limits.map(l => {
-    const pct = Math.min(100, Math.max(0, l.used_percent));
+  box.innerHTML = `<div class="limits">${head}${rateTitle}${quotaNote}` + limits.map(l => {    const pct = Math.min(100, Math.max(0, l.used_percent));
     const colour = pct > 80 ? 'var(--bad)' : pct > 50 ? 'var(--warn)' : 'var(--accent)';
 
     // Burn-rate projection: how much of the window is gone vs how much of the
@@ -784,21 +1091,38 @@ function renderLimits() {
       ? `<span class="burn-vel" title="Observed consumption pace">⚡ ${burnRatePerHour.toFixed(1)}%/hr</span>`
       : '';
 
+    // a live window comes from the provider, so it carries its own badge and
+    // the provider's own description of the window.
+    const live = l.source === 'live';
+    const liveBadge = live
+      ? `<span class="badge badge-live" title="Read from the provider's live quota API">live</span>` : '';
+    const windowText = live ? (l.detail || `${l.window} window`) : `${l.window} window`;
+    const taken = live && snapshot ? ` · updated ${snapshot}` : '';
+
+    // a provider that counts its allowance in money says so in money, not in
+    // percent: the percentage alone would hide how much is left.
+    const amount = l.limit_amount > 0
+      ? `<span class="lm-amount">${fmtUsdCents(l.used_amount)} of ${fmtUsdCents(l.limit_amount)}</span>` : '';
+
     return `<div class="lrow">
       <div class="lh">
         <div class="lh-left">
           <img class="logo sm" src="${agentLogo(l.agent)}" alt="" onerror="this.style.visibility='hidden'">
-          <span>${esc(l.agent)} · ${esc(l.window)} window${l.plan ? ' · ' + esc(l.plan) : ''}</span>
+          <span>${esc(l.agent)} · ${esc(windowText)}${l.plan ? ' · ' + esc(l.plan) : ''}</span>
+          ${liveBadge}
           ${badge}
         </div>
-        <span class="pct" style="color:${colour}">${pct.toFixed(0)}%</span>
+        <div class="lh-right">
+          <span class="pct" style="color:${colour}">${pct.toFixed(0)}%</span>
+          ${amount}
+        </div>
       </div>
       <div class="track">
         <i class="bar" style="width:${pct}%;background:${colour}"></i>
         ${paceMarker}
       </div>
       <div class="lm">
-        <span>${windowLabel(l.window_minutes)} · ${reset}${note}</span>
+        <span>${windowLabel(l.window_minutes)} · ${reset}${note}${taken}</span>
         ${velText}
       </div>
     </div>`;
@@ -879,6 +1203,7 @@ document.getElementById('crumb').addEventListener('click', e => {
   const b = e.target.closest?.('button[data-clear]');
   if (!b) return;
   if (b.dataset.clear === 'agent') selectedAgent = null;
+  else if (b.dataset.clear === 'project') selectedProject = null;
   else selectedModel = null;
   render();
 });
@@ -921,6 +1246,10 @@ function switchSettingsTab(tabName) {
     panel.classList?.add('on');
   }
 
+  // the plans tab shows what the user declared, so it reads the declarations
+  // every time the tab is opened
+  if (tabName === 'plans') loadPlans();
+
   const modalTitle = document.getElementById('modalTitle');
   if (modalTitle) {
     if (tabName === 'updates' && UPDATE_INFO && UPDATE_INFO.available) {
@@ -961,6 +1290,110 @@ function openSettings(tabName = 'updates') {
   const modal = document.getElementById('updateModal');
   if (modal) modal.hidden = false;
 }
+
+// ---------- plans and budgets ----------
+// What the user declared: a plan is a flat rate they pay, a budget is a
+// limit on what they may spend. The declarations live on disk, so they are
+// read and written through commands instead of being kept in the page.
+let PLANS = [];
+
+// the agents Cinder knows about: the ones it has a colour for, plus the ones
+// the scanned logs mention.
+function knownAgents() {
+  const seen = new Set(Object.keys(AGENT_COLORS));
+  for (const r of ((DATA && DATA.rows) || [])) if (r.agent) seen.add(r.agent);
+  return [...seen].sort();
+}
+
+function planRow(p, i) {
+  const kind = p.kind === 'budget' ? 'budget' : 'subscription';
+  return `<div class="plan-edit" data-i="${i}">
+    <input class="pe-agent" data-i="${i}" data-f="agent" list="planAgents" value="${esc(p.agent || '')}" placeholder="Agent">
+    <select class="pe-kind" data-i="${i}" data-f="kind">
+      <option value="subscription"${kind === 'subscription' ? ' selected' : ''}>Subscription</option>
+      <option value="budget"${kind === 'budget' ? ' selected' : ''}>Budget</option>
+    </select>
+    <input class="pe-limit" data-i="${i}" data-f="limit" type="number" min="0" step="0.01" value="${p.limit > 0 ? esc(String(p.limit)) : ''}" placeholder="0.00">
+    <input class="pe-label" data-i="${i}" data-f="label" value="${esc(p.label || '')}" placeholder="Label">
+    <button class="pe-del" data-i="${i}" title="Remove this declaration">&times;</button>
+  </div>`;
+}
+
+function renderPlans() {
+  const list = document.getElementById('plansList');
+  if (list) {
+    list.innerHTML = PLANS.map(planRow).join('') ||
+      '<div class="plans-empty">Nothing declared yet. A plan says what an agent costs you a month; a budget says how much you may spend.</div>';
+  }
+  const dl = document.getElementById('planAgents');
+  if (dl) dl.innerHTML = knownAgents().map(a => `<option value="${esc(a)}"></option>`).join('');
+}
+
+async function loadPlans() {
+  renderPlans();
+  try {
+    const plans = await invokeCmd('get_plans');
+    PLANS = Array.isArray(plans) ? plans : [];
+  } catch (e) {
+    // no backend to ask: keep the declarations already on screen
+  }
+  renderPlans();
+}
+
+async function savePlans() {
+  const btn = document.getElementById('plansSaveBtn');
+  const status = document.getElementById('plansStatus');
+  // a declaration without a limit says nothing, so it is never sent
+  const rows = PLANS
+    .filter(p => p.agent && Number(p.limit) > 0)
+    .map(p => ({
+      agent: p.agent,
+      kind: p.kind === 'budget' ? 'budget' : 'subscription',
+      limit: Number(p.limit),
+      label: p.label || '',
+    }));
+  if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
+  try {
+    const saved = await invokeCmd('set_plans', { plans: rows });
+    PLANS = Array.isArray(saved) ? saved : rows;
+    renderPlans();
+    if (status) { status.className = 'plans-status'; status.textContent = 'Saved.'; }
+    // the limits view reads the plans out of the stats, so they need a fresh
+    // scan before the new declaration shows up there.
+    load();
+  } catch (e) {
+    if (status) { status.className = 'plans-status bad'; status.textContent = 'Could not save: ' + e; }
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Save'; }
+  }
+}
+
+// the rows are the truth, so every field writes straight back into them
+function planField(e) {
+  const el = e.target;
+  if (!el || !el.dataset || el.dataset.i === undefined) return;
+  const p = PLANS[Number(el.dataset.i)];
+  if (!p) return;
+  const f = el.dataset.f;
+  if (f === 'agent') p.agent = el.value;
+  else if (f === 'kind') p.kind = el.value;
+  else if (f === 'limit') p.limit = Number(el.value);
+  else if (f === 'label') p.label = el.value;
+}
+
+document.getElementById('plansAddBtn')?.addEventListener('click', () => {
+  PLANS.push({ agent: '', kind: 'subscription', limit: 0, label: '' });
+  renderPlans();
+});
+document.getElementById('plansList')?.addEventListener('click', e => {
+  const b = e.target?.closest?.('.pe-del');
+  if (!b) return;
+  PLANS.splice(Number(b.dataset.i), 1);
+  renderPlans();
+});
+document.getElementById('plansList')?.addEventListener('input', planField);
+document.getElementById('plansList')?.addEventListener('change', planField);
+document.getElementById('plansSaveBtn')?.addEventListener('click', savePlans);
 
 function showUpdateModal(info, isUpToDateMessage = false) {
   const modal = document.getElementById('updateModal');

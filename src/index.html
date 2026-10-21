@@ -43,9 +43,13 @@
 
   <main id="dash">
     <section class="hero">
-      <div id="bigTotal" class="big">—</div>
+      <div class="big-row">
+        <div id="bigTotal" class="big">—</div>
+        <span id="bigBadge" class="badge" hidden></span>
+      </div>
       <div id="bigSub" class="sub">&nbsp;</div>
       <div id="bigDelta" class="delta"></div>
+      <div id="bigSaved" class="saved" hidden></div>
     </section>
 
     <section class="left">
@@ -65,6 +69,7 @@
             <button data-v="model" class="on">Model</button>
             <button data-v="day">Day</button>
             <button data-v="agent">Agent</button>
+            <button data-v="project">Project</button>
             <button data-v="cache">Cache</button>
           </div>
           <button id="exportBtn" class="mini-btn" title="Export as CSV">CSV</button>
@@ -77,6 +82,11 @@
       <h3 id="chartTitle">Daily processed tokens</h3>
       <div id="chartLegend" class="chart-legend"></div>
       <div id="chart" class="chart"></div>
+    </section>
+
+    <section class="artifacts" id="artifacts" hidden>
+      <h3>Artifacts</h3>
+      <div id="artifactList" class="artifact-list"></div>
     </section>
   </main>
 
@@ -111,6 +121,7 @@
           <span id="tabUpdateDot" class="update-dot" hidden></span>
         </button>
         <button class="settings-tab" data-tab="preferences" id="tabPreferences">Preferences</button>
+        <button class="settings-tab" data-tab="plans" id="tabPlans">Plans</button>
         <button class="settings-tab" data-tab="sources" id="tabSources">Data Sources</button>
         <button class="settings-tab" data-tab="about" id="tabAbout">About</button>
       </div>
@@ -188,7 +199,19 @@
           </div>
         </div>
 
-        <!-- 3. DATA SOURCES TAB PANEL -->
+        <!-- 3. PLANS TAB PANEL -->
+        <div class="tab-panel" id="panelPlans" hidden>
+          <div class="plans-intro">A plan is a flat rate you pay each month; a budget is a limit on what you may spend. Cinder prices every token at list prices, so the figure it shows against a plan is the value of the work, not an amount you pay.</div>
+          <div class="plans-list" id="plansList"></div>
+          <div class="plans-actions">
+            <button id="plansAddBtn" class="modal-btn secondary">Add</button>
+            <button id="plansSaveBtn" class="modal-btn primary">Save</button>
+          </div>
+          <div class="plans-status" id="plansStatus"></div>
+          <datalist id="planAgents"></datalist>
+        </div>
+
+        <!-- 4. DATA SOURCES TAB PANEL -->
         <div class="tab-panel" id="panelSources" hidden>
           <div class="sources-intro">Cinder parses local logs and SQLite stores directly on this machine, with no network transfer. This list is read live from your machine:</div>
           <div class="sources-list" id="sourcesList"></div>
@@ -197,7 +220,7 @@
           </div>
         </div>
 
-        <!-- 4. ABOUT TAB PANEL -->
+        <!-- 5. ABOUT TAB PANEL -->
         <div class="tab-panel" id="panelAbout" hidden>
           <div class="about-hero">
             <div class="about-name">Cinder</div>

@@ -56,6 +56,10 @@ works and serialises with the watcher through a shared scan lock.
 | Antigravity | `~/.gemini/antigravity*/` + T3 `~/.t3/userdata/statev2.sqlite` and `~/.t3/userdata/providers/antigravity/*/antigravity-acp` | requests, tools, sessions, T3-reported tokens; API cost estimated |
 | DSH | `~/.dsh/sessions/**/session.v4.jsonl.zstd` | requests, tokens, tools, sessions, models; cost estimated |
 | LM Studio | `~/.lmstudio/conversations/*.conversation.json` | requests, sessions, models (no token/cost) |
+| Cursor | `~/.cursor/chats/**` + `~/.cursor/cli-chats/**` | requests, tokens, models |
+| GitHub Copilot | `~/.copilot/history-session-state/**` + `~/.copilot/logs/**` | requests, tokens, models |
+| Gemini CLI | `~/.gemini/tmp/**` + `~/.gemini/sessions/**` | requests, tokens, models |
+| Cline | VS Code `globalStorage/saoudrizwan.claude-dev/**` | requests, tokens, models |
 
 Agents that log no token or cost field (older Antigravity IDE transcripts) are
 still fully visible: use the **Requests** metric. Cost/tokens views show a `—`
@@ -66,14 +70,123 @@ Daily ranges use UTC dates; **Today** is a UTC calendar day, not a rolling
 24-hour window. Costs marked **≥** exclude some unpriced token usage. Codex
 cache counts are kept as reported, without borrowing ratios from other agents.
 
+## What the numbers mean
+
+Cinder prices every token against public list prices, so the dollar figure is
+an **equivalent value**, never an invoice. Each row carries the billing mode
+it was collected under, and the dashboard says which one it is looking at:
+
+- **Plan** — the route is covered by a flat-rate plan (Claude Pro/Max, ChatGPT,
+  Copilot, the Antigravity plan). The card is not charged per token.
+- **API** — billed per token through a provider key.
+- **Local** — local inference, so no provider bill at all. Local runs also show
+  what the same tokens would have cost on a cloud model.
+
+The mode is read from the agent's own credential file where there is one:
+`~/.claude/.credentials.json` says whether Claude Code runs on a subscription or
+an API key, and `~/.codex/auth.json` says the same for Codex. Where there is
+no such evidence, the row is left unlabelled rather than guessed.
+
+## Projects, worktrees and subagents
+
+A run is attributed to the repository it happened in. A git worktree is
+resolved back to its main checkout (through the `gitdir:` pointer in its
+`.git` file), so every branch of a repository counts as one project instead of
+several. A checkout that has since been cleaned up still rolls up through the
+`worktrees` folder it lived in.
+
+A delegated child run (Claude Code writes it to `<session>/subagents/`) is
+counted once, on its own row, badged as a subagent and tagged with the model
+it actually ran on — which is often a cheaper one than its parent.
+
+## Live quotas
+
+The **Limits** view shows two kinds of window: the ones an agent wrote into
+its own session files, and the ones fetched live from the provider. The live
+ones use the OAuth token the agent already stored on disk, and are refreshed
+every five minutes in the background, so a scan never waits on the network.
+
+| Agent | Where the credential is | Endpoint |
+|---|---|---|
+| Claude Code | `~/.claude/.credentials.json` | `api.anthropic.com/api/oauth/usage` |
+| Codex | `~/.codex/auth.json` | `chatgpt.com/backend-api/wham/usage` |
+| GitHub Copilot | `~/.config/github-copilot/apps.json` | `api.github.com/copilot_internal/user` |
+| Gemini CLI | `~/.gemini/oauth_creds.json` | `cloudcode-pa.googleapis.com` |
+| OpenCode | `OPENCODE_API_KEY` or `~/.local/share/opencode/auth.json` | `opencode.ai/api/usage` |
+
+A provider that is not signed in is skipped; one that is signed in but fails
+says so in the panel instead of showing a stale number. A window whose reset
+time has already passed is dropped rather than shown as if it were still
+running.
+
+## Alerts
+
+Cinder watches the live windows and says something when they are about to run
+out. A window is projected forward from how fast it is being consumed, so a
+window that is 40% used a tenth of the way through will not last:
+
+- **critical** — the window is nearly spent, or it will run out before it
+  resets.
+- **warn** — the window is on pace to use most of it.
+
+The alert appears at the top of the Limits view, and the Limits button carries
+a count so a problem is visible without opening the view. The first time an
+alert shows up it also arrives as a desktop notification; the same alert is
+not announced twice, and one that clears is forgotten so it can fire again
+later.
+
+## Plans and budgets
+
+A **plan** is a flat rate you pay each month (Claude Pro, ChatGPT Plus) and a
+**budget** is a limit on what you may spend. They are not the same thing, and
+the dashboard keeps them apart:
+
+- A **budget** burns down: "$12.40 of your $50.00 budget (25%)", and crossing
+  80% raises an alert.
+- A **plan** does not. Cinder prices every token at list prices, so the
+  figure it shows against a plan is the *value of the work delivered*, not an
+  amount you pay. It reads "Claude Pro · $20.00 a month · the work was worth
+  $142.50 (7.1x the plan)". The limit on a plan is the provider's quota
+  window, not a dollar amount, so a plan never raises a budget alert.
+
+Declare them in **Settings → Plans**. They are stored in `~/.cinder/plans.json`
+and are read against the current month.
+
+## System tray
+
+Cinder puts an icon in the tray whose tooltip carries the live quota
+percentages, so the window that matters can be read without opening the app.
+Left-click brings the dashboard back, right-click opens **Open Cinder**,
+**Rescan now** and **Quit Cinder**.
+
+## Speed
+
+The session logs on a busy machine run to gigabytes, and a scan has to find
+the few lines in them that can change a number. Two things make that fast:
+
+- Every line is screened for a handful of marker strings with
+  [FFF](https://github.com/dmtrKovalenko/fff)'s SIMD substring search before
+  it is ever handed to `serde_json`. It picks the two rarest bytes of the
+  needle and compares them in parallel, which is about 1.4x faster than
+  `str::contains` over the same lines.
+- The OpenCode database is aggregated inside SQLite rather than by pulling
+  every message's JSON into Rust, which took the source from 19 s to under 2 s.
+
+A warm scan (nothing changed since the last one) of a machine with 1.7 GB of
+logs now takes about 2 s, and the **Data sources** panel shows how long each
+source took.
+
 ## Using the dashboard
 
 - **Filters stack**: click an agent row, then a model row, to narrow every panel
   at once. The breadcrumb has one click per segment to undo it.
 - **Chart**: click a legend chip to hide an agent. Ranges over six weeks bucket
   into weeks, and the dashed line is the previous period of the same length.
-- **Breakdown**: switch between **Model**, **Day**, **Agent**, and **Cache** views; rows are clickable filters, **Show all** lists every row, and **CSV** exports the tailored dataset.
-- **Limits**: a *view* (`Usage | Limits`), not a metric. Features burn-rate pacing (`⚡ %/hr`), visual quota health badges (`On Pace`, `Elevated`, `Exhaustion Risk`), linear pace markers on the progress track, and depletion ETA forecasts.
+- **Breakdown**: switch between **Model**, **Day**, **Agent**, **Cache** and
+  **Project** views; rows are clickable filters, **Show all** lists every row,
+  and **CSV** exports the tailored dataset.
+- **Limits**: a *view* (`Usage | Limits`), not a metric. Features burn-rate pacing (`⚡ %/hr`), visual quota health badges (`On Pace`, `Elevated`, `Exhaustion Risk`), linear pace markers on the progress track, and depletion ETA forecasts. Live windows are badged **live**, and the alerts and declared plans sit above them.
+- **Artifacts**: the links the agents published during the scanned period.
 - **Keys**: `1`–`4` cost / tokens / requests / limits, `R` refresh, `S` settings,
   `Esc` closes a modal. Window size and position are remembered between launches.
 
@@ -86,4 +199,10 @@ cargo test --manifest-path src-tauri/Cargo.toml  # synthetic logs and databases
 
 Tests use temporary home directories, not your real agent logs.
 
-Add agents by extending `parse_*` functions in `src-tauri/src/main.rs`.
+`cargo test --manifest-path src-tauri/Cargo.toml -- --ignored real_home_scan`
+scans the machine you are on and prints what it found, for a human to eyeball.
+`-- --ignored live_quota_check` asks the providers for their live quota, which
+reaches the network.
+
+Add agents by extending `parse_*` functions in `src-tauri/src/main.rs` and
+`src-tauri/src/agents.rs`.
