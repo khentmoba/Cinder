@@ -160,7 +160,9 @@ blanks the panel.
 
 > `CINDER_TRAY_POPOVER=1 cinder` opens the popover at start-up, which is how
 > it is checked without a mouse. `CINDER_DEBUG=1` prints what the tray is
-> doing to the console.
+> doing to the console. `scripts/screenshot.ps1` and `scripts/tray-click.ps1`
+> take a picture of the screen and click the tray icon through UI Automation,
+> so the popover can be looked at on a machine with no hands on the mouse.
 
 ## Live quotas, and keeping them true
 
