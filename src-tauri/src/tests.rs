@@ -691,3 +691,49 @@ fn real_home_scan() {
         println!("  subagent row agent={} model={} project={}", r.agent, r.model, r.project);
     }
 }
+
+/// Prints the rows for one agent on one day, so they can be checked against
+/// the raw logs by something that does not share the collector's code.
+///
+/// `cargo test --bin cinder -- --ignored --nocapture real_home_day_check`
+///
+/// The day and the agent can be chosen with `CINDER_CHECK_DAY` and
+/// `CINDER_CHECK_AGENT`; the day before yesterday is the default, because
+/// today is still being written to.
+#[test]
+#[ignore]
+fn real_home_day_check() {
+    let home = dirs::home_dir().unwrap();
+    let day = std::env::var("CINDER_CHECK_DAY")
+        .unwrap_or_else(|_| unix_day(now_secs() - 2 * 86_400));
+    let agent = std::env::var("CINDER_CHECK_AGENT").unwrap_or_else(|_| "Claude Code".to_string());
+    let stats = scan_home(&home, &|_| {});
+    let mut rows: Vec<&Row> = stats
+        .rows
+        .iter()
+        .filter(|r| r.day == day && r.agent == agent)
+        .collect();
+    rows.sort_by(|a, b| a.model.cmp(&b.model).then(a.project.cmp(&b.project)));
+    println!("DAY\t{day}\t{agent}");
+    // Every row on its own, so a gap can be traced to a project.
+    for r in &rows {
+        println!(
+            "DETAIL\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            r.model, r.project, r.subagent, r.requests, r.input, r.cache_read, r.cache_write, r.output
+        );
+    }
+    // And the same numbers per model, which is what another implementation of
+    // the collector can be compared against.
+    let mut per_model: std::collections::BTreeMap<String, (u64, u64, u64, u64, u64)> = Default::default();
+    for r in &rows {
+        let e = per_model.entry(r.model.clone()).or_default();
+        e.0 += r.requests;
+        e.1 += r.input;
+        e.2 += r.cache_read;
+        e.3 += r.cache_write;
+        e.4 += r.output;
+    }
+    for (model, (requests, input, cache_read, cache_write, output)) in per_model {
+        println!("ROW\t{model}\t{requests}\t{input}\t{cache_read}\t{cache_write}\t{output}");
+    }
+}
