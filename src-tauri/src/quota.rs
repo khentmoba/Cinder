@@ -102,6 +102,18 @@ pub struct QuotaReport {
     pub account: String,
 }
 
+/// The report for a provider that could not be matched to a sign-in.
+///
+/// No sign-in at all is not a problem worth a card: the agent is simply not
+/// used here. A sign-in that could not be read is a problem, and it is said
+/// out loud.
+fn unmatched(agent: &str, problems: Vec<String>) -> QuotaReport {
+    if problems.is_empty() {
+        return QuotaReport::absent(agent);
+    }
+    QuotaReport::failed(agent, ErrorKind::Unauthorized, problems.join("; "))
+}
+
 impl QuotaReport {
     pub fn ok(agent: &str, windows: Vec<LiveQuota>) -> Self {
         Self {
@@ -327,15 +339,34 @@ fn config_dirs(home: &Path, env: &str, default: &str) -> Vec<PathBuf> {
     dirs
 }
 
-/// The Claude Code accounts signed in on this machine.
-fn claude_credentials(home: &Path) -> Vec<Credential> {
+/// The Claude Code accounts signed in on this machine, and what went wrong
+/// where there is a sign-in but it could not be read.
+///
+/// A credential file that exists but cannot be parsed is not the same as no
+/// sign-in at all: the user is signed in and something is wrong, and the card
+/// has to say which.
+fn claude_credentials(home: &Path) -> (Vec<Credential>, Vec<String>) {
     let mut out = Vec::new();
+    let mut problems = Vec::new();
     for dir in config_dirs(home, "CLAUDE_CONFIG_DIR", ".claude") {
         let path = dir.join(".credentials.json");
-        let Some(v) = read_json(&path) else { continue };
-        let Some(o) = v.get("claudeAiOauth") else { continue };
-        let Some(token) = o.get("accessToken").and_then(|x| x.as_str()) else { continue };
+        if !path.exists() {
+            continue;
+        }
+        let Some(v) = read_json(&path) else {
+            problems.push(format!("{} could not be read", path.display()));
+            continue;
+        };
+        let Some(o) = v.get("claudeAiOauth") else {
+            problems.push(format!("{} holds no sign-in", path.display()));
+            continue;
+        };
+        let Some(token) = o.get("accessToken").and_then(|x| x.as_str()) else {
+            problems.push(format!("{} holds no access token", path.display()));
+            continue;
+        };
         if token.trim().is_empty() {
+            problems.push(format!("{} holds an empty access token", path.display()));
             continue;
         }
         let (mut account, mut expires_at) = token_identity(token);
@@ -357,18 +388,33 @@ fn claude_credentials(home: &Path) -> Vec<Credential> {
             account,
         });
     }
-    out
+    (out, problems)
 }
 
-/// The ChatGPT accounts Codex is signed in with on this machine.
-fn codex_credentials(home: &Path) -> Vec<Credential> {
+/// The ChatGPT accounts Codex is signed in with on this machine, and what went
+/// wrong where there is a sign-in but it could not be read.
+fn codex_credentials(home: &Path) -> (Vec<Credential>, Vec<String>) {
     let mut out = Vec::new();
+    let mut problems = Vec::new();
     for dir in config_dirs(home, "CODEX_HOME", ".codex") {
         let path = dir.join("auth.json");
-        let Some(v) = read_json(&path) else { continue };
-        let Some(t) = v.get("tokens") else { continue };
-        let Some(token) = t.get("access_token").and_then(|x| x.as_str()) else { continue };
+        if !path.exists() {
+            continue;
+        }
+        let Some(v) = read_json(&path) else {
+            problems.push(format!("{} could not be read", path.display()));
+            continue;
+        };
+        let Some(t) = v.get("tokens") else {
+            problems.push(format!("{} holds no sign-in", path.display()));
+            continue;
+        };
+        let Some(token) = t.get("access_token").and_then(|x| x.as_str()) else {
+            problems.push(format!("{} holds no access token", path.display()));
+            continue;
+        };
         if token.trim().is_empty() {
+            problems.push(format!("{} holds an empty access token", path.display()));
             continue;
         }
         let (mut account, expires_at) = token_identity(token);
@@ -384,11 +430,11 @@ fn codex_credentials(home: &Path) -> Vec<Credential> {
             account,
         });
     }
-    out
+    (out, problems)
 }
 
 /// The GitHub token the Copilot extension stores.
-fn copilot_token(home: &Path) -> Option<String> {
+fn copilot_token(home: &Path) -> (Option<String>, Vec<String>) {
     let mut candidates = vec![
         home.join(".config").join("github-copilot").join("apps.json"),
         home.join(".config").join("github-copilot").join("hosts.json"),
@@ -400,47 +446,74 @@ fn copilot_token(home: &Path) -> Option<String> {
             candidates.push(base.join("hosts.json"));
         }
     }
+    let mut problems = Vec::new();
     for path in candidates {
-        let Some(v) = read_json(&path) else { continue };
+        if !path.exists() {
+            continue;
+        }
+        let Some(v) = read_json(&path) else {
+            problems.push(format!("{} could not be read", path.display()));
+            continue;
+        };
         // Both shapes are maps of account id -> credential object.
-        let Some(accounts) = v.as_object() else { continue };
+        let Some(accounts) = v.as_object() else {
+            problems.push(format!("{} holds no sign-in", path.display()));
+            continue;
+        };
         for (_id, cred) in accounts {
             if let Some(t) = str_at(cred, &["oauth_token", "token", "access_token"]) {
-                return Some(t);
+                return (Some(t), problems);
             }
         }
+        problems.push(format!("{} holds no access token", path.display()));
     }
-    None
+    (None, problems)
 }
 
 /// The Google access token the Gemini CLI stores.
-fn gemini_token(home: &Path) -> Option<String> {
+fn gemini_token(home: &Path) -> (Option<String>, Vec<String>) {
+    let mut problems = Vec::new();
     for path in [home.join(".gemini").join("oauth_creds.json")] {
-        let Some(v) = read_json(&path) else { continue };
-        if let Some(t) = str_at(&v, &["access_token", "accessToken"]) {
-            return Some(t);
+        if !path.exists() {
+            continue;
         }
+        let Some(v) = read_json(&path) else {
+            problems.push(format!("{} could not be read", path.display()));
+            continue;
+        };
+        if let Some(t) = str_at(&v, &["access_token", "accessToken"]) {
+            return (Some(t), problems);
+        }
+        problems.push(format!("{} holds no access token", path.display()));
     }
-    None
+    (None, problems)
 }
 
 /// The OpenCode API key, if the user configured one.
-fn opencode_token(home: &Path) -> Option<String> {
+fn opencode_token(home: &Path) -> (Option<String>, Vec<String>) {
     if let Ok(t) = std::env::var("OPENCODE_API_KEY") {
         if !t.trim().is_empty() {
-            return Some(t);
+            return (Some(t), Vec::new());
         }
     }
+    let mut problems = Vec::new();
     for path in [
         home.join(".local").join("share").join("opencode").join("auth.json"),
         home.join(".config").join("opencode").join("auth.json"),
     ] {
-        let Some(v) = read_json(&path) else { continue };
-        if let Some(t) = str_at(&v, &["opencode", "apiKey", "api_key", "token"]) {
-            return Some(t);
+        if !path.exists() {
+            continue;
         }
+        let Some(v) = read_json(&path) else {
+            problems.push(format!("{} could not be read", path.display()));
+            continue;
+        };
+        if let Some(t) = str_at(&v, &["opencode", "apiKey", "api_key", "token"]) {
+            return (Some(t), problems);
+        }
+        problems.push(format!("{} holds no access token", path.display()));
     }
-    None
+    (None, problems)
 }
 
 // ------------------------------------------------------------ token refreshing
@@ -1061,8 +1134,9 @@ async fn codex(client: reqwest::Client, endpoints: Endpoints, cred: Credential, 
 
 /// The Copilot usage.
 async fn copilot(client: reqwest::Client, endpoints: Endpoints, home: PathBuf) -> QuotaReport {
-    let Some(token) = copilot_token(&home) else {
-        return QuotaReport::absent("GitHub Copilot");
+    let (token, problems) = copilot_token(&home);
+    let Some(token) = token else {
+        return unmatched("GitHub Copilot", problems);
     };
     let v = match get_json(
         &client,
@@ -1090,8 +1164,9 @@ async fn copilot(client: reqwest::Client, endpoints: Endpoints, home: PathBuf) -
 
 /// The Gemini CLI usage.
 async fn gemini_cli(client: reqwest::Client, endpoints: Endpoints, home: PathBuf) -> QuotaReport {
-    let Some(token) = gemini_token(&home) else {
-        return QuotaReport::absent("Gemini CLI");
+    let (token, problems) = gemini_token(&home);
+    let Some(token) = token else {
+        return unmatched("Gemini CLI", problems);
     };
     let v = match get_json(
         &client,
@@ -1117,8 +1192,9 @@ async fn gemini_cli(client: reqwest::Client, endpoints: Endpoints, home: PathBuf
 
 /// The OpenCode usage.
 async fn opencode(client: reqwest::Client, endpoints: Endpoints, home: PathBuf) -> QuotaReport {
-    let Some(token) = opencode_token(&home) else {
-        return QuotaReport::absent("OpenCode");
+    let (token, problems) = opencode_token(&home);
+    let Some(token) = token else {
+        return unmatched("OpenCode", problems);
     };
     let v = match get_json(&client, &endpoints.opencode_usage, &token, &[]).await {
         Ok(v) => v,
@@ -1218,15 +1294,6 @@ fn benched(agent: &str, now: i64) -> Option<QuotaReport> {
     Some(report)
 }
 
-/// A provider fetch, boxed so that the different providers can be waited for
-/// together.
-type Fetch = std::pin::Pin<Box<dyn std::future::Future<Output = QuotaReport> + Send>>;
-
-/// Box a fetch so it can sit in a list next to the others.
-fn boxed<F: std::future::Future<Output = QuotaReport> + Send + 'static>(f: F) -> Fetch {
-    Box::pin(f)
-}
-
 /// Run one provider's fetch, bounded by a timeout, and settle the result.
 ///
 /// The future is only awaited when the provider is not benched, so a provider
@@ -1273,8 +1340,8 @@ pub async fn fetch_all_with(home: &Path, endpoints: &Endpoints) -> Vec<QuotaRepo
 
     // Each account is fetched on its own, so a machine with two Claude
     // logins gets a card for each of them.
-    let mut claude_creds = claude_credentials(home);
-    let mut codex_creds = codex_credentials(home);
+    let (mut claude_creds, claude_problems) = claude_credentials(home);
+    let (mut codex_creds, codex_problems) = codex_credentials(home);
     // With a single account the plain name is used, so the alerts read the
     // way they always did.
     let many_claude = claude_creds.len() > 1;
@@ -1297,40 +1364,65 @@ pub async fn fetch_all_with(home: &Path, endpoints: &Endpoints) -> Vec<QuotaRepo
         }
     }
 
-    let mut fetches: Vec<Fetch> = Vec::new();
+    // The providers are asked at the same time, not one after the other: a
+    // provider that is slow or down must not hold the others up.
+    let mut set = tokio::task::JoinSet::new();
     for cred in claude_creds.iter() {
-        fetches.push(boxed(run_provider(
+        set.spawn(run_provider(
             "Claude Code",
             claude_code(client.clone(), endpoints.clone(), cred.clone(), many_claude),
             PROVIDER_TIMEOUT,
-        )));
+        ));
     }
     for cred in codex_creds.iter() {
-        fetches.push(boxed(run_provider(
+        set.spawn(run_provider(
             "Codex",
             codex(client.clone(), endpoints.clone(), cred.clone(), many_codex),
             PROVIDER_TIMEOUT,
-        )));
+        ));
     }
-    fetches.push(boxed(run_provider(
+    set.spawn(run_provider(
         "GitHub Copilot",
         copilot(client.clone(), endpoints.clone(), home.to_path_buf()),
         PROVIDER_TIMEOUT,
-    )));
-    fetches.push(boxed(run_provider(
+    ));
+    set.spawn(run_provider(
         "Gemini CLI",
         gemini_cli(client.clone(), endpoints.clone(), home.to_path_buf()),
         PROVIDER_TIMEOUT,
-    )));
-    fetches.push(boxed(run_provider(
+    ));
+    set.spawn(run_provider(
         "OpenCode",
         opencode(client.clone(), endpoints.clone(), home.to_path_buf()),
         PROVIDER_TIMEOUT,
-    )));
+    ));
 
     let mut reports = Vec::new();
-    for f in fetches {
-        reports.push(f.await);
+    // A sign-in that could not be read is worth a card of its own: the user
+    // is signed in and something is wrong, and saying nothing would be a lie.
+    for (agent, problems, has_account) in [
+        ("Claude Code", &claude_problems, !claude_creds.is_empty()),
+        ("Codex", &codex_problems, !codex_creds.is_empty()),
+    ] {
+        if problems.is_empty() {
+            continue;
+        }
+        if !has_account {
+            reports.push(unmatched(agent, problems.clone()));
+            continue;
+        }
+        for problem in problems {
+            reports.push(QuotaReport::failed(agent, ErrorKind::Unauthorized, problem.clone()));
+        }
+    }
+    while let Some(finished) = set.join_next().await {
+        match finished {
+            Ok(report) => reports.push(report),
+            Err(e) => {
+                // A task that panicked is a provider that could not be read.
+                reports.push(QuotaReport::failed("Cinder", ErrorKind::Unreachable, e.to_string()));
+            }
+        }
     }
     drop_spent(&mut reports, now_secs());
     reports
@@ -1475,6 +1567,16 @@ mod tests {
     use super::*;
     use crate::testserver::{MockServer, Reply};
     use serde_json::json;
+
+    /// The provider state is one map for the whole app, so the tests that use
+    /// it take a lock. One test clearing it while another is looking would
+    /// fail for reasons that have nothing to do with the code.
+    static STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the provider state for the length of a test.
+    fn state_guard() -> std::sync::MutexGuard<'static, ()> {
+        STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn claude_usage_reads_every_window() {
@@ -1661,6 +1763,7 @@ mod tests {
 
     #[test]
     fn a_failure_keeps_the_last_windows_and_marks_them_stale() {
+        let _guard = state_guard();
         STATE.lock().unwrap().clear();
         let now = now_secs();
         let good = QuotaReport::ok(
@@ -1682,6 +1785,7 @@ mod tests {
 
     #[test]
     fn a_provider_that_keeps_failing_is_benched() {
+        let _guard = state_guard();
         STATE.lock().unwrap().clear();
         let now = now_secs();
         settle(QuotaReport::failed("Bench Provider", ErrorKind::Timeout, "too slow"), now);
@@ -1696,6 +1800,7 @@ mod tests {
 
     #[test]
     fn a_good_read_clears_the_bench() {
+        let _guard = state_guard();
         STATE.lock().unwrap().clear();
         let now = now_secs();
         settle(QuotaReport::failed("Clear Provider", ErrorKind::Timeout, "too slow"), now);
@@ -1799,7 +1904,95 @@ mod tests {
     }
 
     #[test]
+    fn a_sign_in_that_cannot_be_read_says_so_instead_of_looking_like_no_sign_in() {
+        let home = std::env::temp_dir().join(format!("cinder-quota-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        // The file is there, but it is not JSON: the user is signed in and
+        // something is wrong.
+        std::fs::write(home.join(".claude").join(".credentials.json"), "{ this is not json").unwrap();
+
+        let (creds, problems) = claude_credentials(&home);
+        assert!(creds.is_empty(), "there is no usable sign-in");
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("could not be read"), "got: {}", problems[0]);
+
+        // The report says what went wrong, and is not simply skipped.
+        let report = unmatched("Claude Code", problems);
+        assert!(!report.skipped, "a broken sign-in is not the same as no sign-in");
+        assert!(!report.error.is_empty());
+        assert_eq!(report.error_kind, Some(ErrorKind::Unauthorized));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn no_sign_in_at_all_is_not_a_problem() {
+        let home = std::env::temp_dir().join(format!("cinder-quota-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let (creds, problems) = claude_credentials(&home);
+        assert!(creds.is_empty());
+        assert!(problems.is_empty());
+        // No sign-in means no card at all.
+        let report = unmatched("Claude Code", problems);
+        assert!(report.skipped);
+        assert!(report.error.is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_providers_are_asked_at_the_same_time_not_one_after_the_other() {
+        let home = std::env::temp_dir().join(format!("cinder-quota-parallel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(
+            home.join(".claude").join(".credentials.json"),
+            r#"{"claudeAiOauth": {"accessToken": "a", "subscriptionType": "max"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            home.join(".codex").join("auth.json"),
+            r#"{"tokens": {"access_token": "b"}}"#,
+        )
+        .unwrap();
+
+        // Two providers, each a good half second behind.
+        let claude = MockServer::start(vec![Reply::slow(
+            r#"{"five_hour": {"utilization": 10}}"#,
+            600,
+        )]);
+        let codex = MockServer::start(vec![Reply::slow(
+            r#"{"plan_type": "plus", "rate_limit": {"primary_window": {"used_percent": 20}}}"#,
+            600,
+        )]);
+        let endpoints = Endpoints {
+            claude_usage: claude.url("/usage"),
+            codex_usage: codex.url("/usage"),
+            ..Endpoints::default()
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let started = std::time::Instant::now();
+        let reports = rt.block_on(fetch_all_with(&home, &endpoints));
+        let elapsed = started.elapsed();
+
+        assert_eq!(reports.len(), 5, "every provider is asked");
+        let claude_report = reports.iter().find(|r| r.agent == "Claude Code").unwrap();
+        assert_eq!(claude_report.windows.len(), 1, "the slow answer should still be read");
+        // Asked one after the other, this would take more than a second and a
+        // bit. Asked at the same time, it takes about one delay.
+        assert!(
+            elapsed < Duration::from_millis(1000),
+            "the providers should be asked at the same time, but it took {elapsed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn a_provider_that_is_benched_is_not_asked_again() {
+        let _guard = state_guard();
         STATE.lock().unwrap().clear();
         // Three failures in a row: the request is tried three times and then
         // the provider is benched.
