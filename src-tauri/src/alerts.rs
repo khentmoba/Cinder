@@ -151,7 +151,7 @@ pub fn evaluate(windows: &[LiveQuota], budgets: &[PlanStatus], now: i64) -> Vec<
         }
     }
     // The worst first, so the header badge can show the first one.
-    out.sort_by(|a, b| severity_rank(b.severity).cmp(&severity_rank(a.severity)));
+    out.sort_by_key(|a| std::cmp::Reverse(severity_rank(a.severity)));
     out
 }
 
