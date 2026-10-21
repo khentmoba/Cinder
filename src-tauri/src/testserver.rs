@@ -4,7 +4,6 @@
 //! "the first call fails, the second one works" and then check that the
 //! fetcher really tried twice.
 
-#![cfg(test)]
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
