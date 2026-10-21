@@ -115,7 +115,42 @@ every five minutes in the background, so a scan never waits on the network.
 | OpenCode | `OPENCODE_API_KEY` or `~/.local/share/opencode/auth.json` | `opencode.ai/api/usage` |
 
 A provider that is not signed in is skipped; one that is signed in but fails
-says so in the panel instead of showing a stale number.
+says so in the panel instead of showing a stale number. A window whose reset
+time has already passed is dropped rather than shown as if it were still
+running.
+
+## Alerts
+
+Cinder watches the live windows and says something when they are about to run
+out. A window is projected forward from how fast it is being consumed, so a
+window that is 40% used a tenth of the way through will not last:
+
+- **critical** — the window is nearly spent, or it will run out before it
+  resets.
+- **warn** — the window is on pace to use most of it.
+
+The alert appears at the top of the Limits view, and the Limits button carries
+a count so a problem is visible without opening the view. The first time an
+alert shows up it also arrives as a desktop notification; the same alert is
+not announced twice, and one that clears is forgotten so it can fire again
+later.
+
+## Plans and budgets
+
+A **plan** is a flat rate you pay each month (Claude Pro, ChatGPT Plus) and a
+**budget** is a limit on what you may spend. They are not the same thing, and
+the dashboard keeps them apart:
+
+- A **budget** burns down: "$12.40 of your $50.00 budget (25%)", and crossing
+  80% raises an alert.
+- A **plan** does not. Cinder prices every token at list prices, so the
+  figure it shows against a plan is the *value of the work delivered*, not an
+  amount you pay. It reads "Claude Pro · $20.00 a month · the work was worth
+  $142.50 (7.1x the plan)". The limit on a plan is the provider's quota
+  window, not a dollar amount, so a plan never raises a budget alert.
+
+Declare them in **Settings → Plans**. They are stored in `~/.cinder/plans.json`
+and are read against the current month.
 
 ## System tray
 
@@ -150,7 +185,7 @@ source took.
 - **Breakdown**: switch between **Model**, **Day**, **Agent**, **Cache** and
   **Project** views; rows are clickable filters, **Show all** lists every row,
   and **CSV** exports the tailored dataset.
-- **Limits**: a *view* (`Usage | Limits`), not a metric. Features burn-rate pacing (`⚡ %/hr`), visual quota health badges (`On Pace`, `Elevated`, `Exhaustion Risk`), linear pace markers on the progress track, and depletion ETA forecasts. Live windows are badged **live**.
+- **Limits**: a *view* (`Usage | Limits`), not a metric. Features burn-rate pacing (`⚡ %/hr`), visual quota health badges (`On Pace`, `Elevated`, `Exhaustion Risk`), linear pace markers on the progress track, and depletion ETA forecasts. Live windows are badged **live**, and the alerts and declared plans sit above them.
 - **Artifacts**: the links the agents published during the scanned period.
 - **Keys**: `1`–`4` cost / tokens / requests / limits, `R` refresh, `S` settings,
   `Esc` closes a modal. Window size and position are remembered between launches.
@@ -166,6 +201,8 @@ Tests use temporary home directories, not your real agent logs.
 
 `cargo test --manifest-path src-tauri/Cargo.toml -- --ignored real_home_scan`
 scans the machine you are on and prints what it found, for a human to eyeball.
+`-- --ignored live_quota_check` asks the providers for their live quota, which
+reaches the network.
 
 Add agents by extending `parse_*` functions in `src-tauri/src/main.rs` and
 `src-tauri/src/agents.rs`.

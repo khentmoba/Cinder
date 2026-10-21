@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// One live quota window reported by a provider.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct LiveQuota {
     pub agent: String,
     /// Short window id: "5h", "7d", "7d-sonnet", "monthly", "premium".
@@ -23,6 +23,13 @@ pub struct LiveQuota {
     pub plan: String,
     /// Human description, e.g. "5-hour session window".
     pub detail: String,
+    /// How much of the allowance is gone, in dollars, when the provider counts
+    /// its allowance in money rather than in requests.
+    #[serde(default)]
+    pub used_amount: f64,
+    /// The size of that allowance, in dollars.
+    #[serde(default)]
+    pub limit_amount: f64,
 }
 
 /// What one provider reported.
@@ -187,13 +194,44 @@ fn parse_resets_at(v: &serde_json::Value) -> i64 {
     if let Ok(n) = s.parse::<i64>() {
         return if n > 1_000_000_000_000 { n / 1000 } else { n };
     }
-    // "2026-10-21T18:00:00Z" -> unix seconds, without pulling in a date crate.
-    let day = crate::day_of(s);
-    if day.is_empty() {
+    parse_iso(s)
+}
+
+/// An ISO-8601 timestamp to unix seconds.
+///
+/// The time of day matters: a window that resets at 18:00 is not a window
+/// that resets at midnight, and getting that wrong puts the reset countdown
+/// hours off.
+fn parse_iso(s: &str) -> i64 {
+    let s = s.trim();
+    if s.len() < 10 {
         return 0;
     }
-    let (y, m, d) = parse_day(&day);
-    days_from_civil(y, m, d) * 86_400
+    let (y, m, d) = parse_day(&s[..10]);
+    let mut secs = days_from_civil(y, m, d) * 86_400;
+    let rest = &s[10..];
+    let rest = rest.trim_start_matches(['T', ' ']);
+    if rest.len() >= 5 {
+        let hour: i64 = rest[0..2].parse().unwrap_or(0);
+        let minute: i64 = rest[3..5].parse().unwrap_or(0);
+        secs += hour * 3600 + minute * 60;
+        if rest.len() >= 8 {
+            if let Ok(second) = rest[6..8].parse::<i64>() {
+                secs += second;
+            }
+        }
+    }
+    // A numeric offset shifts the clock; "Z" means none.
+    if let Some(at) = rest.find(['+', '-']) {
+        let sign = if rest.as_bytes()[at] == b'-' { -1 } else { 1 };
+        let off = &rest[at + 1..];
+        if off.len() >= 4 {
+            let oh: i64 = off[0..2].parse().unwrap_or(0);
+            let om: i64 = off[3..5].parse().unwrap_or(0);
+            secs -= sign * (oh * 3600 + om * 60);
+        }
+    }
+    secs
 }
 
 /// "2026-10-21" -> (2026, 10, 21).
@@ -250,6 +288,7 @@ fn parse_claude_usage(v: &serde_json::Value, plan: &str) -> Vec<LiveQuota> {
             resets_at: w.get("resets_at").map(parse_resets_at).unwrap_or(0),
             plan: plan.into(),
             detail: detail.into(),
+            ..Default::default()
         });
     }
     // Extra usage is a credit balance, not a window: report how much of the
@@ -266,37 +305,98 @@ fn parse_claude_usage(v: &serde_json::Value, plan: &str) -> Vec<LiveQuota> {
                 resets_at: 0,
                 plan: plan.into(),
                 detail: "Extra usage credits".into(),
+                used_amount: used,
+                limit_amount: limit,
             });
         }
     }
     out
 }
 
-/// Codex's usage payload: primary (5h) and secondary (weekly) windows.
+/// Codex's usage payload.
+///
+/// The endpoint has changed shape more than once, so rather than expect one
+/// layout the payload is searched for the objects that carry a percentage:
+/// any object with a `used_percent` is a window, and the name it sits under
+/// says which window it is.
 fn parse_codex_usage(v: &serde_json::Value, plan: &str) -> Vec<LiveQuota> {
-    let root = v.get("rate_limits").unwrap_or(v);
     let mut out = Vec::new();
-    let windows: [(&str, &str, i64, &str); 2] = [
-        ("primary", "5h", 300, "5-hour session window"),
-        ("secondary", "7d", 7 * 24 * 60, "7-day window"),
-    ];
-    for (key, id, minutes, detail) in windows {
-        let Some(w) = root.get(key) else { continue };
-        let Some(pct) = w.get("used_percent").and_then(percent) else { continue };
+    collect_windows(v, "Codex", plan, &mut Vec::new(), &mut out);
+    out
+}
+
+/// The name of a Codex window, and how long it is when the payload does not
+/// say.
+fn codex_window_name(key: &str) -> Option<(&'static str, i64, &'static str)> {
+    let key = key.to_lowercase();
+    if key.contains("primary") || key.contains("five_hour") || key.contains("5h") {
+        return Some(("5h", 300, "5-hour session window"));
+    }
+    if key.contains("secondary") || key.contains("weekly") || key.contains("7d") {
+        return Some(("7d", 7 * 24 * 60, "7-day window"));
+    }
+    None
+}
+
+/// Walk a usage payload and collect every window it holds.
+fn collect_windows(
+    v: &serde_json::Value,
+    agent: &str,
+    plan: &str,
+    path: &mut Vec<String>,
+    out: &mut Vec<LiveQuota>,
+) {
+    let now = now_secs();
+    let Some(obj) = v.as_object() else { return };
+    // An object that says how much of a window is used is a window.
+    let pct = obj
+        .get("used_percent")
+        .or_else(|| obj.get("utilization"))
+        .or_else(|| obj.get("percent_used"))
+        .and_then(percent);
+    if let Some(pct) = pct {
+        let key = path.last().cloned().unwrap_or_default();
+        let (id, default_minutes, detail) = codex_window_name(&key)
+            .unwrap_or(("window", 0, "Rate limit window"));
+        // The window length is sometimes given in seconds, and the reset
+        // sometimes as a countdown rather than a moment.
+        let minutes = obj
+            .get("window_minutes")
+            .and_then(|x| x.as_i64())
+            .or_else(|| {
+                obj.get("limit_window_seconds")
+                    .and_then(|x| x.as_i64())
+                    .map(|s| s / 60)
+            })
+            .unwrap_or(default_minutes);
+        let resets_at = obj
+            .get("reset_at")
+            .or_else(|| obj.get("resets_at"))
+            .map(parse_resets_at)
+            .filter(|t| *t > 0)
+            .or_else(|| {
+                obj.get("reset_after_seconds")
+                    .and_then(|x| x.as_i64())
+                    .map(|s| now + s)
+            })
+            .unwrap_or(0);
         out.push(LiveQuota {
-            agent: "Codex".into(),
+            agent: agent.into(),
             window: id.into(),
             used_percent: pct,
-            window_minutes: w
-                .get("window_minutes")
-                .and_then(|x| x.as_i64())
-                .unwrap_or(minutes),
-            resets_at: w.get("resets_at").map(parse_resets_at).unwrap_or(0),
+            window_minutes: minutes,
+            resets_at,
             plan: plan.into(),
             detail: detail.into(),
+            ..Default::default()
         });
+        return;
     }
-    out
+    for (k, child) in obj {
+        path.push(k.clone());
+        collect_windows(child, agent, plan, path, out);
+        path.pop();
+    }
 }
 
 /// Copilot's user payload: premium interactions and the chat buckets.
@@ -314,6 +414,7 @@ fn parse_copilot_usage(v: &serde_json::Value) -> Vec<LiveQuota> {
                 resets_at: 0,
                 plan: "copilot".into(),
                 detail: "Premium interactions".into(),
+                ..Default::default()
             });
         }
     }
@@ -332,6 +433,7 @@ fn parse_copilot_usage(v: &serde_json::Value) -> Vec<LiveQuota> {
                 resets_at: 0,
                 plan: "copilot".into(),
                 detail: format!("{} quota", name),
+                ..Default::default()
             });
         }
     }
@@ -367,6 +469,7 @@ fn parse_gemini_usage(v: &serde_json::Value) -> Vec<LiveQuota> {
             resets_at: 0,
             plan: plan.clone(),
             detail: id.to_string(),
+            ..Default::default()
         });
     }
     out
@@ -393,6 +496,7 @@ fn parse_opencode_usage(v: &serde_json::Value) -> Vec<LiveQuota> {
             resets_at: w.get("resets_at").map(parse_resets_at).unwrap_or(0),
             plan: String::new(),
             detail: detail.into(),
+            ..Default::default()
         });
     }
     out
@@ -460,22 +564,26 @@ async fn codex(home: &Path, client: &reqwest::Client) -> QuotaReport {
     let Ok(usage) = usage else {
         return QuotaReport::failed("Codex", usage.unwrap_err());
     };
-    // The plan type lives on a second endpoint; a failure there is not fatal.
-    let plan = get_json(
-        client,
-        "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
-        &token,
-        &[("OpenAI-Beta", "codex-1")],
-    )
-    .await
-    .ok()
-    .and_then(|v| {
-        v.get("plan_type")
-            .or_else(|| v.get("rate_limit_resets").and_then(|r| r.get("plan_type")))
-            .and_then(|x| x.as_str())
-            .map(|s| s.to_string())
-    })
-    .unwrap_or_default();
+    // The plan type is in the usage payload itself; the second endpoint is
+    // only a fallback.
+    let plan = match usage.get("plan_type").and_then(|x| x.as_str()) {
+        Some(p) => p.to_string(),
+        None => get_json(
+            client,
+            "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
+            &token,
+            &[("OpenAI-Beta", "codex-1")],
+        )
+        .await
+        .ok()
+        .and_then(|v| {
+            v.get("plan_type")
+                .or_else(|| v.get("rate_limit_resets").and_then(|r| r.get("plan_type")))
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_default(),
+    };
     let windows = parse_codex_usage(&usage, &plan);
     if windows.is_empty() {
         return QuotaReport::failed("Codex", "unexpected usage payload");
@@ -545,6 +653,14 @@ async fn opencode(home: &Path, client: &reqwest::Client) -> QuotaReport {
     QuotaReport::ok("OpenCode", windows)
 }
 
+/// The current time in unix seconds.
+pub fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Fetch every live quota we can reach, using only credentials already on disk.
 ///
 /// A provider that fails is reported with an error string and no windows; the
@@ -567,7 +683,21 @@ pub async fn fetch_all(home: &Path) -> Vec<QuotaReport> {
         gemini_cli(home, &client),
         opencode(home, &client),
     );
-    vec![claude, codex_q, cop, gem, oc]
+    let mut reports = vec![claude, codex_q, cop, gem, oc];
+    drop_spent(&mut reports, now_secs());
+    reports
+}
+
+/// Drop the windows that have already reset.
+///
+/// A provider can still be holding a window whose reset time has passed, and
+/// showing it would say a limit is in use when it is not.
+pub fn drop_spent(reports: &mut [QuotaReport], now: i64) {
+    for report in reports {
+        report
+            .windows
+            .retain(|w| w.resets_at == 0 || w.resets_at > now);
+    }
 }
 
 // --------------------------------------------------------------------- cache
@@ -695,6 +825,64 @@ mod tests {
     fn reset_times_accept_seconds_and_iso_strings() {
         assert_eq!(parse_resets_at(&json!(1789000000)), 1789000000);
         assert_eq!(parse_resets_at(&json!("2026-10-21")), days_from_civil(2026, 10, 21) * 86400);
+    }
+
+    #[test]
+    fn an_iso_timestamp_keeps_its_time_of_day() {
+        // The time of day matters: a window that resets at 18:00 is not one
+        // that resets at midnight.
+        let noon = parse_iso("2026-10-21T18:30:15Z");
+        let midnight = days_from_civil(2026, 10, 21) * 86400;
+        assert_eq!(noon - midnight, 18 * 3600 + 30 * 60 + 15);
+        // An offset shifts the clock.
+        assert_eq!(parse_iso("2026-10-21T18:30:15+02:00"), midnight + 16 * 3600 + 30 * 60 + 15);
+    }
+
+    #[test]
+    fn the_codex_payload_shape_is_read_wherever_the_windows_sit() {
+        // The shape the endpoint actually answers with: the windows live
+        // under rate_limit, the reset is a moment, and the length is in
+        // seconds.
+        let v = json!({
+            "plan_type": "plus",
+            "rate_limit": {
+                "primary_window": {
+                    "limit_window_seconds": 18000,
+                    "reset_at": 1792609864,
+                    "used_percent": 100
+                },
+                "secondary_window": {
+                    "limit_window_seconds": 604800,
+                    "reset_after_seconds": 488274,
+                    "used_percent": 78
+                }
+            }
+        });
+        let w = parse_codex_usage(&v, "plus");
+        assert_eq!(w.len(), 2);
+        assert_eq!(w[0].window, "5h");
+        assert_eq!(w[0].used_percent, 100.0);
+        assert_eq!(w[0].window_minutes, 300);
+        assert_eq!(w[0].resets_at, 1792609864);
+        assert_eq!(w[1].window, "7d");
+        assert_eq!(w[1].used_percent, 78.0);
+        assert_eq!(w[1].window_minutes, 10080);
+        // A countdown is turned into a moment.
+        assert!(w[1].resets_at > now_secs());
+    }
+
+    #[test]
+    fn a_window_that_has_already_reset_is_dropped() {
+        let now = 1_000_000;
+        let mut reports = vec![QuotaReport::ok("Codex", vec![
+            LiveQuota { agent: "Codex".into(), window: "5h".into(), used_percent: 100.0, window_minutes: 300, resets_at: now - 60, ..Default::default() },
+            LiveQuota { agent: "Codex".into(), window: "7d".into(), used_percent: 10.0, window_minutes: 10080, resets_at: now + 3600, ..Default::default() },
+            LiveQuota { agent: "Codex".into(), window: "premium".into(), used_percent: 5.0, window_minutes: 0, resets_at: 0, ..Default::default() },
+        ])];
+        drop_spent(&mut reports, now);
+        // The window that has reset is gone, the other two are not.
+        let windows: Vec<&str> = reports[0].windows.iter().map(|w| w.window.as_str()).collect();
+        assert_eq!(windows, vec!["7d", "premium"]);
     }
 
     #[test]

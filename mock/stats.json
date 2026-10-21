@@ -6248,6 +6248,18 @@
    "plan": "plus",
    "source": "live",
    "detail": "7-day window"
+  },
+  {
+   "agent": "Claude Code",
+   "window": "monthly",
+   "used_percent": 50,
+   "window_minutes": 43200,
+   "resets_at": 1789600000,
+   "plan": "pro",
+   "source": "live",
+   "detail": "Extra usage credits",
+   "used_amount": 25,
+   "limit_amount": 50
   }
  ],
  "sources": [
@@ -6322,6 +6334,42 @@
    "url": "https://claude.ai/code/artifact/5a6b7c8d",
    "day": "2026-07-01",
    "title": "Quota centre sketch"
+  }
+ ],
+ "alerts": [
+  {
+   "id": "quota:Claude Code:5h",
+   "agent": "Claude Code",
+   "severity": "critical",
+   "title": "Claude Code 5h window will run out before it resets",
+   "detail": "62% used this early - on pace for 148%"
+  },
+  {
+   "id": "budget:OpenCode",
+   "agent": "OpenCode",
+   "severity": "warn",
+   "title": "OpenCode is at 84% of its budget",
+   "detail": "$42.10 of $50.00"
+  }
+ ],
+ "plans": [
+  {
+   "agent": "Claude Code",
+   "kind": "subscription",
+   "label": "Claude Pro",
+   "limit": 20,
+   "used": 142.5,
+   "percent": 712.5,
+   "multiple": 7.125
+  },
+  {
+   "agent": "OpenCode",
+   "kind": "budget",
+   "label": "monthly spend",
+   "limit": 50,
+   "used": 42.1,
+   "percent": 84.2,
+   "multiple": 0.842
   }
  ]
 }

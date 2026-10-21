@@ -517,10 +517,143 @@ fn a_worktree_rolls_up_into_its_repository() {
     assert_eq!(r.project, "mainrepo");
 }
 
-/// A scan of the machine this test runs on, for a human to eyeball.
+#[test]
+fn a_scan_reports_the_alerts_the_current_numbers_justify() {
+    let home = Home::new();
+    let now = now_secs();
+    // A window that is 40% used with a fifth of its time gone: on pace for
+    // 200%, so it will run out before it resets.
+    let reports = vec![quota::QuotaReport {
+        agent: "Claude Code".into(),
+        windows: vec![quota::LiveQuota {
+            agent: "Claude Code".into(),
+            window: "5h".into(),
+            used_percent: 40.0,
+            window_minutes: 300,
+            resets_at: now + 300 * 60 * 4 / 5,
+            plan: "pro".into(),
+            detail: "5-hour session window".into(),
+            ..Default::default()
+        }],
+        error: String::new(),
+        skipped: false,
+    }];
+    let stats = scan_home_with(&home.0, &|_| {}, reports, "2026-10-21T00:00:00Z".into());
+    assert_eq!(stats.alerts.len(), 1);
+    assert_eq!(stats.alerts[0].severity, alerts::Severity::Critical);
+    assert!(stats.alerts[0].title.contains("run out"));
+    // The window is in the limits list as a live one.
+    assert!(stats.limits.iter().any(|l| l.source == "live" && l.window == "5h"));
+}
+
+#[test]
+fn a_budget_over_its_limit_raises_an_alert() {
+    let home = Home::new();
+    // The plan is read against the current month, so the usage has to fall in
+    // it for the budget to mean anything.
+    let today = unix_day(now_secs());
+    budget::save(&home.0, &[Plan {
+        agent: "Pi".into(),
+        kind: budget::PlanKind::Budget,
+        limit: 0.001,
+        label: "monthly".into(),
+    }])
+    .unwrap();
+    home.lines(".pi/agent/sessions/s.jsonl", &[
+        json!({"type": "session", "timestamp": format!("{today}T00:00:00Z")}),
+        json!({"type": "message", "timestamp": format!("{today}T00:01:00Z"), "message": {
+            "role": "assistant", "model": "gpt-5", "usage": {"input": 1000, "output": 100}
+        }})
+    ]);
+    let stats = scan_home_with(&home.0, &|_| {}, Vec::new(), String::new());
+    assert_eq!(stats.plans.len(), 1);
+    assert!(stats.plans[0].percent > 100.0, "percent {}", stats.plans[0].percent);
+    assert!(stats.alerts.iter().any(|a| a.title.contains("over its budget")));
+    // The plan is measured against the spend the rows actually report.
+    let spend: f64 = stats.rows.iter().filter(|r| r.agent == "Pi").map(|r| r.cost).sum();
+    assert_eq!(stats.plans[0].used, spend);
+}
+
+#[test]
+fn a_plan_is_reported_as_the_value_the_work_was_worth() {
+    let home = Home::new();
+    let today = unix_day(now_secs());
+    budget::save(&home.0, &[Plan {
+        agent: "Pi".into(),
+        kind: budget::PlanKind::Subscription,
+        limit: 0.001,
+        label: "Pi Pro".into(),
+    }])
+    .unwrap();
+    home.lines(".pi/agent/sessions/s.jsonl", &[
+        json!({"type": "session", "timestamp": format!("{today}T00:00:00Z")}),
+        json!({"type": "message", "timestamp": format!("{today}T00:01:00Z"), "message": {
+            "role": "assistant", "model": "gpt-5", "usage": {"input": 1000, "output": 100}
+        }})
+    ]);
+    let stats = scan_home_with(&home.0, &|_| {}, Vec::new(), String::new());
+    // A plan is not a budget: being over the plan price is not an alert.
+    assert_eq!(stats.plans.len(), 1);
+    assert!(stats.plans[0].multiple > 1.0);
+    assert!(stats.alerts.is_empty(), "alerts {:?}", stats.alerts);
+}
+
+/// Asks the providers for their live quota, on the machine this runs on.
 ///
-/// Ignored by default because it reads gigabytes of real logs:
-/// `cargo test --bin cinder -- --ignored --nocapture real_home_scan`.
+/// Ignored by default because it reaches the network:
+/// `cargo test --bin cinder -- --ignored --nocapture live_quota_check`.
+#[test]
+#[ignore]
+fn live_quota_check() {
+    let home = dirs::home_dir().unwrap();
+    let reports = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(quota::fetch_all(&home));
+    for r in &reports {
+        if r.skipped {
+            println!("  {:<18} not signed in", r.agent);
+            continue;
+        }
+        if !r.error.is_empty() {
+            println!("  {:<18} ERROR {}", r.agent, r.error);
+            continue;
+        }
+        for w in &r.windows {
+            println!(
+                "  {:<18} {:<12} {:>5.1}%  resets in {:>6}  {}",
+                w.agent,
+                w.window,
+                w.used_percent,
+                w.resets_at - now_secs(),
+                w.detail
+            );
+        }
+    }
+    // The whole chain: the live windows become the alerts the panel shows.
+    let sandbox = Home::new();
+    let today = unix_day(now_secs());
+    sandbox.lines(".pi/agent/sessions/s.jsonl", &[
+        json!({"type": "session", "timestamp": format!("{today}T00:00:00Z")}),
+        json!({"type": "message", "timestamp": format!("{today}T00:01:00Z"), "message": {
+            "role": "assistant", "model": "gpt-5", "usage": {"input": 1000, "output": 100}
+        }})
+    ]);
+    budget::save(&sandbox.0, &[Plan {
+        agent: "Pi".into(),
+        kind: budget::PlanKind::Budget,
+        limit: 0.001,
+        label: "monthly".into(),
+    }])
+    .unwrap();
+    let stats = scan_home_with(&sandbox.0, &|_| {}, reports, "2026-10-21T00:00:00Z".into());
+    println!("  alerts from the live windows:");
+    for a in &stats.alerts {
+        println!("    [{}] {} — {}", a.severity as u8, a.title, a.detail);
+    }
+    println!("  plans: {:?}", stats.plans);
+}
+
+/// A scan of the machine this test runs on, for a human to eyeball.
 #[test]
 #[ignore]
 fn real_home_scan() {
@@ -546,6 +679,8 @@ fn real_home_scan() {
     println!("subagent rows: {subagents}");
     println!("limits: {:?}", stats.limits);
     println!("rows: {}", stats.rows.len());
+    println!("alerts: {:?}", stats.alerts);
+    println!("plans: {:?}", stats.plans);
     // How a git worktree resolves.
     for cwd in [
         r"C:\Users\Admin\.t3\worktrees\Cinder\t3-1e48cab7",

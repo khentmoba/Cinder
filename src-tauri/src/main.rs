@@ -5,6 +5,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod agents;
+mod alerts;
+mod budget;
 mod cache;
 mod prefilter;
 mod pricing;
@@ -12,6 +14,8 @@ mod project;
 mod quota;
 mod updater;
 
+use alerts::Alert;
+use budget::{Plan, PlanStatus};
 use cache::{file_stamp, CachedDb, CachedFile, CachedLimit, ScanCache};
 use prefilter::Prefilter;
 use pricing::Pricing;
@@ -226,6 +230,13 @@ pub struct LimitRow {
     /// Human description of the window, e.g. "5-hour session window".
     #[serde(default)]
     pub detail: String,
+    /// How much of the allowance is gone, in dollars, when the provider counts
+    /// its allowance in money.
+    #[serde(default)]
+    pub used_amount: f64,
+    /// The size of that allowance, in dollars.
+    #[serde(default)]
+    pub limit_amount: f64,
 }
 
 #[derive(Serialize)]
@@ -265,6 +276,10 @@ struct Stats {
     quota_checked_at: String,
     /// Artifacts the agents published during the scanned period.
     artifacts: Vec<Artifact>,
+    /// The things worth interrupting the user about.
+    alerts: Vec<Alert>,
+    /// How each declared plan looks against the usage it covered.
+    plans: Vec<PlanStatus>,
 }
 
 #[derive(Serialize)]
@@ -687,6 +702,7 @@ fn parse_single_codex(
                                         } else {
                                             "7-day window".into()
                                         },
+                                        ..Default::default()
                                     }));
                                 }
                             }
@@ -2214,6 +2230,18 @@ fn scan(progress: &dyn Fn(&str)) -> Stats {
 }
 
 fn scan_home(home: &Path, progress: &dyn Fn(&str)) -> Stats {
+    // The live quota snapshot is read from the background refresher, so a scan
+    // never waits on the network.
+    let (reports, quota_checked_at) = quota::snapshot();
+    scan_home_with(home, progress, reports, quota_checked_at)
+}
+
+fn scan_home_with(
+    home: &Path,
+    progress: &dyn Fn(&str),
+    reports: Vec<quota::QuotaReport>,
+    quota_checked_at: String,
+) -> Stats {
     progress("model prices");
     let pricing = Pricing::load(home);
     let pricing_fp = (pricing.embedded_count as u64) ^ ((pricing.local_count as u64) << 32);
@@ -2303,10 +2331,10 @@ fn scan_home(home: &Path, progress: &dyn Fn(&str)) -> Stats {
     cache.save();
     progress("done");
 
-    // The live quota snapshot is read from the background refresher, so a scan
-    // never waits on the network.
-    let (reports, quota_checked_at) = quota::snapshot();
+    // The live quota snapshot was handed in, so a scan never waits on the
+    // network.
     let mut quota_error = String::new();
+    let mut live_windows: Vec<quota::LiveQuota> = Vec::new();
     for report in reports {
         if report.skipped {
             continue;
@@ -2320,15 +2348,18 @@ fn scan_home(home: &Path, progress: &dyn Fn(&str)) -> Stats {
         }
         for w in report.windows {
             limits.push(LimitRow {
-                agent: w.agent,
-                window: w.window,
+                agent: w.agent.clone(),
+                window: w.window.clone(),
                 used_percent: w.used_percent,
                 window_minutes: w.window_minutes,
                 resets_at: w.resets_at,
-                plan: w.plan,
+                plan: w.plan.clone(),
                 source: "live".into(),
-                detail: w.detail,
+                detail: w.detail.clone(),
+                used_amount: w.used_amount,
+                limit_amount: w.limit_amount,
             });
+            live_windows.push(w);
         }
     }
 
@@ -2351,6 +2382,14 @@ fn scan_home(home: &Path, progress: &dyn Fn(&str)) -> Stats {
     artifacts.sort_by(|a, b| a.url.cmp(&b.url));
     artifacts.dedup_by(|a, b| a.url == b.url);
 
+    // The plans the user declared, and how this month's usage looks against
+    // them. A plan says what the work was worth; a budget says how much of
+    // the limit is gone.
+    let now = now_secs();
+    let month = budget::month_of(&unix_day(now));
+    let plans = budget::statuses(&rows, &budget::load(home), &month);
+    let alerts = alerts::evaluate(&live_windows, &plans, now);
+
     Stats {
         rows,
         sessions,
@@ -2365,12 +2404,22 @@ fn scan_home(home: &Path, progress: &dyn Fn(&str)) -> Stats {
         quota_error,
         quota_checked_at,
         artifacts,
+        alerts,
+        plans,
         pricing: PricingInfo {
             source: pricing.source.clone(),
             embedded: pricing.embedded_count,
             local: pricing.local_count,
         },
     }
+}
+
+/// The current time in unix seconds.
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[tauri::command]
@@ -2393,6 +2442,27 @@ async fn download_and_install_update(
 #[tauri::command]
 fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
+}
+
+/// The plans the user declared, if any.
+#[tauri::command]
+fn get_plans() -> Vec<Plan> {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    budget::load(&home)
+}
+
+/// Remember what the user declared.
+#[tauri::command(async)]
+fn set_plans(app: AppHandle, plans: Vec<Plan>) -> Result<Vec<Plan>, String> {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    budget::save(&home, &plans)?;
+    // A budget that just crossed its limit is worth saying out loud, so the
+    // announcements start over.
+    alerts::reset_announcements();
+    let stats = scan(&|_| {});
+    announce(&app, &stats.alerts);
+    let _ = app.emit("stats-updated", &stats);
+    Ok(budget::load(&home))
 }
 
 // ---------------- System tray ----------------
@@ -2498,11 +2568,28 @@ fn spawn_quota_refresher(app: AppHandle) {
                 update_tray_tooltip();
                 // The window shows the limits too, so it gets the new numbers.
                 let stats = scan(&|_| {});
+                announce(&app, &stats.alerts);
                 let _ = app.emit("stats-updated", &stats);
             }
             std::thread::sleep(quota::REFRESH_INTERVAL);
         }
     });
+}
+
+/// Tell the user about an alert the first time it shows up.
+///
+/// The same alert is not announced twice, and one that clears is forgotten so
+/// it can fire again later.
+fn announce(app: &AppHandle, alerts: &[Alert]) {
+    use tauri_plugin_notification::NotificationExt;
+    for alert in alerts::take_new(alerts) {
+        let _ = app
+            .notification()
+            .builder()
+            .title(&alert.title)
+            .body(&alert.detail)
+            .show();
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2511,6 +2598,7 @@ pub fn run() {
         // Remember where the user put the window instead of resetting to the
         // config default on every launch.
         .plugin(tauri_plugin_window_state::Builder::default().build())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             spawn_log_watcher(app.handle().clone());
             spawn_quota_refresher(app.handle().clone());
@@ -2525,7 +2613,9 @@ pub fn run() {
             rescan_stats,
             check_update,
             download_and_install_update,
-            get_app_version
+            get_app_version,
+            get_plans,
+            set_plans
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

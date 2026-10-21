@@ -87,6 +87,11 @@ const fmtUsd = (n, known, partial = false) => known
   ? (partial ? '≥ ' : '') + '$' + n.toLocaleString('en-US', n >= 100
       ? { maximumFractionDigits: 0 } : { minimumFractionDigits: 2, maximumFractionDigits: 2 })
   : '—';
+// fmtUsd drops the cents above a hundred, which is right for a headline
+// figure but wrong for a plan price or a budget, where the exact amount is
+// the whole point of the number.
+const fmtUsdCents = n => '$' + Number(n || 0).toLocaleString('en-US',
+  { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
 // How the money behind a figure is actually paid for. Every dollar number on
@@ -338,6 +343,7 @@ function renderDelta() {
 function render() {
   if (!DATA) return;          // still scanning: nothing to draw yet
   renderLimits();
+  renderAlertBadge();
   renderSources();
   renderCrumb();
   const dash = document.getElementById('dash');
@@ -934,6 +940,76 @@ function sinceAgo(iso) {
   return Math.round(hours / 24) + 'd ago';
 }
 
+// The things worth interrupting the user about, worst first. Nothing is drawn
+// when there is nothing wrong: an empty section would only add noise.
+function renderAlerts() {
+  const alerts = (DATA && DATA.alerts) || [];
+  if (!alerts.length) return '';
+  return `<div class="alerts">` + alerts.map(a => {
+    const critical = a.severity === 'critical';
+    const colour = critical ? 'var(--bad)' : 'var(--warn)';
+    return `<div class="alert-row ${critical ? 'crit' : 'warn'}">
+      <div class="alert-title" style="color:${colour}">${esc(a.title || '')}</div>
+      <div class="alert-detail">${esc(a.detail || '')}</div>
+    </div>`;
+  }).join('') + '</div>';
+}
+
+// The count of active alerts rides on the Limits button, so a quota problem
+// is visible without opening the view.
+function renderAlertBadge() {
+  const n = ((DATA && DATA.alerts) || []).length;
+  const btn = document.querySelector('#view button[data-v="limits"]');
+  if (btn) {
+    btn.innerHTML = n ? `Limits <span id="limitsAlertBadge" class="alert-badge">${n}</span>` : 'Limits';
+    btn.title = n ? `${n} active alert${n === 1 ? '' : 's'}` : '';
+  }
+  const badge = document.getElementById('limitsAlertBadge');
+  if (badge) {
+    badge.textContent = n ? String(n) : '';
+    badge.hidden = !n;
+  }
+}
+
+// What the declared plans look like against this month's usage. A budget is
+// a limit on spending and burns down, so it gets a bar. A plan is a flat
+// rate the user pays: the work is worth more than the plan costs, and it
+// must never be drawn as something that is being used up.
+function renderPlanStatus() {
+  const plans = (DATA && DATA.plans) || [];
+  if (!plans.length) return '';
+  const rows = plans.map(p => {
+    const logo = `<img class="logo sm" src="${agentLogo(p.agent)}" alt="" onerror="this.style.visibility='hidden'">`;
+    if (p.kind === 'budget') {
+      const pct = Math.min(100, Math.max(0, p.percent || 0));
+      const colour = pct > 80 ? 'var(--bad)' : pct > 50 ? 'var(--warn)' : 'var(--accent)';
+      return `<div class="lrow plan-row budget">
+        <div class="lh">
+          <div class="lh-left">${logo}<span>${esc(p.agent)}</span>
+            <span class="badge badge-budget" title="A limit on spending: it burns down as the month goes on">Budget</span>
+          </div>
+          <span class="pct" style="color:${colour}">${Math.round(pct)}%</span>
+        </div>
+        <div class="track"><i class="bar" style="width:${pct}%;background:${colour}"></i></div>
+        <div class="lm"><span>${fmtUsdCents(p.used)} of your ${fmtUsdCents(p.limit)} budget (${Math.round(pct)}%)</span></div>
+      </div>`;
+    }
+    const multiple = p.multiple || 0;
+    const label = p.label || p.agent;
+    return `<div class="lrow plan-row subscription">
+      <div class="lh">
+        <div class="lh-left">${logo}<span>${esc(p.agent)}</span>
+          <span class="badge badge-plan" title="A flat rate you pay: the provider's quota window is the limit, not the price">Plan</span>
+        </div>
+        <span class="pct" style="color:var(--accent)">${multiple.toFixed(1)}x</span>
+      </div>
+      <div class="lm"><span>${esc(label)} · ${fmtUsdCents(p.limit)} a month · the work was worth ${fmtUsdCents(p.used)} (${multiple.toFixed(1)}x the plan)</span></div>
+      <div class="plan-note">The plan price is what you pay each month. ${fmtUsdCents(p.used)} is what the work was worth at list prices, not an amount you pay.</div>
+    </div>`;
+  }).join('');
+  return `<h3 style="margin-top:0">Plans &amp; budgets</h3>${rows}`;
+}
+
 function renderLimits() {
   const box = document.getElementById('limitsView');
   const limits = [...(DATA.limits || [])].sort((a, b) => b.used_percent - a.used_percent);
@@ -943,13 +1019,17 @@ function renderLimits() {
   // below is then the last thing the logs knew, not the current state.
   const quotaNote = quotaError
     ? `<p class="limits-note">Live quotas could not be read: ${esc(quotaError)}</p>` : '';
+  // the alerts and the declared plans come first: they are what the user
+  // came to this view for.
+  const head = renderAlerts() + renderPlanStatus();
+  const rateTitle = `<h3${head ? '' : ' style="margin-top:0"'}>Rate limits</h3>`;
   if (!limits.length) {
-    box.innerHTML = `<div class="limits"><h3 style="margin-top:0">Rate limits</h3>${quotaNote}
+    box.innerHTML = `<div class="limits">${head}${rateTitle}${quotaNote}
       <p style="color:var(--dim)">No agent reported rate-limit usage in the scanned logs.<br>
       Only Codex writes plan limits into its session files (5h / weekly windows).</p></div>`;
     return;
   }
-  box.innerHTML = `<div class="limits"><h3 style="margin-top:0">Rate limits</h3>${quotaNote}` + limits.map(l => {    const pct = Math.min(100, Math.max(0, l.used_percent));
+  box.innerHTML = `<div class="limits">${head}${rateTitle}${quotaNote}` + limits.map(l => {    const pct = Math.min(100, Math.max(0, l.used_percent));
     const colour = pct > 80 ? 'var(--bad)' : pct > 50 ? 'var(--warn)' : 'var(--accent)';
 
     // Burn-rate projection: how much of the window is gone vs how much of the
@@ -1019,6 +1099,11 @@ function renderLimits() {
     const windowText = live ? (l.detail || `${l.window} window`) : `${l.window} window`;
     const taken = live && snapshot ? ` · updated ${snapshot}` : '';
 
+    // a provider that counts its allowance in money says so in money, not in
+    // percent: the percentage alone would hide how much is left.
+    const amount = l.limit_amount > 0
+      ? `<span class="lm-amount">${fmtUsdCents(l.used_amount)} of ${fmtUsdCents(l.limit_amount)}</span>` : '';
+
     return `<div class="lrow">
       <div class="lh">
         <div class="lh-left">
@@ -1027,7 +1112,10 @@ function renderLimits() {
           ${liveBadge}
           ${badge}
         </div>
-        <span class="pct" style="color:${colour}">${pct.toFixed(0)}%</span>
+        <div class="lh-right">
+          <span class="pct" style="color:${colour}">${pct.toFixed(0)}%</span>
+          ${amount}
+        </div>
       </div>
       <div class="track">
         <i class="bar" style="width:${pct}%;background:${colour}"></i>
@@ -1158,6 +1246,10 @@ function switchSettingsTab(tabName) {
     panel.classList?.add('on');
   }
 
+  // the plans tab shows what the user declared, so it reads the declarations
+  // every time the tab is opened
+  if (tabName === 'plans') loadPlans();
+
   const modalTitle = document.getElementById('modalTitle');
   if (modalTitle) {
     if (tabName === 'updates' && UPDATE_INFO && UPDATE_INFO.available) {
@@ -1198,6 +1290,110 @@ function openSettings(tabName = 'updates') {
   const modal = document.getElementById('updateModal');
   if (modal) modal.hidden = false;
 }
+
+// ---------- plans and budgets ----------
+// What the user declared: a plan is a flat rate they pay, a budget is a
+// limit on what they may spend. The declarations live on disk, so they are
+// read and written through commands instead of being kept in the page.
+let PLANS = [];
+
+// the agents Cinder knows about: the ones it has a colour for, plus the ones
+// the scanned logs mention.
+function knownAgents() {
+  const seen = new Set(Object.keys(AGENT_COLORS));
+  for (const r of ((DATA && DATA.rows) || [])) if (r.agent) seen.add(r.agent);
+  return [...seen].sort();
+}
+
+function planRow(p, i) {
+  const kind = p.kind === 'budget' ? 'budget' : 'subscription';
+  return `<div class="plan-edit" data-i="${i}">
+    <input class="pe-agent" data-i="${i}" data-f="agent" list="planAgents" value="${esc(p.agent || '')}" placeholder="Agent">
+    <select class="pe-kind" data-i="${i}" data-f="kind">
+      <option value="subscription"${kind === 'subscription' ? ' selected' : ''}>Subscription</option>
+      <option value="budget"${kind === 'budget' ? ' selected' : ''}>Budget</option>
+    </select>
+    <input class="pe-limit" data-i="${i}" data-f="limit" type="number" min="0" step="0.01" value="${p.limit > 0 ? esc(String(p.limit)) : ''}" placeholder="0.00">
+    <input class="pe-label" data-i="${i}" data-f="label" value="${esc(p.label || '')}" placeholder="Label">
+    <button class="pe-del" data-i="${i}" title="Remove this declaration">&times;</button>
+  </div>`;
+}
+
+function renderPlans() {
+  const list = document.getElementById('plansList');
+  if (list) {
+    list.innerHTML = PLANS.map(planRow).join('') ||
+      '<div class="plans-empty">Nothing declared yet. A plan says what an agent costs you a month; a budget says how much you may spend.</div>';
+  }
+  const dl = document.getElementById('planAgents');
+  if (dl) dl.innerHTML = knownAgents().map(a => `<option value="${esc(a)}"></option>`).join('');
+}
+
+async function loadPlans() {
+  renderPlans();
+  try {
+    const plans = await invokeCmd('get_plans');
+    PLANS = Array.isArray(plans) ? plans : [];
+  } catch (e) {
+    // no backend to ask: keep the declarations already on screen
+  }
+  renderPlans();
+}
+
+async function savePlans() {
+  const btn = document.getElementById('plansSaveBtn');
+  const status = document.getElementById('plansStatus');
+  // a declaration without a limit says nothing, so it is never sent
+  const rows = PLANS
+    .filter(p => p.agent && Number(p.limit) > 0)
+    .map(p => ({
+      agent: p.agent,
+      kind: p.kind === 'budget' ? 'budget' : 'subscription',
+      limit: Number(p.limit),
+      label: p.label || '',
+    }));
+  if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
+  try {
+    const saved = await invokeCmd('set_plans', { plans: rows });
+    PLANS = Array.isArray(saved) ? saved : rows;
+    renderPlans();
+    if (status) { status.className = 'plans-status'; status.textContent = 'Saved.'; }
+    // the limits view reads the plans out of the stats, so they need a fresh
+    // scan before the new declaration shows up there.
+    load();
+  } catch (e) {
+    if (status) { status.className = 'plans-status bad'; status.textContent = 'Could not save: ' + e; }
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Save'; }
+  }
+}
+
+// the rows are the truth, so every field writes straight back into them
+function planField(e) {
+  const el = e.target;
+  if (!el || !el.dataset || el.dataset.i === undefined) return;
+  const p = PLANS[Number(el.dataset.i)];
+  if (!p) return;
+  const f = el.dataset.f;
+  if (f === 'agent') p.agent = el.value;
+  else if (f === 'kind') p.kind = el.value;
+  else if (f === 'limit') p.limit = Number(el.value);
+  else if (f === 'label') p.label = el.value;
+}
+
+document.getElementById('plansAddBtn')?.addEventListener('click', () => {
+  PLANS.push({ agent: '', kind: 'subscription', limit: 0, label: '' });
+  renderPlans();
+});
+document.getElementById('plansList')?.addEventListener('click', e => {
+  const b = e.target?.closest?.('.pe-del');
+  if (!b) return;
+  PLANS.splice(Number(b.dataset.i), 1);
+  renderPlans();
+});
+document.getElementById('plansList')?.addEventListener('input', planField);
+document.getElementById('plansList')?.addEventListener('change', planField);
+document.getElementById('plansSaveBtn')?.addEventListener('click', savePlans);
 
 function showUpdateModal(info, isUpToDateMessage = false) {
   const modal = document.getElementById('updateModal');
