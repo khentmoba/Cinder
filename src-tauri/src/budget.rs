@@ -62,10 +62,10 @@ pub fn plans_file(home: &Path) -> PathBuf {
 
 /// Read the declarations, if there are any.
 pub fn load(home: &Path) -> Vec<Plan> {
-    let Ok(text) = std::fs::read_to_string(plans_file(home)) else {
+    let Some(v) = crate::read_json_file(&plans_file(home)) else {
         return Vec::new();
     };
-    serde_json::from_str(&text).unwrap_or_default()
+    serde_json::from_value(v).unwrap_or_default()
 }
 
 /// Write the declarations, creating the folder if it is not there yet.

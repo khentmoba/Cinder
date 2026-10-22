@@ -652,12 +652,17 @@ function renderSources() {
   const el = document.getElementById('sourcesList');
   if (!el || !DATA) return;
   el.innerHTML = (DATA.sources || []).map(s => {
+    // A source that could not be read says so: the numbers below it are the
+    // other agents' numbers, and the user should know which one is missing.
+    const failed = s.error ? ' failed' : '';
     const files = s.found ? (s.files ? s.files.toLocaleString() + ' files' : 'found') : 'not installed';
     // how long the scan of this source took, when the collector measured it
     const scan = s.scan_ms ? ' · ' + Math.round(s.scan_ms).toLocaleString() + ' ms' : '';
-    return `<div class="source-item${s.found ? '' : ' off'}">
+    const error = s.error ? `<div class="source-error">${esc(s.error)}</div>` : '';
+    return `<div class="source-item${s.found ? '' : ' off'}${failed}">
     <div class="source-name"><span class="dot"></span><b>${esc(s.agent)}</b> <code>${esc(s.path)}</code></div>
     <div class="source-metrics">${files}${scan}</div>
+    ${error}
   </div>`;
   }).join('') || '<div class="source-metrics">No sources reported by the last scan.</div>';
 }
@@ -1092,10 +1097,14 @@ function renderLimits() {
       : '';
 
     // a live window comes from the provider, so it carries its own badge and
-    // the provider's own description of the window.
-    const live = l.source === 'live';
-    const liveBadge = live
-      ? `<span class="badge badge-live" title="Read from the provider's live quota API">live</span>` : '';
+    // the provider's own description of the window. A stale one is the last
+    // number that came back, which is worth saying out loud.
+    const live = l.source === 'live' || l.source === 'stale';
+    const liveBadge = l.source === 'live'
+      ? `<span class="badge badge-live" title="Read from the provider's live quota API">live</span>`
+      : l.source === 'stale'
+        ? `<span class="badge badge-stale" title="The newest refresh did not come back. These are the last numbers that did.">stale</span>`
+        : '';
     const windowText = live ? (l.detail || `${l.window} window`) : `${l.window} window`;
     const taken = live && snapshot ? ` · updated ${snapshot}` : '';
 

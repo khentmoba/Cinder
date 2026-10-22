@@ -17,7 +17,7 @@ dirs = "6"
 notify = "8"
 zstd = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "sync"] }
 semver = "1"
 fff-search = "0.11.0"
-tauri-plugin-notification = "2.7.0"
+notify-rust = "4"

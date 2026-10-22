@@ -12,7 +12,11 @@ mod prefilter;
 mod pricing;
 mod project;
 mod quota;
+mod tray;
 mod updater;
+
+#[cfg(test)]
+mod testserver;
 
 use alerts::Alert;
 use budget::{Plan, PlanStatus};
@@ -83,10 +87,35 @@ impl Route {
 }
 
 /// Read a small JSON file, if it is there and it parses.
-fn read_json_file(path: &Path) -> Option<serde_json::Value> {
+///
+/// A file written by Notepad or by PowerShell starts with a byte order mark,
+/// which is not part of the document and which the parser refuses, so it is
+/// taken off first.
+pub fn read_json_file(path: &Path) -> Option<serde_json::Value> {
     let text = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    serde_json::from_str(text).ok()
 }
+
+/// Tell Windows which app this is.
+///
+/// Without it, a notification raised by a run that was started from a terminal
+/// is filed under the terminal's name, and the toast says "Windows
+/// PowerShell" instead of "Cinder". The id is the one the installer puts on
+/// the shortcut, so the notifications group with the installed app.
+#[cfg(windows)]
+fn claim_app_id(id: &str) {
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SetCurrentProcessExplicitAppUserModelID(pszappid: *const u16) -> i32;
+    }
+    let wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
+    // The call is told which app this is; it says whether it took.
+    let _ = unsafe { SetCurrentProcessExplicitAppUserModelID(wide.as_ptr()) };
+}
+
+#[cfg(not(windows))]
+fn claim_app_id(_id: &str) {}
 
 /// How Claude Code is signed in on this machine.
 fn claude_route(home: &Path) -> Route {
@@ -168,6 +197,17 @@ pub fn billing_of(reported: Option<f64>, priced: bool, local: bool) -> Billing {
     }
 }
 
+/// Where the money on a row came from.
+#[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CostSource {
+    /// Priced against the public list prices.
+    #[default]
+    Estimated,
+    /// The figure the agent itself reported.
+    Reported,
+}
+
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 pub struct Row {
     pub day: String,
@@ -200,6 +240,12 @@ pub struct Row {
     /// For local models: what the same tokens would have cost on a cloud
     /// provider, i.e. the money running locally saved.
     pub cloud_savings: f64,
+    /// What the agent itself said the request cost, when it wrote it down.
+    #[serde(default)]
+    pub cost_reported: Option<f64>,
+    /// Where the money on this row came from.
+    #[serde(default)]
+    pub cost_source: CostSource,
 }
 
 impl Row {
@@ -239,7 +285,7 @@ pub struct LimitRow {
     pub limit_amount: f64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct Source {
     agent: String,
     path: String,
@@ -247,6 +293,42 @@ struct Source {
     files: u64,
     /// How long this source took to scan, in milliseconds.
     scan_ms: u64,
+    /// Why this source could not be read. Empty when it could.
+    error: String,
+}
+
+/// Read one source, and write down how it went.
+///
+/// A source that goes wrong is noted and skipped: the other agents are still
+/// worth counting, and one parser that trips over a file should not cost the
+/// user the whole dashboard.
+fn scan_source(
+    sources: &mut Vec<Source>,
+    agent: &str,
+    path: &str,
+    f: impl FnOnce() -> u64,
+) -> u64 {
+    let started = std::time::Instant::now();
+    let (files, error) = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(n) => (n, String::new()),
+        Err(e) => {
+            let what = e
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| e.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "the parser stopped unexpectedly".to_string());
+            (0, what)
+        }
+    };
+    sources.push(Source {
+        agent: agent.into(),
+        path: path.into(),
+        found: files > 0,
+        files,
+        scan_ms: started.elapsed().as_millis() as u64,
+        error,
+    });
+    files
 }
 
 /// A usage row produced by one agent, for one model, on one day, in one
@@ -331,6 +413,14 @@ pub fn add(rows: &mut Rows, sess: &mut Sess, agent: &str, model: &str, day: &str
     e.cost_partial |= r.cost_partial || (!r.cost_known && r.tokens() > 0);
     e.savings += r.savings;
     e.cloud_savings += r.cloud_savings;
+    // What the agent said it cost is kept apart from the estimate, so the two
+    // can be compared without one overwriting the other.
+    if let Some(reported) = r.cost_reported {
+        e.cost_reported = Some(e.cost_reported.unwrap_or(0.0) + reported);
+    }
+    if r.cost_source == CostSource::Reported {
+        e.cost_source = CostSource::Reported;
+    }
     // A route that turned out to be billed per token wins over a guess made
     // before the route was known.
     if e.billing == Billing::Unknown {
@@ -951,6 +1041,12 @@ fn parse_single_claude(
             }
         }
         let model = pricing::normalize_model(msg.get("model").and_then(|m| m.as_str()).unwrap_or("unknown"));
+        // Claude Code writes down what each call cost. It is not used when
+        // the catalogue has a price — the dashboard prices every token the
+        // same way, so the figures add up — but it is the answer when the
+        // catalogue does not know the model, which is better than no number
+        // at all.
+        let reported = v.get("costUSD").and_then(|x| x.as_f64()).filter(|c| *c > 0.0);
         let mut r = Row {
             day: day_of(ts),
             agent: "Claude Code".into(),
@@ -966,12 +1062,18 @@ fn parse_single_claude(
             project: project.clone(),
             subagent,
             billing: route.billing(),
+            cost_reported: reported,
             ..Default::default()
         };
         if let Some(pr) = pricing.lookup(model_provider(&model), &model) {
             r.cost = pr.cost_split(input, cache_read, cache_write, cache_write_1h, output);
             r.cost_known = true;
             r.savings = pr.savings_split(cache_read, cache_write, cache_write_1h);
+        } else if let Some(reported) = reported {
+            // The agent knows what it paid; that beats no price at all.
+            r.cost = reported;
+            r.cost_known = true;
+            r.cost_source = CostSource::Reported;
         }
         if r.day.is_empty() { r.day = day.clone(); }
         add(rows, sess, "Claude Code", &model, &r.day.clone(), r);
@@ -1067,8 +1169,14 @@ fn parse_opencode(
     let Some((mtime_ns, size)) = file_stamp(&db) else {
         return 0;
     };
+    // The database is written in write-ahead mode, so a message that was
+    // written a moment ago may still be in the log beside it and not in the
+    // file itself. The stamp of that log is part of the key, or the numbers
+    // would sit still until the next checkpoint.
+    let wal = db.with_extension("wal");
+    let wal_stamp = file_stamp(&wal).unwrap_or((0, 0));
     if let Some(cached) = &cache.opencode_db {
-        if cached.mtime_ns == mtime_ns && cached.size == size {
+        if cached.mtime_ns == mtime_ns && cached.size == size && cached.wal == wal_stamp {
             for r in &cached.rows {
                 add(rows, sess, &r.agent, &r.model, &r.day, r.clone());
             }
@@ -1132,8 +1240,35 @@ fn parse_opencode(
     // few hundred thousand messages, while SQLite does the same sum in well
     // under a second. Messages that report a cost are kept apart from those
     // that do not, because the two are priced differently.
+    // The current schema keeps the messages in `session_message`, with the
+    // model and the content inside the message. The older one keeps them in
+    // `message` and their parts in `part`. A database that has both holds
+    // the old messages twice over, so only one of the two may be read.
+    let current = conn
+        .query_row("SELECT COUNT(*) FROM session_message", [], |r| r.get::<_, i64>(0))
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    let (message_table, provider_col, model_col, assistant) = if current {
+        (
+            "session_message",
+            "json_extract(m.data,'$.model.providerID')",
+            "json_extract(m.data,'$.model.id')",
+            // A compaction is a model call of its own: the summary it wrote
+            // cost tokens, and they are spent whether or not the messages it
+            // replaced are still there.
+            "m.type IN ('assistant','compaction')",
+        )
+    } else {
+        (
+            "message",
+            "json_extract(m.data,'$.providerID')",
+            "json_extract(m.data,'$.modelID')",
+            "json_extract(m.data,'$.role') = 'assistant'",
+        )
+    };
     let day_expr = "date(CASE WHEN m.time_created > 1000000000000 THEN m.time_created/1000 ELSE m.time_created END,'unixepoch')";
-    let columns = "json_extract(m.data,'$.providerID'), json_extract(m.data,'$.modelID'),
+    let columns = format!(
+        "{provider_col}, {model_col},
                    COUNT(*),
                    SUM(COALESCE(json_extract(m.data,'$.tokens.input'),0)),
                    SUM(COALESCE(json_extract(m.data,'$.tokens.output'),0)),
@@ -1141,7 +1276,8 @@ fn parse_opencode(
                    SUM(COALESCE(json_extract(m.data,'$.tokens.cache.write'),0)),
                    SUM(COALESCE(json_extract(m.data,'$.tokens.reasoning'),0)),
                    SUM(COALESCE(json_extract(m.data,'$.cost'),0)),
-                   json_extract(m.data,'$.cost') IS NOT NULL";
+                   json_extract(m.data,'$.cost') IS NOT NULL"
+    );
     // One grouped row of assistant messages.
     struct MsgGroup {
         day: String,
@@ -1164,16 +1300,16 @@ fn parse_opencode(
     let candidates = [
         format!(
             "SELECT {day_expr} AS d, {columns}, s.directory, s.parent_id IS NOT NULL
-             FROM message m LEFT JOIN {} s ON m.session_id = s.id
-             WHERE json_valid(m.data) AND json_extract(m.data,'$.role') = 'assistant'
-             GROUP BY d, 1, 2, 3, 11, 12",
+             FROM {message_table} m LEFT JOIN {} s ON m.session_id = s.id
+             WHERE json_valid(m.data) AND {assistant}
+             GROUP BY d, 2, 3, 12, 13",
             table
         ),
         format!(
             "SELECT {day_expr} AS d, {columns}, NULL, NULL
-             FROM message m
-             WHERE json_valid(m.data) AND json_extract(m.data,'$.role') = 'assistant'
-             GROUP BY d, 1, 2, 3"
+             FROM {message_table} m
+             WHERE json_valid(m.data) AND {assistant}
+             GROUP BY d, 2, 3"
         ),
     ];
     for sql in candidates {
@@ -1231,7 +1367,7 @@ fn parse_opencode(
             }
             add(&mut db_rows, &mut db_sess, "OpenCode", &model, &g.day, r);
         }
-    } else if let Ok(mut stmt) = conn.prepare("SELECT data, time_created, session_id FROM message") {
+    } else if let Ok(mut stmt) = conn.prepare(&format!("SELECT data, time_created, session_id FROM {message_table}")) {
         // An older schema without the token fields: fall back to reading the
         // messages one by one.
         if let Ok(it) = stmt.query_map([], |r| {
@@ -1243,7 +1379,11 @@ fn parse_opencode(
         }) {
             for (data, ts, session_id) in it.flatten() {
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else { continue };
-                if v.get("role").and_then(|x| x.as_str()) != Some("assistant") {
+                if current {
+                    if v.get("type").and_then(|x| x.as_str()) != Some("assistant") {
+                        continue;
+                    }
+                } else if v.get("role").and_then(|x| x.as_str()) != Some("assistant") {
                     continue;
                 }
                 let model = opencode_model(&v);
@@ -1286,24 +1426,50 @@ fn parse_opencode(
     // Group tools in SQLite instead of transferring each call's JSON. The
     // session table carries the working directory, but an older schema does
     // not have that column, so the join is only used when it works.
-    let joined = format!(
-        "SELECT json_extract(m.data, '$.providerID'), json_extract(m.data, '$.modelID'),
-                      date(p.time_created/1000,'unixepoch'), s.directory, COUNT(*)
-               FROM part p JOIN message m ON p.message_id = m.id
-               LEFT JOIN {} s ON m.session_id = s.id
-               WHERE json_valid(p.data) AND json_valid(m.data) AND json_extract(p.data, '$.type') = 'tool'
-               GROUP BY 1, 2, 3, 4",
-        table
-    );
-    let plain = "SELECT json_extract(m.data, '$.providerID'), json_extract(m.data, '$.modelID'),
+    //
+    // The current schema keeps the content inside the message, so the tool
+    // calls are counted from it; the older one keeps the parts in their own
+    // table.
+    let tools_sql = if current {
+        [
+            format!(
+                "SELECT {provider_col}, {model_col},
+                        date(CASE WHEN m.time_created > 1000000000000 THEN m.time_created/1000 ELSE m.time_created END,'unixepoch'), s.directory, COUNT(*)
+                 FROM {message_table} m LEFT JOIN {} s ON m.session_id = s.id, json_each(m.data,'$.content')
+                 WHERE json_valid(m.data) AND {assistant} AND json_extract(value,'$.type') = 'tool'
+                 GROUP BY 1, 2, 3, 4",
+                table
+            ),
+            format!(
+                "SELECT {provider_col}, {model_col},
+                        date(CASE WHEN m.time_created > 1000000000000 THEN m.time_created/1000 ELSE m.time_created END,'unixepoch'), NULL, COUNT(*)
+                 FROM {message_table} m, json_each(m.data,'$.content')
+                 WHERE json_valid(m.data) AND {assistant} AND json_extract(value,'$.type') = 'tool'
+                 GROUP BY 1, 2, 3"
+            ),
+        ]
+    } else {
+        [
+            format!(
+                "SELECT json_extract(m.data, '$.providerID'), json_extract(m.data, '$.modelID'),
+                        date(p.time_created/1000,'unixepoch'), s.directory, COUNT(*)
+                 FROM part p JOIN message m ON p.message_id = m.id
+                 LEFT JOIN {} s ON m.session_id = s.id
+                 WHERE json_valid(p.data) AND json_valid(m.data) AND json_extract(p.data, '$.type') = 'tool'
+                 GROUP BY 1, 2, 3, 4",
+                table
+            ),
+            "SELECT json_extract(m.data, '$.providerID'), json_extract(m.data, '$.modelID'),
                         date(p.time_created/1000,'unixepoch'), NULL, COUNT(*)
                  FROM part p JOIN message m ON p.message_id = m.id
                  WHERE json_valid(p.data) AND json_valid(m.data) AND json_extract(p.data, '$.type') = 'tool'
-                 GROUP BY 1, 2, 3";
+                 GROUP BY 1, 2, 3".to_string(),
+        ]
+    };
     // One grouped row of tool calls: (provider, model, day, directory, calls).
     type ToolRow = (Option<String>, Option<String>, Option<String>, Option<String>, u64);
     let mut tools_by_row: Vec<ToolRow> = Vec::new();
-    for sql in [joined.as_str(), plain] {
+    for sql in tools_sql.iter() {
         let Ok(mut stmt) = conn.prepare(sql) else { continue };
         let Ok(it) = stmt.query_map([], |r| {
             Ok((
@@ -1335,6 +1501,7 @@ fn parse_opencode(
     cache.opencode_db = Some(CachedDb {
         mtime_ns,
         size,
+        wal: wal_stamp,
         count,
         rows: db_rows.into_values().collect(),
         sessions: db_sess.into_keys().collect(),
@@ -1343,9 +1510,23 @@ fn parse_opencode(
     count
 }
 
+/// The model a message ran on.
+///
+/// The current schema keeps it in an object, with the provider and the id
+/// in it; the older one had the two fields at the top of the message.
 fn opencode_model(message: &serde_json::Value) -> String {
-    let id = message["modelID"].as_str().unwrap_or("unknown");
-    match message["providerID"].as_str().filter(|p| !p.is_empty()) {
+    let model = message.get("model").filter(|m| m.is_object());
+    let id = model
+        .and_then(|m| m.get("id"))
+        .and_then(|x| x.as_str())
+        .or_else(|| message["modelID"].as_str())
+        .unwrap_or("unknown");
+    let provider = model
+        .and_then(|m| m.get("providerID"))
+        .and_then(|x| x.as_str())
+        .or_else(|| message["providerID"].as_str())
+        .filter(|p| !p.is_empty());
+    match provider {
         Some(provider) => pricing::normalize_model(&format!("{}/{}", provider, id)),
         None => pricing::normalize_model(id),
     }
@@ -2232,7 +2413,7 @@ fn scan(progress: &dyn Fn(&str)) -> Stats {
 fn scan_home(home: &Path, progress: &dyn Fn(&str)) -> Stats {
     // The live quota snapshot is read from the background refresher, so a scan
     // never waits on the network.
-    let (reports, quota_checked_at) = quota::snapshot();
+    let (reports, quota_checked_at, _, _) = quota::snapshot();
     scan_home_with(home, progress, reports, quota_checked_at)
 }
 
@@ -2244,7 +2425,7 @@ fn scan_home_with(
 ) -> Stats {
     progress("model prices");
     let pricing = Pricing::load(home);
-    let pricing_fp = (pricing.embedded_count as u64) ^ ((pricing.local_count as u64) << 32);
+    let pricing_fp = pricing.fingerprint;
     let mut cache = ScanCache::load_for(home, pricing_fp);
 
     let mut rows = Rows::new();
@@ -2257,76 +2438,73 @@ fn scan_home_with(
     let mut sources: Vec<Source> = Vec::new();
 
     progress("Pi logs");
-    let started = std::time::Instant::now();
-    let pi_files = parse_pi(home, &pricing, &mut cache, &mut rows, &mut sess, &mut plan_routes);
-    sources.push(Source { agent: "Pi".into(), path: "~/.pi/agent/sessions".into(), found: pi_files > 0, files: pi_files, scan_ms: started.elapsed().as_millis() as u64 });
-
-    progress("Claude Code logs");
-    let started = std::time::Instant::now();
-    let claude_files = parse_claude(home, &pricing, &mut cache, &mut rows, &mut sess, &mut artifacts);
-    sources.push(Source { agent: "Claude Code".into(), path: "~/.claude/projects".into(), found: claude_files > 0, files: claude_files, scan_ms: started.elapsed().as_millis() as u64 });
-
-    progress("OpenCode database");
-    let started = std::time::Instant::now();
-    let opencode_n = parse_opencode(home, &pricing, &mut cache, &mut rows, &mut sess);
-    sources.push(Source { agent: "OpenCode".into(), path: "~/.local/share/opencode/opencode.db".into(), found: opencode_n > 0, files: opencode_n, scan_ms: started.elapsed().as_millis() as u64 });
-
-    progress("Antigravity logs");
-    let started = std::time::Instant::now();
-    let agy_dbs = parse_antigravity(home, &pricing, &mut cache, &mut rows, &mut sess);
-    sources.push(Source {
-        agent: "Antigravity".into(),
-        path: "~/.gemini/antigravity* + ~/.t3/userdata/statev2.sqlite + providers/antigravity/*/antigravity-acp".into(),
-        found: agy_dbs > 0,
-        files: agy_dbs,
-        scan_ms: started.elapsed().as_millis() as u64,
+    scan_source(&mut sources, "Pi", "~/.pi/agent/sessions", || {
+        parse_pi(home, &pricing, &mut cache, &mut rows, &mut sess, &mut plan_routes)
     });
 
+    progress("Claude Code logs");
+    scan_source(&mut sources, "Claude Code", "~/.claude/projects", || {
+        parse_claude(home, &pricing, &mut cache, &mut rows, &mut sess, &mut artifacts)
+    });
+
+    progress("OpenCode database");
+    scan_source(&mut sources, "OpenCode", "~/.local/share/opencode/opencode.db", || {
+        parse_opencode(home, &pricing, &mut cache, &mut rows, &mut sess)
+    });
+
+    progress("Antigravity logs");
+    scan_source(
+        &mut sources,
+        "Antigravity",
+        "~/.gemini/antigravity* + ~/.t3/userdata/statev2.sqlite + providers/antigravity/*/antigravity-acp",
+        || parse_antigravity(home, &pricing, &mut cache, &mut rows, &mut sess),
+    );
+
     progress("T3 logs");
-    let started = std::time::Instant::now();
-    let t3_files = parse_t3(home, &mut cache, &mut rows, &mut sess, &mut counted_threads);
-    sources.push(Source { agent: "T3".into(), path: "~/.t3/userdata/providers/antigravity".into(), found: t3_files > 0, files: t3_files, scan_ms: started.elapsed().as_millis() as u64 });
+    scan_source(&mut sources, "T3", "~/.t3/userdata/providers/antigravity", || {
+        parse_t3(home, &mut cache, &mut rows, &mut sess, &mut counted_threads)
+    });
 
     progress("T3 usage database");
-    let started = std::time::Instant::now();
-    let t3_usage_db = parse_t3_usage(home, &pricing, &mut rows, &mut sess, &counted_threads);
-    sources.push(Source { agent: "T3 usage".into(), path: "~/.t3/userdata/statev2.sqlite".into(), found: t3_usage_db, files: t3_usage_db as u64, scan_ms: started.elapsed().as_millis() as u64 });
+    scan_source(&mut sources, "T3 usage", "~/.t3/userdata/statev2.sqlite", || {
+        if parse_t3_usage(home, &pricing, &mut rows, &mut sess, &counted_threads) { 1 } else { 0 }
+    });
 
     progress("DSH logs");
-    let started = std::time::Instant::now();
-    let dsh_files = parse_dsh(home, &pricing, &mut cache, &mut rows, &mut sess);
-    sources.push(Source { agent: "DSH".into(), path: "~/.dsh/sessions".into(), found: dsh_files > 0, files: dsh_files, scan_ms: started.elapsed().as_millis() as u64 });
+    scan_source(&mut sources, "DSH", "~/.dsh/sessions", || {
+        parse_dsh(home, &pricing, &mut cache, &mut rows, &mut sess)
+    });
 
     progress("LM Studio logs");
-    let started = std::time::Instant::now();
-    let lms_files = parse_lmstudio(home, &pricing, &mut cache, &mut rows, &mut sess);
-    sources.push(Source { agent: "LM Studio".into(), path: "~/.lmstudio/conversations + server-logs".into(), found: lms_files > 0, files: lms_files, scan_ms: started.elapsed().as_millis() as u64 });
+    scan_source(&mut sources, "LM Studio", "~/.lmstudio/conversations + server-logs", || {
+        parse_lmstudio(home, &pricing, &mut cache, &mut rows, &mut sess)
+    });
 
     progress("Codex logs");
-    let started = std::time::Instant::now();
-    let codex_files = parse_codex(home, &pricing, &mut cache, &mut rows, &mut sess, &mut limits);
-    sources.push(Source { agent: "Codex".into(), path: "~/.codex/sessions + archived_sessions".into(), found: codex_files > 0, files: codex_files, scan_ms: started.elapsed().as_millis() as u64 });
+    scan_source(&mut sources, "Codex", "~/.codex/sessions + archived_sessions", || {
+        parse_codex(home, &pricing, &mut cache, &mut rows, &mut sess, &mut limits)
+    });
 
     // The agents Cinder learned to read later.
     progress("Cursor logs");
-    let started = std::time::Instant::now();
-    let cursor_files = agents::parse_cursor(home, &pricing, &mut cache, &mut rows, &mut sess);
-    sources.push(Source { agent: "Cursor".into(), path: "~/.cursor/chats + cli-chats".into(), found: cursor_files > 0, files: cursor_files, scan_ms: started.elapsed().as_millis() as u64 });
+    scan_source(&mut sources, "Cursor", "~/.cursor/chats + cli-chats", || {
+        agents::parse_cursor(home, &pricing, &mut cache, &mut rows, &mut sess)
+    });
 
     progress("GitHub Copilot logs");
-    let started = std::time::Instant::now();
-    let copilot_files = agents::parse_copilot(home, &pricing, &mut cache, &mut rows, &mut sess);
-    sources.push(Source { agent: "GitHub Copilot".into(), path: "~/.copilot/history-session-state + logs".into(), found: copilot_files > 0, files: copilot_files, scan_ms: started.elapsed().as_millis() as u64 });
+    scan_source(&mut sources, "GitHub Copilot", "~/.copilot/history-session-state + logs", || {
+        agents::parse_copilot(home, &pricing, &mut cache, &mut rows, &mut sess)
+    });
 
     progress("Gemini CLI logs");
-    let started = std::time::Instant::now();
-    let gemini_files = agents::parse_gemini(home, &pricing, &mut cache, &mut rows, &mut sess);
-    sources.push(Source { agent: "Gemini CLI".into(), path: "~/.gemini/tmp + sessions".into(), found: gemini_files > 0, files: gemini_files, scan_ms: started.elapsed().as_millis() as u64 });
+    scan_source(&mut sources, "Gemini CLI", "~/.gemini/tmp + sessions", || {
+        agents::parse_gemini(home, &pricing, &mut cache, &mut rows, &mut sess)
+    });
 
     progress("Cline logs");
-    let started = std::time::Instant::now();
-    let cline_files = agents::parse_cline(home, &pricing, &mut cache, &mut rows, &mut sess);
-    sources.push(Source { agent: "Cline".into(), path: "VS Code globalStorage/saoudrizwan.claude-dev".into(), found: cline_files > 0, files: cline_files, scan_ms: started.elapsed().as_millis() as u64 });
+    scan_source(&mut sources, "Cline", "VS Code globalStorage/saoudrizwan.claude-dev", || {
+        agents::parse_cline(home, &pricing, &mut cache, &mut rows, &mut sess)
+    });
 
     cache.save();
     progress("done");
@@ -2354,7 +2532,9 @@ fn scan_home_with(
                 window_minutes: w.window_minutes,
                 resets_at: w.resets_at,
                 plan: w.plan.clone(),
-                source: "live".into(),
+                // A window that is not fresh is marked as such: it is the last
+                // number that came back, not the current state.
+                source: if report.stale { "stale".into() } else { "live".into() },
                 detail: w.detail.clone(),
                 used_amount: w.used_amount,
                 limit_amount: w.limit_amount,
@@ -2389,6 +2569,24 @@ fn scan_home_with(
     let month = budget::month_of(&unix_day(now));
     let plans = budget::statuses(&rows, &budget::load(home), &month);
     let alerts = alerts::evaluate(&live_windows, &plans, now);
+
+    // The tray popover answers from what the last scan found, so opening it
+    // never has to walk the logs again.
+    let today = unix_day(now);
+    let today_rows: Vec<&Row> = rows.iter().filter(|r| r.day == today).collect();
+    // A run that used no tokens costs nothing, so it does not make the
+    // day's cost unknown.
+    let priced_today: Vec<&&Row> = today_rows.iter().filter(|r| r.tokens() > 0).collect();
+    tray::remember(tray::ScanSummary {
+        today_cost: today_rows.iter().map(|r| r.cost).sum(),
+        today_cost_known: priced_today.iter().all(|r| r.cost_known),
+        today_cost_partial: today_rows.iter().any(|r| r.cost_partial),
+        today_tokens: today_rows.iter().map(|r| r.tokens()).sum(),
+        today_requests: today_rows.iter().map(|r| r.requests).sum(),
+        alerts: alerts.clone(),
+        plans: plans.clone(),
+        scanned_at: quota::now_iso(),
+    });
 
     Stats {
         rows,
@@ -2465,89 +2663,88 @@ fn set_plans(app: AppHandle, plans: Vec<Plan>) -> Result<Vec<Plan>, String> {
     Ok(budget::load(&home))
 }
 
+/// What the tray popover shows.
+#[tauri::command]
+fn get_tray_summary() -> tray::TraySummary {
+    tray::summary()
+}
+
+/// Do something the popover asked for.
+#[tauri::command]
+fn tray_action(app: AppHandle, action: String) {
+    match action.as_str() {
+        "open" => tray::show_window(&app),
+        "rescan" => tray::rescan(&app),
+        "quit" => app.exit(0),
+        "hide" => tray::hide_popover(&app),
+        // A refresh of the live quotas, without waiting for the timer.
+        "refresh-quota" => request_quota_refresh(),
+        _ => {}
+    }
+}
+
 // ---------------- System tray ----------------
 // The tray shows how close the tightest live quota window is to its ceiling,
-// so the number that matters is visible without opening the window.
-static TRAY: std::sync::LazyLock<std::sync::Mutex<Option<tauri::tray::TrayIcon>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+// so the number that matters is visible without opening the window, and a
+// click opens a popover with the whole picture. The tray itself lives in
+// `tray.rs`.
 
-/// The tray tooltip: the tightest window first, then the rest.
-fn tray_tooltip(reports: &[quota::QuotaReport]) -> String {
-    let mut windows: Vec<&quota::LiveQuota> = reports
-        .iter()
-        .filter(|r| !r.skipped)
-        .flat_map(|r| r.windows.iter())
-        .collect();
-    if windows.is_empty() {
-        return "Cinder — no live quota available".into();
-    }
-    windows.sort_by(|a, b| b.used_percent.partial_cmp(&a.used_percent).unwrap_or(std::cmp::Ordering::Equal));
-    let mut parts = vec![format!("Cinder — {} windows", windows.len())];
-    for w in windows.iter().take(3) {
-        parts.push(format!("{} {} {:.0}%", w.agent, w.window, w.used_percent));
-    }
-    parts.join(" | ")
+/// Wakes the quota refresher, so a refresh asked for by hand does not wait
+/// for the timer.
+static QUOTA_WAKE: (std::sync::Mutex<bool>, std::sync::Condvar) =
+    (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+/// Ask the background refresher to run now.
+fn request_quota_refresh() {
+    let (lock, cvar) = &QUOTA_WAKE;
+    let mut flag = lock.lock().unwrap_or_else(|e| e.into_inner());
+    *flag = true;
+    cvar.notify_all();
 }
 
-/// Refresh the tray tooltip from the latest snapshot.
-fn update_tray_tooltip() {
-    let (reports, _) = quota::snapshot();
-    let tip = tray_tooltip(&reports);
-    let mut guard = TRAY.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(tray) = guard.as_mut() {
-        let _ = tray.set_tooltip(Some(tip));
+/// Wait for the next tick, or until somebody asks for a refresh.
+fn wait_for_quota_tick() {
+    let (lock, cvar) = &QUOTA_WAKE;
+    let mut flag = lock.lock().unwrap_or_else(|e| e.into_inner());
+    // A little jitter, so machines that were started at the same time do not
+    // all ask the providers at the same moment.
+    let jitter = std::time::Duration::from_secs((now_secs() % 30) as u64);
+    while !*flag {
+        let (guard, timeout) = cvar
+            .wait_timeout(flag, quota::REFRESH_INTERVAL + jitter)
+            .unwrap_or_else(|e| e.into_inner());
+        flag = guard;
+        if timeout.timed_out() {
+            break;
+        }
     }
+    *flag = false;
 }
 
-/// Build the tray icon and its menu.
-fn build_tray(app: &AppHandle) -> tauri::Result<()> {
-    use tauri::menu::{Menu, MenuItem};
-    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-
-    let show = MenuItem::with_id(app, "show", "Open Cinder", true, None::<&str>)?;
-    let refresh = MenuItem::with_id(app, "refresh", "Rescan now", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "Quit Cinder", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &refresh, &quit])?;
-
-    let mut builder = TrayIconBuilder::with_id("cinder-tray")
-        .tooltip(tray_tooltip(&[]))
-        .menu(&menu)
-        .show_menu_on_left_click(false)
-        .on_menu_event(|app, event| match event.id.as_ref() {
-            "show" => show_window(app),
-            "refresh" => {
-                let app = app.clone();
-                std::thread::spawn(move || {
+/// Keep the price list fresh.
+///
+/// The bundled catalogue is a snapshot taken when the app was built. A fresh
+/// one is fetched once a day, so a model that appeared last week is priced at
+/// this week's price instead of showing up as unpriced.
+fn spawn_price_refresher(app: AppHandle) {
+    std::thread::spawn(move || {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        loop {
+            if pricing::needs_refresh(&home) {
+                let fetched = tokio::runtime::Runtime::new()
+                    .map(|rt| rt.block_on(pricing::refresh(&home)))
+                    .unwrap_or_else(|_| Err("no runtime".into()));
+                if let Ok(count) = fetched {
+                    // The prices changed, so the dashboard is rescanned with
+                    // them and the user sees the difference.
+                    eprintln!("price list refreshed: {count} models");
                     let stats = scan(&|_| {});
                     let _ = app.emit("stats-updated", &stats);
-                });
+                }
             }
-            "quit" => app.exit(0),
-            _ => {}
-        })
-        .on_tray_icon_event(|tray, event| {
-            // A left click brings the window back; the menu is for the right
-            // button, so it stays out of the way.
-            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
-                show_window(tray.app_handle());
-            }
-        });
-    if let Some(icon) = app.default_window_icon() {
-        builder = builder.icon(icon.clone());
-    }
-    let tray = builder.build(app)?;
-    let mut guard = TRAY.lock().unwrap_or_else(|e| e.into_inner());
-    *guard = Some(tray);
-    Ok(())
-}
-
-/// Bring the dashboard back to the front.
-fn show_window(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
-    }
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
+    });
 }
 
 /// Ask the providers for their quota windows, over and over.
@@ -2558,6 +2755,10 @@ fn show_window(app: &AppHandle) {
 fn spawn_quota_refresher(app: AppHandle) {
     std::thread::spawn(move || {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        // The numbers from the last run are on disk, so a launch shows them
+        // while the first refresh is still in flight.
+        quota::restore_cache(&home);
+        tray::refresh();
         loop {
             let reports = match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt.block_on(quota::fetch_all(&home)),
@@ -2565,13 +2766,14 @@ fn spawn_quota_refresher(app: AppHandle) {
             };
             if !reports.is_empty() {
                 quota::publish(reports);
-                update_tray_tooltip();
+                quota::save_cache(&home, &quota::snapshot().0);
+                tray::refresh();
                 // The window shows the limits too, so it gets the new numbers.
                 let stats = scan(&|_| {});
                 announce(&app, &stats.alerts);
                 let _ = app.emit("stats-updated", &stats);
             }
-            std::thread::sleep(quota::REFRESH_INTERVAL);
+            wait_for_quota_tick();
         }
     });
 }
@@ -2581,30 +2783,40 @@ fn spawn_quota_refresher(app: AppHandle) {
 /// The same alert is not announced twice, and one that clears is forgotten so
 /// it can fire again later.
 fn announce(app: &AppHandle, alerts: &[Alert]) {
-    use tauri_plugin_notification::NotificationExt;
+    let id = app.config().identifier.clone();
     for alert in alerts::take_new(alerts) {
-        let _ = app
-            .notification()
-            .builder()
-            .title(&alert.title)
-            .body(&alert.detail)
-            .show();
+        let mut n = notify_rust::Notification::new();
+        n.summary(&alert.title);
+        n.body(&alert.detail);
+        // Without this the notification is filed under the PowerShell app id,
+        // and the toast says "Windows PowerShell" instead of "Cinder".
+        n.app_id(&id);
+        let _ = n.show();
     }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // The window and the notifications are Cinder's, not the name of whatever
+    // started them.
+    claim_app_id("com.cinder.usage");
     tauri::Builder::default()
         // Remember where the user put the window instead of resetting to the
         // config default on every launch.
         .plugin(tauri_plugin_window_state::Builder::default().build())
-        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             spawn_log_watcher(app.handle().clone());
             spawn_quota_refresher(app.handle().clone());
-            if let Err(e) = build_tray(app.handle()) {
+            spawn_price_refresher(app.handle().clone());
+            if let Err(e) = tray::build(app.handle()) {
                 // A missing tray is not a reason to refuse to start.
                 eprintln!("system tray unavailable: {e}");
+            }
+            tray::open_on_start(app.handle());
+            // The popover hides itself when it loses the focus, the way a
+            // menu does.
+            if let Some(window) = app.get_webview_window(tray::POPOVER) {
+                tray::watch_popover(&window);
             }
             Ok(())
         })
@@ -2615,7 +2827,9 @@ pub fn run() {
             download_and_install_update,
             get_app_version,
             get_plans,
-            set_plans
+            set_plans,
+            get_tray_summary,
+            tray_action
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

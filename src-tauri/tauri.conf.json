@@ -15,6 +15,21 @@
         "height": 760,
         "minWidth": 800,
         "minHeight": 600
+      },
+      {
+        "label": "tray",
+        "title": "Cinder — Subscriptions",
+        "url": "tray.html",
+        "width": 360,
+        "height": 600,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "center": false
       }
     ],
     "security": {

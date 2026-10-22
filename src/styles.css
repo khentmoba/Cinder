@@ -108,6 +108,7 @@ h3 { font-size: 13px; font-weight: 600; margin: 26px 0 12px; }
 .badge-local { color: var(--good); background: rgba(86, 211, 100, 0.12); }
 .badge-sub { color: var(--dim); background: rgba(163, 163, 173, 0.12); }
 .badge-live { color: var(--accent); background: rgba(107, 138, 253, 0.12); }
+.badge-stale { color: var(--warn); background: rgba(210, 153, 34, 0.12); }
 .bd-row .bd-name .badge { margin-left: 5px; }
 .bd-row .bd-cost .badge { margin-left: 5px; }
 .big-row .badge { margin-left: 0; }
@@ -450,6 +451,9 @@ footer {
   padding: 8px 10px; display: flex; flex-direction: column; gap: 2px;
 }
 .source-item.off { opacity: .6; }
+.source-item.failed { border-color: #5c2422; }
+.source-item.failed .source-name .dot { background: var(--bad); }
+.source-error { font-size: 11px; color: var(--bad); }
 .source-name { font-size: 12px; color: var(--text); display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .source-name .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--good); flex: none; }
 .source-item.off .source-name .dot { background: var(--faint); }

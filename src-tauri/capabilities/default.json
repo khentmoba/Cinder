@@ -2,6 +2,6 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "default capability",
-  "windows": ["main"],
-  "permissions": ["core:default", "notification:default"]
+  "windows": ["main", "tray"],
+  "permissions": ["core:default"]
 }
