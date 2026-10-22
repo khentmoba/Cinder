@@ -1100,7 +1100,16 @@ async fn try_json(
                     .and_then(|m| m.as_str())
                     .map(|s| s.to_string())
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                // A short plain answer is worth repeating too. A long one -
+                // an error page, say - is not.
+                let trimmed = body.trim();
+                if trimmed.is_empty() || trimmed.len() > 120 || trimmed.starts_with('<') {
+                    String::new()
+                } else {
+                    trimmed.to_string()
+                }
+            });
         return Err(FetchError::Status(status.as_u16(), said));
     }
     resp.json::<serde_json::Value>().await.map_err(|e| FetchError::BadJson(e.to_string()))
@@ -1147,13 +1156,63 @@ fn account_label(agent: &str, cred: &Credential, many: bool) -> String {
     format!("{agent} \u{b7} {}", cred.account)
 }
 
+/// The providers whose token can be refreshed.
+#[derive(Clone, Copy, PartialEq)]
+enum Account {
+    Claude,
+    Codex,
+}
+
+/// Refresh the account's token, if it can be.
+async fn refresh_account(
+    client: &reqwest::Client,
+    endpoints: &Endpoints,
+    account: Account,
+    cred: &Credential,
+) -> Option<Credential> {
+    match account {
+        Account::Claude => refresh_claude(client, endpoints, cred).await,
+        Account::Codex => refresh_codex(client, endpoints, cred).await,
+    }
+}
+
+/// Ask for the usage, refreshing the token once if it is refused.
+///
+/// A token can be refused before its expiry is known — the clock moved, or the
+/// agent stored no expiry at all — so asking again with a fresh token is
+/// worth one attempt.
+async fn get_usage(
+    client: &reqwest::Client,
+    endpoints: &Endpoints,
+    account: Account,
+    cred: &mut Credential,
+    url: &str,
+    extra: &[(&str, &str)],
+) -> Result<serde_json::Value, FetchError> {
+    let first = get_json(client, url, &cred.token, extra).await;
+    let Err(FetchError::Status(401, said)) = first else { return first };
+    let Some(next) = refresh_account(client, endpoints, account, cred).await else {
+        return Err(FetchError::Status(401, said));
+    };
+    let token = next.token.clone();
+    *cred = next;
+    match get_json(client, url, &token, extra).await {
+        // The fresh token was refused too: the old answer is the one to keep.
+        Err(FetchError::Status(401, _)) => Err(FetchError::Status(401, said)),
+        other => other,
+    }
+}
+
 /// The Claude Code usage for one account.
 async fn claude_code(client: reqwest::Client, endpoints: Endpoints, cred: Credential, many: bool) -> QuotaReport {
     let label = account_label("Claude Code", &cred, many);
-    let v = match get_json(
+    let mut cred = cred;
+    let v = match get_usage(
         &client,
+        &endpoints,
+        Account::Claude,
+        &mut cred,
         &endpoints.claude_usage,
-        &cred.token,
         &[("anthropic-beta", "oauth-2025-04-20")],
     )
     .await
@@ -1186,12 +1245,14 @@ async fn claude_code(client: reqwest::Client, endpoints: Endpoints, cred: Creden
 }
 
 /// The Codex usage for one account.
-async fn codex(client: reqwest::Client, endpoints: Endpoints, cred: Credential, many: bool) -> QuotaReport {
+async fn codex(client: reqwest::Client, endpoints: Endpoints, mut cred: Credential, many: bool) -> QuotaReport {
     let label = account_label("Codex", &cred, many);
-    let usage = get_json(
+    let usage = get_usage(
         &client,
+        &endpoints,
+        Account::Codex,
+        &mut cred,
         &endpoints.codex_usage,
-        &cred.token,
         &[("OpenAI-Beta", "codex-1")],
     )
     .await;
@@ -1837,7 +1898,7 @@ mod tests {
         let server = MockServer::start(vec![Reply::status(401, "nope")]);
         let rt = tokio::runtime::Runtime::new().unwrap();
         let v = rt.block_on(get_json(&server.client(), &server.url("/usage"), "t", &[]));
-        assert_eq!(v.unwrap_err(), FetchError::Status(401, String::new()));
+        assert_eq!(v.unwrap_err(), FetchError::Status(401, "nope".to_string()));
         assert_eq!(server.requests().len(), 1);
     }
 
@@ -1969,6 +2030,9 @@ mod tests {
 
     #[test]
     fn a_provider_that_does_not_answer_in_time_is_given_up_on() {
+        // It settles into the provider state like any other, so it takes the
+        // lock too.
+        let _guard = state_guard();
         STATE.lock().unwrap().clear();
         let server = MockServer::start(vec![Reply::slow(r#"{"ok":true}"#, 400)]);
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -1985,6 +2049,67 @@ mod tests {
         assert_eq!(report.error_kind, Some(ErrorKind::Timeout));
         assert!(report.error.contains("did not answer"));
         STATE.lock().unwrap().clear();
+    }
+
+    #[test]
+    fn a_refused_token_is_refreshed_and_asked_again() {
+        let server = MockServer::start(vec![
+            // The usage is refused...
+            Reply::status(401, "the token has expired"),
+            // ...the refresh gives a new one...
+            Reply::ok(r#"{"access_token":"fresh","expires_in":3600}"#),
+            // ...and the second ask works.
+            Reply::ok(r#"{"five_hour": {"utilization": 12}}"#),
+        ]);
+        let dir = std::env::temp_dir().join(format!("cinder-refresh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".credentials.json");
+        std::fs::write(&path, r#"{"claudeAiOauth": {"accessToken": "old"}}"#).unwrap();
+        let cred = Credential {
+            path: path.clone(),
+            token: "old".into(),
+            refresh: Some("the-refresh-token".into()),
+            expires_at: 0,
+            plan: String::new(),
+            account: String::new(),
+        };
+        let endpoints = Endpoints {
+            claude_usage: server.url("/usage"),
+            claude_token: server.url("/token"),
+            ..Endpoints::default()
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let report = rt.block_on(claude_code(server.client(), endpoints, cred, false));
+        assert!(report.error.is_empty(), "the retry should have worked: {}", report.error);
+        assert_eq!(report.windows.len(), 1);
+        assert_eq!(report.windows[0].used_percent, 12.0);
+        // The new token was written back, so the agent stays signed in.
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("fresh"), "the new token should have been written back");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_refused_token_with_nothing_to_refresh_with_stays_refused() {
+        let server = MockServer::start(vec![Reply::status(401, "the token has expired")]);
+        let cred = Credential {
+            path: PathBuf::from("nowhere"),
+            token: "old".into(),
+            refresh: None,
+            expires_at: 0,
+            plan: String::new(),
+            account: String::new(),
+        };
+        let endpoints = Endpoints {
+            claude_usage: server.url("/usage"),
+            ..Endpoints::default()
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let report = rt.block_on(claude_code(server.client(), endpoints, cred, false));
+        assert!(report.error.contains("401"), "got: {}", report.error);
+        assert!(report.error.contains("the token has expired"), "the provider's own words: {}", report.error);
+        // And it was not asked twice.
+        assert_eq!(server.requests().len(), 1);
     }
 
     #[test]
