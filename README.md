@@ -449,6 +449,7 @@ are checked against the provider's own record of them:
 
 ```bash
 node scripts/check-live-quota.mjs
+node scripts/check-claude-quota.mjs
 ```
 
 The Codex CLI writes its copy of the limits into its own session log, so
@@ -468,6 +469,22 @@ the CLI wrote its limits at 2026-10-21T21:45:47.547Z
 The reset times have to match exactly; the percentages may have moved a
 little between the log being written and the fetch, so they are compared
 with a small tolerance.
+
+Claude Code writes its copy of the limits down as well, in the `quotaLimits`
+of the record where a request was refused, so its card can be checked the
+same way:
+
+```
+the CLI wrote its limits at 2026-10-22T05:53:21.228Z
+  five_hour      log status rejected, resets 2026-10-22T07:00:00.000Z (1792652400)
+  five_hour      app  100% used, resets 2026-10-22T06:59:59.000Z (1792652399)  reset the same
+  api   refused the request: the window is full, which is what the card says
+```
+
+The CLI only writes its record when it is refused, so what it holds is the
+moment the window filled up rather than a percentage; the reset moment is
+the one that has to line up. When the window is full the API refuses the
+fetch too, which is the provider's own answer to the same question.
 
 Anthropic sends the list of the windows a plan has, and Cinder reads it for
 the windows the named fields do not carry and for the reset times they leave
