@@ -474,6 +474,59 @@ fn a_turn_written_down_twice_is_counted_once() {
     assert_eq!(r.tools, 2);
 }
 
+/// A request past the long-context threshold is priced at the premium.
+///
+/// Some providers charge more once a request is long: the catalogue carries
+/// the rates for that case and the threshold they start at. The CLI's own
+/// charges agree - a claude-haiku-5-5 session whose prompt passed a hundred
+/// thousand tokens was charged at the premium rates and not at the flat ones.
+#[test]
+fn a_request_past_the_long_context_threshold_is_priced_at_the_premium() {
+    let home = Home::new();
+    let p = Pricing::load(&home.0);
+    let haiku = p.lookup(None, "claude-haiku-5-5").expect("haiku should be priced");
+    let tier = haiku.tier.expect("haiku should carry a long-context premium");
+    assert_eq!(tier.above, 100_000);
+    // A short request is priced at the base rates.
+    let short = haiku.cost_split(1_000, 10_000, 0, 0, 1_000);
+    let short_expected = (1_000.0 * 0.1 + 10_000.0 * 0.01 + 1_000.0 * 0.5) / 1e6;
+    assert!((short - short_expected).abs() < 1e-12, "got {short}, expected {short_expected}");
+    // A long one at the premium rates.
+    let long = haiku.cost_split(1_000, 200_000, 0, 0, 1_000);
+    let long_expected = (1_000.0 * 0.5 + 200_000.0 * 0.05 + 1_000.0 * 2.5) / 1e6;
+    assert!((long - long_expected).abs() < 1e-12, "got {long}, expected {long_expected}");
+}
+
+/// A fetched catalogue can carry the premium, and the agent catalogues can
+/// carry it too.
+#[test]
+fn a_catalogue_can_carry_a_long_context_premium() {
+    let home = Home::new();
+    home.write(
+        ".cinder/prices.json",
+        &json!({"meta": {"fetched": "2026-10-22"}, "models": {
+            "vendor/long-model": {
+                "i": 1.0, "o": 5.0, "cr": 0.1, "cw": 1.25,
+                "tier": {"above": 100000, "i": 5.0, "o": 25.0, "cr": 0.5, "cw": 6.25, "cw1h": 10.0}
+            }
+        }})
+        .to_string(),
+    );
+    home.write(".pi/agent/models-store.json", &json!({
+        "vendor": {"models": [{"id": "tiered-model", "cost": {
+            "input": 2.0, "output": 10.0, "cacheRead": 0.2, "cacheWrite": 2.5,
+            "tiers": [{"inputTokensAbove": 100000, "input": 10.0, "output": 50.0, "cacheRead": 1.0, "cacheWrite": 12.5}]
+        }}]}
+    }).to_string());
+    let p = Pricing::load(&home.0);
+    let fetched = p.lookup(None, "long-model").expect("the fetched price should be found");
+    assert_eq!(fetched.tier.expect("the premium should be carried").above, 100_000);
+    assert!((fetched.cost_split(0, 200_000, 0, 0, 0) - 200_000.0 * 0.5 / 1e6).abs() < 1e-12);
+    let local = p.lookup(Some("vendor"), "tiered-model").expect("the agent catalogue should be found");
+    assert_eq!(local.tier.expect("the premium should be carried").above, 100_000);
+    assert!((local.cost_split(0, 200_000, 0, 0, 0) - 200_000.0 * 1.0 / 1e6).abs() < 1e-12);
+}
+
 /// DSH keeps its sessions as zstd-compressed JSONL.
 ///
 /// The fixture is the shape the real files have: a `session` line with the
@@ -869,15 +922,15 @@ fn a_1h_cache_write_is_priced_at_its_own_rate() {
 /// million for the 1-hour writes. At $10 the charge is 25% too high.
 #[test]
 fn the_1h_cache_write_rate_is_twice_the_input_price() {
-    let p = crate::pricing::Price { i: 4.0, o: 20.0, cr: 0.2, cw: 5.0 };
+    let p = crate::pricing::Price { i: 4.0, o: 20.0, cr: 0.2, cw: 5.0, ..Default::default() };
     assert_eq!(p.cache_write_1h_rate(), 8.0);
     // A catalog with no cache-write price of its own still works out: the
     // 5-minute write is 1.25x the input price, the 1-hour one is twice it.
-    let q = crate::pricing::Price { i: 4.0, o: 20.0, cr: 0.2, cw: 0.0 };
+    let q = crate::pricing::Price { i: 4.0, o: 20.0, cr: 0.2, cw: 0.0, ..Default::default() };
     assert_eq!(q.cache_write_1h_rate(), 8.0);
     // And a 1-hour write costs more than sending the same tokens as input,
     // so it is not a saving.
-    assert_eq!(p.savings_split(0, 1000, 1000), 0.0);
+    assert_eq!(p.savings_split(0, 0, 1000, 1000), 0.0);
     assert!((p.cost_split(0, 0, 1000, 1000, 0) - 1000.0 * 8.0 / 1e6).abs() < 1e-12);
 }
 
@@ -1173,6 +1226,19 @@ fn real_home_day_check() {
     }
     for (agent, (requests, tokens, cost, known, partial)) in per_agent {
         println!("AGENT\t{agent}\t{requests}\t{tokens}\t{cost:.6}\tknown={known}\tpartial={partial}");
+    }
+    // The models whose price is unknown, so the tokens they carry can be seen.
+    let mut unpriced: std::collections::BTreeMap<String, (u64, f64)> = Default::default();
+    for r in &stats.rows {
+        if r.cost_known || r.tokens() == 0 {
+            continue;
+        }
+        let e = unpriced.entry(r.agent.clone()).or_insert((0, 0.0));
+        e.0 += r.tokens();
+        e.1 += r.cost;
+    }
+    for (agent, (tokens, cost)) in unpriced {
+        println!("UNPRICED\t{agent}\t{tokens}\t{cost:.6}");
     }
     // The token totals on their own, for the agent whose tokens come out of a
     // database rather than out of a log line. The requests are left out on

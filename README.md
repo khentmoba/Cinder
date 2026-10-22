@@ -279,6 +279,12 @@ a snapshot; a fresh one is fetched once a day in the background and kept in
 week's price instead of showing up as unpriced. The bundled list is still
 there underneath, so a fetch that fails changes nothing.
 
+The bundled snapshot is refreshed by hand with
+`node scripts/refresh-bundled-prices.mjs`, which merges the fetched list over
+it the same way the collector does: the fresh prices win, the models the
+upstream list has since dropped stay, and the long-context premiums come
+along.
+
 When a model has no price at all, but the agent itself wrote down what the
 call cost, that figure is used instead: the number the agent knows is better
 than no number. Those rows are marked as **reported** rather than estimated.
@@ -290,6 +296,11 @@ pay-as-you-go route pricing the same model - the route that served the
 request is not known, so the public list price is used instead. The work was
 not free, and a list price is the same figure the rest of the dashboard
 quotes.
+
+A long request is priced at the premium some providers charge past a
+threshold. The threshold is the prompt length - the input, the cached input
+and the cache writes - and the catalogue carries the rates for it, so the
+estimate follows the price list instead of averaging over it.
 
 ## Speed
 
@@ -406,29 +417,30 @@ counted once per id. The tool calls are still counted from every record,
 because each block is written exactly once.
 
 The same file answers a second question: what the CLI charged against the
-price list. Five of the six models it used agree with the list price to a
-tenth of a percent:
+price list. The estimate is worked out per request, because a long request is
+priced at the premium rate and a flat average would hide that:
 
 ```
-claude-opus-5-5              charged $105.7749  list price $105.7913  diff +0.0%
-claude-sonnet-5-5            charged $20.4019   list price $20.4091   diff +0.0%
-claude-haiku-4-5             charged $0.0260    list price $0.0260    diff +0.0%
-claude-opus-5-5[1m]          charged $11.1364   list price $11.1364   diff +0.0%
-claude-haiku-5-5             charged $17.5566   list price $4.7297    diff -73.1%
+sessions compared: 34, within 1%: 24, median difference: -0.0%
+claude-opus-5-5              charged $57.7720  list price $60.3501  diff +4.5%
+claude-opus-5-5[1m]          charged $11.1364  list price $11.1364  diff +0.0%
+claude-haiku-5-5[1m]         charged $0.0282   list price $0.0282   diff +0.0%
 ```
 
-The last one is a known gap: Anthropic prices that model with a premium past
-a hundred thousand tokens, and Cinder estimates with one flat rate, so the
-figure is too low for it. The premium is not modelled yet, and the check says
-so rather than hiding it.
+The sessions that differ are the ones where the CLI's last snapshot lags the
+transcript, or where the session's total spans more than one file: the CLI
+counts the calls it made for the session's own title, which the transcript
+never holds.
 
-Two price bugs came out of the same comparison. A 1-hour cache write is
+The pricing bugs this comparison found are fixed. A 1-hour cache write is
 billed at twice the *input* price, not twice the 5-minute write price, which
 is 25% more than it should be - the upstream catalogue carries the rate as
-`cache_creation_input_token_cost_above_1hr`. And when the agent catalogues on
-this machine disagree about a model's price, the public list price is used
-instead of nothing at all: Claude Code's opus row went from $0.00 a day to
-$30.94, and the day's figure from a partial `$10.42` to a complete one.
+`cache_creation_input_token_cost_above_1hr`. When the agent catalogues
+disagree about a model's price, the public list price is used instead of
+nothing at all: Claude Code's opus row went from $0.00 a day to $30.94, and
+the day's figure from a partial `$10.42` to a complete one. And a long
+request is priced at the premium the catalogue lists for it, so the estimate
+follows the price list instead of averaging over it.
 
 ### Checking the popover against the provider's own numbers
 

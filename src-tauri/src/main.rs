@@ -1086,7 +1086,7 @@ fn parse_single_claude(
         if let Some(pr) = pricing.lookup(model_provider(&model), &model) {
             r.cost = pr.cost_split(input, cache_read, cache_write, cache_write_1h, output);
             r.cost_known = true;
-            r.savings = pr.savings_split(cache_read, cache_write, cache_write_1h);
+            r.savings = pr.savings_split(input, cache_read, cache_write, cache_write_1h);
         } else if let Some(reported) = reported {
             // The agent knows what it paid; that beats no price at all.
             r.cost = reported;

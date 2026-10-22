@@ -19,16 +19,81 @@ const LITELLM_URL: &str =
 /// How long a fetched catalogue is used before a new one is fetched.
 const CATALOG_TTL_HOURS: u64 = 24;
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+/// The premium a provider charges past a long context.
+///
+/// Some models cost more once the request is longer than a threshold: the
+/// catalogue carries the rates for that case, and the threshold is the
+/// prompt length (the input, the cached input and the cache writes) past
+/// which they apply.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
+pub struct Tier {
+    /// The prompt length past which the premium applies.
+    pub above: u64,
+    pub i: f64,
+    pub o: f64,
+    pub cr: f64,
+    pub cw: f64,
+    /// The 1-hour cache write rate past the threshold, when it is known.
+    #[serde(default)]
+    pub cw1h: f64,
+}
+
+impl Tier {
+    /// The 1-hour ephemeral cache write rate past the threshold: twice the
+    /// input price, when the catalogue does not say.
+    pub fn cache_write_1h_rate(&self) -> f64 {
+        if self.cw1h > 0.0 {
+            self.cw1h
+        } else {
+            self.i * 2.0
+        }
+    }
+    /// The cost of a request priced past the threshold.
+    pub fn cost_split(
+        &self,
+        input: u64,
+        cache_read: u64,
+        cache_write: u64,
+        cache_write_1h: u64,
+        output: u64,
+    ) -> f64 {
+        let five_min = cache_write.saturating_sub(cache_write_1h);
+        (input as f64 * self.i
+            + cache_read as f64 * self.cr
+            + five_min as f64 * self.cw
+            + cache_write_1h as f64 * self.cache_write_1h_rate()
+            + output as f64 * self.o)
+            / 1e6
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
 pub struct Price {
     pub i: f64,
     pub o: f64,
     pub cr: f64,
     pub cw: f64,
+    /// The premium past a long context, when the provider charges one.
+    #[serde(default)]
+    pub tier: Option<Tier>,
 }
 
 impl Price {
+    /// The rate for a request of this size.
+    ///
+    /// A request whose prompt is past the provider's long-context threshold is
+    /// priced at the premium rates, if the catalogue has them.
+    fn rates_for(&self, prompt: u64) -> Option<Tier> {
+        match self.tier {
+            Some(t) if prompt > t.above => Some(t),
+            _ => None,
+        }
+    }
     pub fn cost(&self, input: u64, cache_read: u64, cache_write: u64, output: u64) -> f64 {
+        let prompt = input + cache_read + cache_write;
+        if let Some(t) = self.rates_for(prompt) {
+            return t.cost_split(input, cache_read, cache_write, 0, output);
+        }
         (input as f64 * self.i + cache_read as f64 * self.cr + cache_write as f64 * self.cw + output as f64 * self.o) / 1e6
     }
     /// The 1-hour ephemeral cache write rate: twice the base input price.
@@ -53,6 +118,10 @@ impl Price {
         cache_write_1h: u64,
         output: u64,
     ) -> f64 {
+        let prompt = input + cache_read + cache_write;
+        if let Some(t) = self.rates_for(prompt) {
+            return t.cost_split(input, cache_read, cache_write, cache_write_1h, output);
+        }
         let five_min = cache_write.saturating_sub(cache_write_1h);
         (input as f64 * self.i
             + cache_read as f64 * self.cr
@@ -69,12 +138,20 @@ impl Price {
     }
     /// What caching saved, where part of the writes use the 1-hour rate and
     /// therefore cost more than plain input rather than less.
-    pub fn savings_split(&self, cache_read: u64, cache_write: u64, cache_write_1h: u64) -> f64 {
+    ///
+    /// `input` is the uncached input of the request: the prompt length is
+    /// what decides whether the premium rates apply, and the saving is
+    /// measured against the rates the request is billed at.
+    pub fn savings_split(&self, input: u64, cache_read: u64, cache_write: u64, cache_write_1h: u64) -> f64 {
         let five_min = cache_write.saturating_sub(cache_write_1h);
-        let read = if self.cr > 0.0 { self.cr } else { self.i };
-        let write = if self.cw > 0.0 { self.cw } else { self.i };
-        let saved = cache_read as f64 * (self.i - read) + five_min as f64 * (self.i - write);
-        let spent = cache_write_1h as f64 * (self.cache_write_1h_rate() - self.i);
+        let (i, read, write, one_hour) = match self.rates_for(input + cache_read + cache_write) {
+            Some(t) => (t.i, t.cr, t.cw, t.cache_write_1h_rate()),
+            None => (self.i, self.cr, self.cw, self.cache_write_1h_rate()),
+        };
+        let read = if read > 0.0 { read } else { i };
+        let write = if write > 0.0 { write } else { i };
+        let saved = cache_read as f64 * (i - read) + five_min as f64 * (i - write);
+        let spent = cache_write_1h as f64 * (one_hour - i);
         (saved - spent).max(0.0) / 1e6
     }
 }
@@ -173,6 +250,7 @@ fn parse_catalog(text: &str) -> (HashMap<String, Price>, HashMap<String, Vec<Str
                 o: v.get("o").and_then(|x| x.as_f64()).unwrap_or(0.0),
                 cr: v.get("cr").and_then(|x| x.as_f64()).unwrap_or(0.0),
                 cw: v.get("cw").and_then(|x| x.as_f64()).unwrap_or(0.0),
+                tier: v.get("tier").and_then(|t| serde_json::from_value(t.clone()).ok()),
             };
             let key = k.to_lowercase();
             tail_index.entry(tail(k)).or_default().push(key.clone());
@@ -296,6 +374,72 @@ pub async fn refresh(home: &Path) -> Result<usize, String> {
     Ok(catalog.get("models").and_then(|m| m.as_object()).map(|m| m.len()).unwrap_or(0))
 }
 
+/// The premium a model is charged past a long context.
+///
+/// LiteLLM names those rates after the threshold they apply at - "the input
+/// cost above 100k tokens" - so the threshold comes out of the field name.
+/// The first (lowest) threshold is the one that applies first.
+fn litellm_tier(entry: &serde_json::Map<String, serde_json::Value>) -> Option<serde_json::Value> {
+    let per_million = |v: Option<f64>| v.unwrap_or(0.0) * 1_000_000.0;
+    let above = |name: &str| -> Option<u64> {
+        let rest = name.strip_suffix("_tokens")?;
+        let rest = rest.rsplit_once("above_")?.1;
+        let k = rest.strip_suffix('k')?;
+        k.parse::<u64>().ok().map(|n| n * 1000)
+    };
+    let find = |prefix: &str| -> Option<(u64, f64)> {
+        for (name, value) in entry {
+            if !name.starts_with(prefix) || !name.ends_with("_tokens") {
+                continue;
+            }
+            let n = above(name)?;
+            let v = value.as_f64()?;
+            return Some((n, per_million(Some(v))));
+        }
+        None
+    };
+    // The threshold every one of the rates agrees on.
+    let mut counts: HashMap<u64, usize> = HashMap::new();
+    for prefix in [
+        "input_cost_per_token_above_",
+        "output_cost_per_token_above_",
+        "cache_read_input_token_cost_above_",
+        "cache_creation_input_token_cost_above_",
+    ] {
+        if let Some((n, _)) = find(prefix) {
+            *counts.entry(n).or_default() += 1;
+        }
+    }
+    let threshold = counts
+        .into_iter()
+        .filter(|(_, c)| *c >= 3)
+        .map(|(n, _)| n)
+        .min()?;
+    let i = find("input_cost_per_token_above_").filter(|(n, _)| *n == threshold).map(|(_, v)| v)?;
+    let o = find("output_cost_per_token_above_").filter(|(n, _)| *n == threshold).map(|(_, v)| v)?;
+    let cr = find("cache_read_input_token_cost_above_").filter(|(n, _)| *n == threshold).map(|(_, v)| v).unwrap_or(0.0);
+    let cw = find("cache_creation_input_token_cost_above_").filter(|(n, _)| *n == threshold).map(|(_, v)| v).unwrap_or(0.0);
+    // The 1-hour cache write rate past the threshold is named differently, and
+    // only some models carry it.
+    let mut cw1h = 0.0;
+    for (name, value) in entry {
+        if !name.contains("above_1hr_above_") {
+            continue;
+        }
+        if above(name) == Some(threshold) {
+            cw1h = per_million(value.as_f64());
+        }
+    }
+    Some(serde_json::json!({
+        "above": threshold,
+        "i": i,
+        "o": o,
+        "cr": cr,
+        "cw": cw,
+        "cw1h": cw1h,
+    }))
+}
+
 /// The LiteLLM price list, in the shape the bundled catalogue has.
 ///
 /// LiteLLM quotes prices per token; the catalogue quotes them per million,
@@ -326,6 +470,10 @@ fn convert_litellm(text: &str) -> Result<serde_json::Value, String> {
             "cw": per_million(entry.get("cache_creation_input_token_cost").and_then(|x| x.as_f64())),
             "p": entry.get("litellm_provider").and_then(|x| x.as_str()).unwrap_or(""),
         });
+        let mut price = price;
+        if let Some(tier) = litellm_tier(entry) {
+            price["tier"] = tier;
+        }
         models.insert(k.to_lowercase(), price);
     }
     if models.is_empty() {
@@ -559,7 +707,7 @@ impl Pricing {
         // free / contributor routes genuinely cost nothing, whatever the provider
         let m = model.to_lowercase();
         if is_free_route(&m) {
-            return Some(Price { i: 0.0, o: 0.0, cr: 0.0, cw: 0.0 });
+            return Some(Price { i: 0.0, o: 0.0, cr: 0.0, cw: 0.0, ..Default::default() });
         }
         // Public list prices are only a fair stand-in for providers that actually bill
         // per token. A subscription route (zed-ai, antigravity, ...) is covered by its
@@ -678,7 +826,23 @@ fn price_from_json(v: &serde_json::Value) -> Option<Price> {
     let (i, o) = (i?, o?);
     let cr = v.get("cacheRead").and_then(|x| x.as_f64()).unwrap_or(0.0);
     let cw = v.get("cacheWrite").and_then(|x| x.as_f64()).unwrap_or(0.0);
-    Some(Price { i, o, cr, cw })
+    // The premium past a long context, when the catalog lists one.
+    let tier = v.get("tiers").and_then(|t| t.as_array()).and_then(|list| {
+        list.iter().find_map(|t| {
+            let above = t.get("inputTokensAbove").and_then(|x| x.as_u64())?;
+            let ti = t.get("input").and_then(|x| x.as_f64())?;
+            let to = t.get("output").and_then(|x| x.as_f64())?;
+            Some(Tier {
+                above,
+                i: ti,
+                o: to,
+                cr: t.get("cacheRead").and_then(|x| x.as_f64()).unwrap_or(0.0),
+                cw: t.get("cacheWrite").and_then(|x| x.as_f64()).unwrap_or(0.0),
+                cw1h: 0.0,
+            })
+        })
+    });
+    Some(Price { i, o, cr, cw, tier })
 }
 
 /// ~/.pi/agent/models-store.json : { provider: { models: [ { id, cost: {...} } ] } }
@@ -823,7 +987,7 @@ mod tests {
     /// Fetches the real price list, which reaches the network.
     #[test]
     #[ignore = "reaches the network"]
-    fn live_price_refresh() {
+fn live_price_refresh() {
         let dir = std::env::temp_dir().join(format!("cinder-prices-live-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
