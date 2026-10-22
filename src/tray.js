@@ -102,9 +102,9 @@ function planName(plan) {
 function windowRow(w) {
   const pct = Math.min(100, Math.max(0, w.used_percent || 0));
   const colour = pct > 80 ? 'var(--bad)' : pct > 50 ? 'var(--warn)' : 'var(--accent)';
-  // A window the provider says is not running is not counting anything, and
+  // A window the provider says is not active is not counting anything, and
   // it has no reset time to count down to.
-  const reset = w.inactive ? 'not running' : (w.resets_at ? untilReset(w.resets_at) : '');
+  const reset = w.inactive ? 'not active' : (w.resets_at ? untilReset(w.resets_at) : '');
   const detail = w.detail && w.detail !== windowName(w.window) ? w.detail : '';
   return `<div class="wrow${w.inactive ? ' idle' : ''}">
     <div class="wtop"><span class="wname">${esc(windowName(w.window))}</span><span class="wpct" style="color:${colour}">${Math.round(pct)}%</span></div>

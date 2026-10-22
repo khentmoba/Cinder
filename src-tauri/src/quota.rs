@@ -219,7 +219,7 @@ impl Default for Endpoints {
             codex_token: "https://auth.openai.com/oauth/token".into(),
             copilot_usage: "https://api.github.com/copilot_internal/user".into(),
             gemini_usage: "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist".into(),
-            opencode_usage: "https://opencode.ai/api/usage".into(),
+            opencode_usage: "https://opencode.ai/zen/go/v1/usage".into(),
         }
     }
 }
@@ -497,6 +497,10 @@ fn gemini_token(home: &Path) -> (Option<String>, Vec<String>) {
 }
 
 /// The OpenCode API key, if the user configured one.
+///
+/// The newer auth file holds one entry per provider, so the account's own
+/// entry is picked out of that map: the usage API wants the account's key,
+/// not the key of whichever provider the CLI happens to be talking to.
 fn opencode_token(home: &Path) -> (Option<String>, Vec<String>) {
     if let Ok(t) = std::env::var("OPENCODE_API_KEY") {
         if !t.trim().is_empty() {
@@ -515,8 +519,19 @@ fn opencode_token(home: &Path) -> (Option<String>, Vec<String>) {
             problems.push(format!("{} could not be read", path.display()));
             continue;
         };
+        // The older shape: one key at the top.
         if let Some(t) = str_at(&v, &["opencode", "apiKey", "api_key", "token"]) {
             return (Some(t), problems);
+        }
+        // The newer shape: one entry per provider.
+        if let Some(accounts) = v.as_object() {
+            for name in ["opencode-go", "opencode-zen", "opencode"] {
+                if let Some(entry) = accounts.get(name) {
+                    if let Some(t) = str_at(entry, &["key", "apiKey", "api_key", "token"]) {
+                        return (Some(t), problems);
+                    }
+                }
+            }
         }
         problems.push(format!("{} holds no access token", path.display()));
     }
@@ -965,26 +980,29 @@ fn parse_gemini_usage(v: &serde_json::Value) -> Vec<LiveQuota> {
 }
 
 /// OpenCode's usage payload: rolling five-hour, weekly and monthly windows.
+///
+/// The console answers with the percentage of each window that is gone, how
+/// long until it resets, and whether the window has run out.
 fn parse_opencode_usage(v: &serde_json::Value) -> Vec<LiveQuota> {
     let mut out = Vec::new();
     let windows: [(&str, &str, i64, &str); 3] = [
-        ("five_hour", "5h", 300, "5-hour session window"),
-        ("weekly", "7d", 7 * 24 * 60, "7-day window"),
-        ("monthly", "30d", 30 * 24 * 60, "30-day window"),
+        ("rollingUsage", "5h", 300, "5-hour session window"),
+        ("weeklyUsage", "7d", 7 * 24 * 60, "7-day window"),
+        ("monthlyUsage", "30d", 30 * 24 * 60, "30-day window"),
     ];
     for (key, id, minutes, detail) in windows {
         let Some(w) = v.get(key) else { continue };
-        let Some(pct) = w.get("utilization").and_then(percent).or_else(|| w.as_f64().map(|n| n.clamp(0.0, 100.0))) else {
-            continue;
-        };
+        let Some(pct) = w.get("usagePercent").and_then(percent) else { continue };
+        let reset = w.get("resetInSec").and_then(|x| x.as_i64()).unwrap_or(0);
+        let spent = w.get("status").and_then(|x| x.as_str()) == Some("rate-limited");
         out.push(LiveQuota {
             agent: "OpenCode".into(),
             window: id.into(),
             used_percent: pct,
             window_minutes: minutes,
-            resets_at: w.get("resets_at").map(parse_resets_at).unwrap_or(0),
+            resets_at: if reset > 0 { now_secs() + reset } else { 0 },
             plan: String::new(),
-            detail: detail.into(),
+            detail: if spent { format!("{detail} — spent") } else { detail.into() },
             ..Default::default()
         });
     }
@@ -1000,8 +1018,8 @@ enum FetchError {
     Network(String),
     /// The provider took too long.
     Timeout(String),
-    /// The provider answered with an error status.
-    Status(u16),
+    /// The provider answered with an error status, and what it said.
+    Status(u16, String),
     /// The answer was not JSON.
     BadJson(String),
 }
@@ -1013,7 +1031,7 @@ impl FetchError {
             FetchError::Network(_) | FetchError::Timeout(_) => true,
             // A server-side error or a rate limit is worth another attempt; a
             // refused token is not.
-            FetchError::Status(code) => *code == 429 || *code >= 500,
+            FetchError::Status(code, _) => *code == 429 || *code >= 500,
             FetchError::BadJson(_) => false,
         }
     }
@@ -1023,8 +1041,8 @@ impl FetchError {
         match self {
             FetchError::Network(_) => ErrorKind::Unreachable,
             FetchError::Timeout(_) => ErrorKind::Timeout,
-            FetchError::Status(401) | FetchError::Status(403) => ErrorKind::Unauthorized,
-            FetchError::Status(_) => ErrorKind::Status,
+            FetchError::Status(401, _) | FetchError::Status(403, _) => ErrorKind::Unauthorized,
+            FetchError::Status(_, _) => ErrorKind::Status,
             FetchError::BadJson(_) => ErrorKind::BadPayload,
         }
     }
@@ -1033,7 +1051,15 @@ impl FetchError {
         match self {
             FetchError::Network(m) => m.clone(),
             FetchError::Timeout(m) => m.clone(),
-            FetchError::Status(code) => format!("HTTP {code}"),
+            FetchError::Status(code, said) => {
+                // The provider usually says what went wrong; a card that
+                // repeats it is more use than one that says "HTTP 403".
+                if said.is_empty() {
+                    format!("HTTP {code}")
+                } else {
+                    format!("HTTP {code}: {said}")
+                }
+            }
             FetchError::BadJson(m) => m.clone(),
         }
     }
@@ -1068,7 +1094,20 @@ async fn try_json(
     })?;
     let status = resp.status();
     if !status.is_success() {
-        return Err(FetchError::Status(status.as_u16()));
+        // The body usually says what went wrong: "OpenCode Go subscription
+        // required." is more use than "HTTP 403".
+        let body = resp.text().await.unwrap_or_default();
+        let said = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| {
+                v.get("error")
+                    .and_then(|e| e.get("message"))
+                    .or_else(|| v.get("message"))
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_default();
+        return Err(FetchError::Status(status.as_u16(), said));
     }
     resp.json::<serde_json::Value>().await.map_err(|e| FetchError::BadJson(e.to_string()))
 }
@@ -1091,7 +1130,7 @@ async fn get_json(
                 // providers failing together do not retry in lockstep. A rate
                 // limit waits longer, because it says "not yet".
                 let base = match &e {
-                    FetchError::Status(429) => RETRY_BASE_LIMITED,
+                    FetchError::Status(429, _) => RETRY_BASE_LIMITED,
                     _ => RETRY_BASE,
                 };
                 let backoff = base * 2u32.pow(attempt - 1);
@@ -1804,7 +1843,7 @@ mod tests {
         let server = MockServer::start(vec![Reply::status(401, "nope")]);
         let rt = tokio::runtime::Runtime::new().unwrap();
         let v = rt.block_on(get_json(&server.client(), &server.url("/usage"), "t", &[]));
-        assert_eq!(v.unwrap_err(), FetchError::Status(401));
+        assert_eq!(v.unwrap_err(), FetchError::Status(401, String::new()));
         assert_eq!(server.requests().len(), 1);
     }
 
@@ -1969,6 +2008,81 @@ mod tests {
         assert_eq!(body["grant_type"], "refresh_token");
         assert_eq!(body["client_id"], "client-1");
         assert_eq!(body["refresh_token"], "refresh-1");
+    }
+
+    #[test]
+    fn the_opencode_usage_is_read_out_of_the_console_answer() {
+        // The shape the console answers with: a percentage of each window
+        // that is gone, how long until it resets, and whether it ran out.
+        let v = json!({
+            "useBalance": false,
+            "rollingUsage": {"status": "ok", "resetInSec": 3600, "usagePercent": 42},
+            "weeklyUsage": {"status": "ok", "resetInSec": 86400, "usagePercent": 7},
+            "monthlyUsage": {"status": "rate-limited", "resetInSec": 7200, "usagePercent": 100}
+        });
+        let w = parse_opencode_usage(&v);
+        assert_eq!(w.len(), 3);
+        assert_eq!(w[0].window, "5h");
+        assert_eq!(w[0].used_percent, 42.0);
+        assert_eq!(w[0].window_minutes, 300);
+        assert!(w[0].resets_at > now_secs(), "the reset countdown becomes a moment");
+        assert_eq!(w[1].window, "7d");
+        assert_eq!(w[1].used_percent, 7.0);
+        assert_eq!(w[2].window, "30d");
+        assert_eq!(w[2].used_percent, 100.0);
+        assert!(w[2].detail.contains("spent"), "a window that ran out says so");
+    }
+
+    #[test]
+    fn the_opencode_account_key_is_picked_out_of_the_per_provider_map() {
+        let home = std::env::temp_dir().join(format!("cinder-opencode-key-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".local/share/opencode")).unwrap();
+        // The newer auth file: one entry per provider, of which only the
+        // account's own one is the key the usage API wants.
+        std::fs::write(
+            home.join(".local/share/opencode/auth.json"),
+            r#"{"opencode-go": {"type": "api", "key": "sk-the-account"},
+                "meta": {"type": "api", "key": "local"}}"#,
+        )
+        .unwrap();
+        let (token, problems) = opencode_token(&home);
+        assert_eq!(token.as_deref(), Some("sk-the-account"));
+        assert!(problems.is_empty(), "a key that was found is not a problem");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_opencode_file_with_no_key_says_so() {
+        let home = std::env::temp_dir().join(format!("cinder-opencode-nokey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".local/share/opencode")).unwrap();
+        std::fs::write(home.join(".local/share/opencode/auth.json"), r#"{"meta": {"key": "local"}}"#).unwrap();
+        let (token, problems) = opencode_token(&home);
+        assert!(token.is_none());
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("no access token"), "got: {}", problems[0]);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_provider_that_says_why_is_quoted() {
+        let server = MockServer::start(vec![Reply::status(
+            403,
+            r#"{"type":"error","error":{"type":"EntitlementError","message":"OpenCode Go subscription required."}}"#,
+        )]);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let v = rt.block_on(get_json(&server.client(), &server.url("/usage"), "t", &[]));
+        let e = v.unwrap_err();
+        assert_eq!(e.message(), "HTTP 403: OpenCode Go subscription required.");
+    }
+
+    #[test]
+    fn a_provider_that_says_nothing_is_quoted_by_its_status() {
+        let server = MockServer::start(vec![Reply::status(404, "")]);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let v = rt.block_on(get_json(&server.client(), &server.url("/usage"), "t", &[]));
+        assert_eq!(v.unwrap_err().message(), "HTTP 404");
     }
 
     #[test]

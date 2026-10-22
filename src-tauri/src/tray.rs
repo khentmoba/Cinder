@@ -125,7 +125,7 @@ fn cards(reports: &[QuotaReport]) -> Vec<TrayCard> {
 pub fn summary() -> TraySummary {
     let (reports, checked_at, _, restored) = quota::snapshot();
     let scan = SCAN.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    TraySummary {
+    let out = TraySummary {
         cards: cards(&reports),
         alerts: scan.alerts,
         plans: scan.plans,
@@ -137,8 +137,22 @@ pub fn summary() -> TraySummary {
         checked_at,
         restored,
         scanned_at: scan.scanned_at,
+    };
+    if std::env::var("CINDER_DEBUG").is_ok() {
+        // What the popover is about to show, so a card can be read without
+        // a mouse. Only when it changes, so the log stays readable.
+        let cards = serde_json::to_string(&out.cards).unwrap_or_default();
+        let mut last = LAST_CARDS.lock().unwrap_or_else(|e| e.into_inner());
+        if *last != cards {
+            eprintln!("tray cards: {cards}");
+            *last = cards;
+        }
     }
+    out
 }
+
+/// The cards the last debug print showed.
+static LAST_CARDS: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 // ----------------------------------------------------------------- the window
 

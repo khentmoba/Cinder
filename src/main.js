@@ -1084,7 +1084,7 @@ function renderLimits() {
     }
 
     const reset = l.inactive
-      ? 'not running'
+      ? 'not active'
       : (l.resets_at
         ? `resets ${untilReset(l.resets_at)} <span class="lm-when">(${new Date(l.resets_at * 1000).toLocaleString()})</span>`
         : 'reset time unknown');

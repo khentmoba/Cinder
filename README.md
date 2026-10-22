@@ -177,12 +177,21 @@ every five minutes in the background, so a scan never waits on the network.
 | Codex | `~/.codex/auth.json` | `chatgpt.com/backend-api/wham/usage` |
 | GitHub Copilot | `~/.config/github-copilot/apps.json` | `api.github.com/copilot_internal/user` |
 | Gemini CLI | `~/.gemini/oauth_creds.json` | `cloudcode-pa.googleapis.com` |
-| OpenCode | `OPENCODE_API_KEY` or `~/.local/share/opencode/auth.json` | `opencode.ai/api/usage` |
+| OpenCode | `~/.local/share/opencode/auth.json` | `opencode.ai/zen/go/v1/usage` |
 
 A provider that is not signed in is skipped; one that is signed in but fails
 says so in the panel instead of showing a stale number. A window whose reset
 time has already passed is dropped rather than shown as if it were still
 running.
+
+When a provider explains itself, the card quotes it: an expired key says
+*"This API key has expired. Create a new API key in OpenCode Console and
+replace it in your client"*, which is more use than "HTTP 401".
+
+Anthropic sends the list of the windows a plan has, and says which of them
+are running. That list is the authority where it is there, so a session
+window that has just reset reads **not active** rather than pretending to be
+a window that is counting.
 
 The fetcher is built for a bad day, not only for a good one:
 
