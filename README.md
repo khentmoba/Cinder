@@ -102,6 +102,14 @@ cache counts are kept as reported, without borrowing ratios from other agents.
 
 ## What the numbers mean
 
+The days are the reader's own. The agents write their timestamps in UTC, but
+the day on the screen is the one the person reading it means: on this machine
+(UTC+8) the day rolls over at eight in the morning, and a day's usage would
+otherwise lose its first eight hours and gain the next day's - on
+2026-10-20 that was 240.8M tokens against a local day's 351.5M. The time
+zone rules of the day a timestamp falls on are used, so a day that crosses a
+daylight-saving change still lands on the right side of it.
+
 Cinder prices every token against public list prices, so the dollar figure is
 an **equivalent value**, never an invoice. Each row carries the billing mode
 it was collected under, and the dashboard says which one it is looking at:
@@ -279,9 +287,28 @@ a snapshot; a fresh one is fetched once a day in the background and kept in
 week's price instead of showing up as unpriced. The bundled list is still
 there underneath, so a fetch that fails changes nothing.
 
+The bundled snapshot is refreshed by hand with
+`node scripts/refresh-bundled-prices.mjs`, which merges the fetched list over
+it the same way the collector does: the fresh prices win, the models the
+upstream list has since dropped stay, and the long-context premiums come
+along.
+
 When a model has no price at all, but the agent itself wrote down what the
 call cost, that figure is used instead: the number the agent knows is better
 than no number. Those rows are marked as **reported** rather than estimated.
+
+The agent catalogues on this machine (Pi's model store, the Cline pass price
+list) know what each route charges, and that price is used when the route is
+known. When they disagree about a bare model name - a subscription route and a
+pay-as-you-go route pricing the same model - the route that served the
+request is not known, so the public list price is used instead. The work was
+not free, and a list price is the same figure the rest of the dashboard
+quotes.
+
+A long request is priced at the premium some providers charge past a
+threshold. The threshold is the prompt length - the input, the cached input
+and the cache writes - and the catalogue carries the rates for it, so the
+estimate follows the price list instead of averaging over it.
 
 ## Speed
 
@@ -342,6 +369,7 @@ powershell -File scripts/check-logs.ps1 -Agent OpenCode              # OpenCode
 powershell -File scripts/check-logs.ps1 -Agent DSH                   # DSH
 powershell -File scripts/check-logs.ps1 -Agent Antigravity           # T3's Antigravity
 powershell -File scripts/check-logs.ps1 -Agent Codex 2026-10-19 2026-10-20
+node scripts/check-today-figure.mjs                                  # what the popover calls today
 ```
 
 `scripts/check-claude-logs.mjs`, `scripts/check-codex-logs.mjs`,
@@ -366,6 +394,63 @@ walk the chain of zstd frames the sessions are written in, and the Antigravity
 one reads the same usage out of two places — T3's own orchestration database
 and the IDE transcripts — where the model is named in a line of prose.
 
+### Checking the numbers against the agent's own record
+
+Claude Code writes down what it charged and the usage that made up the charge,
+in a `cost-state` line per session. That is the agent's own record of the
+same turns the collector reads from the transcript, so the two can be
+compared:
+
+```bash
+node scripts/check-claude-sessions.mjs          # session by session
+node scripts/check-claude-sessions.mjs --no-dedup   # what counting every record gives
+node scripts/check-claude-price.mjs             # the price list against what it charged
+node scripts/check-claude-own-totals.mjs 2026-10-22
+```
+
+This is how the biggest counting bug was found. Claude Code writes one record
+per content block of a turn - the thinking block, then one for each tool call
+- and every one of those records carries the whole turn's usage. Counting the
+records as they come counts a turn once per tool call it made, and the
+transcript then holds about twice the usage the CLI recorded:
+
+```
+sessions with a cost-state: 34
+  the transcript and the CLI's total agree exactly: 7
+  median ratio transcript/CLI: 0.999      # one record per message id
+  median ratio transcript/CLI: 2.067      # every record counted
+```
+
+The API message id is the same in all of a turn's records, so the usage is
+counted once per id. The tool calls are still counted from every record,
+because each block is written exactly once.
+
+The same file answers a second question: what the CLI charged against the
+price list. The estimate is worked out per request, because a long request is
+priced at the premium rate and a flat average would hide that:
+
+```
+sessions compared: 34, within 1%: 24, median difference: -0.0%
+claude-opus-5-5              charged $57.7720  list price $60.3501  diff +4.5%
+claude-opus-5-5[1m]          charged $11.1364  list price $11.1364  diff +0.0%
+claude-haiku-5-5[1m]         charged $0.0282   list price $0.0282   diff +0.0%
+```
+
+The sessions that differ are the ones where the CLI's last snapshot lags the
+transcript, or where the session's total spans more than one file: the CLI
+counts the calls it made for the session's own title, which the transcript
+never holds.
+
+The pricing bugs this comparison found are fixed. A 1-hour cache write is
+billed at twice the *input* price, not twice the 5-minute write price, which
+is 25% more than it should be - the upstream catalogue carries the rate as
+`cache_creation_input_token_cost_above_1hr`. When the agent catalogues
+disagree about a model's price, the public list price is used instead of
+nothing at all: Claude Code's opus row went from $0.00 a day to $30.94, and
+the day's figure from a partial `$10.42` to a complete one. And a long
+request is priced at the premium the catalogue lists for it, so the estimate
+follows the price list instead of averaging over it.
+
 ### Checking the popover against the provider's own numbers
 
 The numbers on the popover come from the provider's own quota API, and they
@@ -373,6 +458,7 @@ are checked against the provider's own record of them:
 
 ```bash
 node scripts/check-live-quota.mjs
+node scripts/check-claude-quota.mjs
 ```
 
 The Codex CLI writes its copy of the limits into its own session log, so
@@ -392,6 +478,22 @@ the CLI wrote its limits at 2026-10-21T21:45:47.547Z
 The reset times have to match exactly; the percentages may have moved a
 little between the log being written and the fetch, so they are compared
 with a small tolerance.
+
+Claude Code writes its copy of the limits down as well, in the `quotaLimits`
+of the record where a request was refused, so its card can be checked the
+same way:
+
+```
+the CLI wrote its limits at 2026-10-22T05:53:21.228Z
+  five_hour      log status rejected, resets 2026-10-22T07:00:00.000Z (1792652400)
+  five_hour      app  100% used, resets 2026-10-22T06:59:59.000Z (1792652399)  reset the same
+  api   refused the request: the window is full, which is what the card says
+```
+
+The CLI only writes its record when it is refused, so what it holds is the
+moment the window filled up rather than a percentage; the reset moment is
+the one that has to line up. When the window is full the API refuses the
+fetch too, which is the provider's own answer to the same question.
 
 Anthropic sends the list of the windows a plan has, and Cinder reads it for
 the windows the named fields do not carry and for the reset times they leave

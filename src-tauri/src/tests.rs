@@ -48,6 +48,40 @@ impl Drop for Home {
     }
 }
 
+/// The day a timestamp falls on, in the machine's own time.
+///
+/// The collector files a row under the day the person reading it means, which
+/// is not the UTC day unless the machine sits on UTC. The tests work it out
+/// the same way, so they hold on any machine.
+fn day_of(ts: &str) -> String {
+    let t = chrono::DateTime::parse_from_rfc3339(ts).expect("the timestamp should be read");
+    t.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string()
+}
+
+/// A timestamp that cannot be read keeps the date it carries.
+///
+/// The agents write their timestamps in UTC, but some of the logs carry a
+/// shape the reader does not know. A row is still filed under the date that
+/// timestamp names, rather than being dropped or filed under the wrong day.
+#[test]
+fn a_timestamp_that_cannot_be_read_keeps_the_date_it_carries() {
+    // A timestamp the reader knows.
+    assert_eq!(super::day_of("2026-01-01T00:00:00Z"), day_of("2026-01-01T00:00:00Z"));
+    // A timestamp with no time at all.
+    assert_eq!(super::day_of("2026-01-01"), "2026-01-01");
+    // A timestamp with a zone offset rather than Z.
+    assert_eq!(
+        super::day_of("2026-01-01T00:00:00+00:00"),
+        day_of("2026-01-01T00:00:00+00:00")
+    );
+    assert_eq!(
+        super::day_of("2026-01-01T00:00:00+08:00"),
+        day_of("2026-01-01T00:00:00+08:00")
+    );
+    // Nonsense does not take the row with it.
+    assert_eq!(super::day_of("not a timestamp"), "not a time");
+}
+
 #[test]
 fn cache_preserves_rows_and_sessions_and_detects_modification() {
     let home = Home::new();
@@ -114,10 +148,34 @@ fn local_price_conflicts_include_cache_prices_and_do_not_pick_a_provider() {
         "other": {"models": [{"id": "gpt-5", "cost": {"input": 2, "output": 3, "cacheRead": 1}}]}
     }).to_string());
     let p = Pricing::load(&home.0);
-    assert!(p.lookup(None, "gpt-5").is_none());
-    assert!(p.lookup(None, "gpt-5-1m").is_none());
+    // Each route is priced with its own price.
     assert_eq!(p.lookup(Some("openai"), "gpt-5").unwrap().cr, 0.2);
     assert_eq!(p.lookup(Some("other"), "gpt-5").unwrap().cr, 1.0);
+    // A bare name does not pick one of the two local prices: the route that
+    // served the request is not known. It gets the public list price, which is
+    // neither of them and is what the dashboard quotes everywhere else.
+    let bare = p.lookup(None, "gpt-5").expect("the public list price should be used");
+    assert_ne!(bare.cr, 0.2);
+    assert_ne!(bare.cr, 1.0);
+    assert_eq!(bare.i, 1.25, "the public price for gpt-5");
+    assert_eq!(bare.o, 10.0);
+    assert_eq!(p.lookup(None, "gpt-5-1m").expect("the public list price should be used").i, 1.25);
+}
+
+/// A context-size variant is the same model at the same price.
+///
+/// "gpt-5-1m" is gpt-5 with a bigger window, not a different model, so it
+/// carries the same list price. Normalizing the name away to "gpt" would
+/// leave it unpriced.
+#[test]
+fn a_context_size_variant_is_priced_as_its_model() {
+    let home = Home::new();
+    let p = Pricing::load(&home.0);
+    let base = p.lookup(None, "gpt-5").expect("gpt-5 has a list price");
+    let variant = p.lookup(None, "gpt-5-1m").expect("the 1M-context variant has the same price");
+    assert_eq!(variant.i, base.i);
+    assert_eq!(variant.o, base.o);
+    assert_eq!(variant.cr, base.cr);
 }
 
 #[test]
@@ -141,7 +199,7 @@ fn unicode_model_names_do_not_panic_and_context_variants_still_match() {
         {"id": "audit-model", "cost": {"input": 2, "output": 3}}
     ]}}).to_string());
     let p = Pricing::load(&home.0);
-    for model in ["custom-é", "custom-模型", "custom-🦀", "custom-m"] {
+    for model in ["custom-Ã©", "custom-æ¨¡åž‹", "custom-ðŸ¦€", "custom-m"] {
         assert!(p.lookup(Some("vendor"), model).is_none());
     }
     assert_eq!(p.lookup(Some("vendor"), "audit-model-1m").unwrap().i, 2.0);
@@ -241,7 +299,7 @@ fn t3_transcripts_supply_counts_and_usage_database_supplies_tokens() {
     assert_eq!(stats.rows.iter().map(|r| r.tools).sum::<u64>(), 1);
     assert_eq!(stats.rows.iter().map(Row::tokens).sum::<u64>(), 220);
     assert_eq!(stats.sessions.iter().map(|s| s.sessions).sum::<u64>(), 2);
-    assert!(stats.sessions.iter().all(|s| s.day == "2026-01-01"));
+    assert!(stats.sessions.iter().all(|s| s.day == day_of("2026-01-01T00:00:00Z")));
 }
 
 #[test]
@@ -297,17 +355,17 @@ fn opencode_uses_message_dates_models_and_request_counts() {
         db.execute("INSERT INTO message VALUES ('user', 's', ?, 1767225600000)", [json!({"role": "user"}).to_string()]).unwrap();
         db.execute("INSERT INTO message VALUES ('bad', 's', 'not JSON', 1767225600000)", []).unwrap();
         let stats = scan_home(&home.0, &|_| {});
-        let first = stats.rows.iter().find(|r| r.day == "2026-01-01").unwrap();
+        let first = stats.rows.iter().find(|r| r.day == day_of("2026-01-01T00:00:00Z")).unwrap();
         assert_eq!(first.model, "openai/gpt-5");
         assert_eq!((first.requests, first.input, first.cache_read, first.cache_write, first.tools), (2, 150, 40, 10, 1));
         assert_eq!(first.cost, 1.0);
-        let second = stats.rows.iter().find(|r| r.day == "2026-01-02").unwrap();
+        let second = stats.rows.iter().find(|r| r.day == day_of("2026-01-02T00:00:00Z")).unwrap();
         assert_eq!(second.model, "openai/gpt-4.1");
         assert_eq!((second.requests, second.input, second.tools), (1, 200, 1));
         assert_eq!(stats.sessions.len(), 1);
-        assert_eq!(stats.sessions[0].day, "2026-01-01");
+        assert_eq!(stats.sessions[0].day, day_of("2026-01-01T00:00:00Z"));
         assert_eq!(stats.sessions[0].sessions, 1);
-        assert!(!stats.rows.iter().any(|r| r.day == "2026-01-03"));
+        assert!(!stats.rows.iter().any(|r| r.day == day_of("2026-01-03T00:00:00Z")));
     }
 }
 
@@ -365,7 +423,7 @@ fn the_current_opencode_schema_is_read() {
     .unwrap();
 
     let stats = scan_home(&home.0, &|_| {});
-    let first = stats.rows.iter().find(|r| r.day == "2026-01-01").expect("the OpenCode row should be there");
+    let first = stats.rows.iter().find(|r| r.day == day_of("2026-01-01T00:00:00Z")).expect("the OpenCode row should be there");
     assert_eq!(first.model, "openai/gpt-5");
     assert_eq!(first.requests, 2, "the compaction is a request of its own");
     assert_eq!(first.input, 107, "the compaction's own tokens are counted");
@@ -376,9 +434,171 @@ fn the_current_opencode_schema_is_read() {
     assert_eq!(first.tools, 1, "the tool call is inside the message");
     assert_eq!(first.cost, 1.5);
     assert_eq!(first.project, "project");
-    let second = stats.rows.iter().find(|r| r.day == "2026-01-02").expect("the second day should be there");
+    let second = stats.rows.iter().find(|r| r.day == day_of("2026-01-02T00:00:00Z")).expect("the second day should be there");
     assert_eq!(second.model, "openai/gpt-4.1");
     assert_eq!((second.requests, second.input, second.tools), (1, 200, 1));
+}
+
+/// When the local agent catalogues disagree about a model, the run is still
+/// worth something.
+///
+/// Two routes can price the same model differently â€” a subscription route and
+/// a pay-as-you-go one â€” and a request that does not say which route served
+/// it cannot use either price. That is no reason to call the work free: the
+/// public list price is the better answer, and it is the one the dashboard
+/// quotes everywhere else.
+#[test]
+fn a_model_the_local_catalogues_disagree_about_is_still_priced() {
+    let home = Home::new();
+    // Two routes, two prices, for the same model.
+    home.write(
+        ".pi/agent/clinepass-prices.json",
+        &json!({"models": {
+            "opencode/claude-opus-4-5": {"input": 4.0, "output": 20.0, "cacheRead": 0.2, "cacheWrite": 5.0},
+            "antigravity/claude-opus-4-5": {"input": 15.0, "output": 75.0, "cacheRead": 1.5, "cacheWrite": 18.75}
+        }})
+        .to_string(),
+    );
+    home.lines(".claude/projects/c/s.jsonl", &[
+        json!({"type": "assistant", "timestamp": "2026-01-01T00:00:00Z", "message": {
+            "role": "assistant", "model": "claude-opus-4-5",
+            "usage": {"input_tokens": 1000, "output_tokens": 100, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+        }}),
+    ]);
+    let stats = scan_home(&home.0, &|_| {});
+    let row = stats.rows.iter().find(|r| r.agent == "Claude Code").expect("the Claude Code row should be there");
+    assert!(row.cost_known, "the model should be priced");
+    assert!(row.cost > 0.0, "the work was not free, so the cost should not be zero");
+    assert!(!row.cost_partial, "and the figure should not be marked as unknown");
+    // The public list price for claude-opus-4-5 is 5 in and 25 out per million.
+    let expected = (1000.0 * 5.0 + 100.0 * 25.0) / 1e6;
+    assert!((row.cost - expected).abs() < 1e-9, "got {}, expected {}", row.cost, expected);
+}
+
+/// A usage is filed under the day the machine thinks it is.
+///
+/// The agents write their timestamps in UTC, but the day on the dashboard is
+/// the reader's own: on this machine (UTC+8) the day rolls over at eight in
+/// the morning, and a day's usage would otherwise lose its first eight hours
+/// and gain the next day's. The time zone rules of the day the timestamp
+/// falls on are used, so a day that crosses a daylight-saving change still
+/// lands on the right side of it.
+#[test]
+fn a_usage_is_filed_under_the_machines_own_day() {
+    let home = Home::new();
+    // An instant in the middle of the UTC day and one near its end: on a
+    // machine east of UTC they can fall on different local days, and on a
+    // machine west of UTC the same thing happens the other way round.
+    let noon = "2026-03-10T12:00:00Z";
+    let evening = "2026-03-10T23:30:00Z";
+    let turn = |ts: &str| {
+        json!({
+            "type": "assistant", "cwd": "C:/repo", "timestamp": ts,
+            "message": {"role": "assistant", "model": "claude-sonnet-4-5",
+                "usage": {"input_tokens": 100, "output_tokens": 50}}
+        })
+    };
+    home.lines(".claude/projects/-C--repo/s.jsonl", &[turn(noon), turn(evening)]);
+    let stats = scan_home(&home.0, &|_| {});
+    let days: Vec<&str> = stats.rows.iter().map(|r| r.day.as_str()).collect();
+    let wanted: Vec<String> = [noon, evening].iter().map(|t| day_of(t)).collect();
+    for day in &wanted {
+        assert!(days.contains(&day.as_str()), "a row should be filed under {day}: {days:?}");
+    }
+    // The day the collector reads for right now is the local one too.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert_eq!(unix_day(now), local_day(now));
+    let local = chrono::DateTime::from_timestamp(now, 0).unwrap().with_timezone(&chrono::Local);
+    assert_eq!(unix_day(now), local.format("%Y-%m-%d").to_string());
+}
+
+/// A turn that the CLI writes down twice is counted once.
+///
+/// Claude Code writes one record per content block of a turn - the thinking
+/// block, then one for each tool call - and every record carries the whole
+/// turn's usage. Counting every record counts a turn once per tool call it
+/// made. The API message id is the same in all of them, and the CLI's own
+/// session total agrees with counting it once.
+#[test]
+fn a_turn_written_down_twice_is_counted_once() {
+    let home = Home::new();
+    let usage = json!({"input_tokens": 100, "output_tokens": 50,
+        "cache_read_input_tokens": 1000, "cache_creation_input_tokens": 200});
+    let turn = |content: Value| {
+        json!({"type": "assistant", "cwd": "C:/repo", "timestamp": "2026-01-01T00:00:00Z",
+            "message": {"role": "assistant", "id": "msg_01same", "model": "claude-sonnet-4-5",
+                "content": content, "usage": usage}})
+    };
+    home.lines(".claude/projects/-C--repo/s.jsonl", &[
+        turn(json!([{"type": "thinking", "thinking": "hmm"}])),
+        turn(json!([{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {}}])),
+        turn(json!([{"type": "tool_use", "id": "toolu_2", "name": "Read", "input": {}}])),
+    ]);
+    let stats = scan_home(&home.0, &|_| {});
+    let r = stats.rows.iter().find(|r| r.agent == "Claude Code").expect("the Claude Code row should be there");
+    assert_eq!(r.requests, 1, "the turn is one request");
+    assert_eq!(r.input, 100);
+    assert_eq!(r.output, 50);
+    assert_eq!(r.cache_read, 1000);
+    assert_eq!(r.cache_write, 200);
+    // The tool calls are still counted: each block is written exactly once.
+    assert_eq!(r.tools, 2);
+}
+
+/// A request past the long-context threshold is priced at the premium.
+///
+/// Some providers charge more once a request is long: the catalogue carries
+/// the rates for that case and the threshold they start at. The CLI's own
+/// charges agree - a claude-haiku-5-5 session whose prompt passed a hundred
+/// thousand tokens was charged at the premium rates and not at the flat ones.
+#[test]
+fn a_request_past_the_long_context_threshold_is_priced_at_the_premium() {
+    let home = Home::new();
+    let p = Pricing::load(&home.0);
+    let haiku = p.lookup(None, "claude-haiku-5-5").expect("haiku should be priced");
+    let tier = haiku.tier.expect("haiku should carry a long-context premium");
+    assert_eq!(tier.above, 100_000);
+    // A short request is priced at the base rates.
+    let short = haiku.cost_split(1_000, 10_000, 0, 0, 1_000);
+    let short_expected = (1_000.0 * 0.1 + 10_000.0 * 0.01 + 1_000.0 * 0.5) / 1e6;
+    assert!((short - short_expected).abs() < 1e-12, "got {short}, expected {short_expected}");
+    // A long one at the premium rates.
+    let long = haiku.cost_split(1_000, 200_000, 0, 0, 1_000);
+    let long_expected = (1_000.0 * 0.5 + 200_000.0 * 0.05 + 1_000.0 * 2.5) / 1e6;
+    assert!((long - long_expected).abs() < 1e-12, "got {long}, expected {long_expected}");
+}
+
+/// A fetched catalogue can carry the premium, and the agent catalogues can
+/// carry it too.
+#[test]
+fn a_catalogue_can_carry_a_long_context_premium() {
+    let home = Home::new();
+    home.write(
+        ".cinder/prices.json",
+        &json!({"meta": {"fetched": "2026-10-22"}, "models": {
+            "vendor/long-model": {
+                "i": 1.0, "o": 5.0, "cr": 0.1, "cw": 1.25,
+                "tier": {"above": 100000, "i": 5.0, "o": 25.0, "cr": 0.5, "cw": 6.25, "cw1h": 10.0}
+            }
+        }})
+        .to_string(),
+    );
+    home.write(".pi/agent/models-store.json", &json!({
+        "vendor": {"models": [{"id": "tiered-model", "cost": {
+            "input": 2.0, "output": 10.0, "cacheRead": 0.2, "cacheWrite": 2.5,
+            "tiers": [{"inputTokensAbove": 100000, "input": 10.0, "output": 50.0, "cacheRead": 1.0, "cacheWrite": 12.5}]
+        }}]}
+    }).to_string());
+    let p = Pricing::load(&home.0);
+    let fetched = p.lookup(None, "long-model").expect("the fetched price should be found");
+    assert_eq!(fetched.tier.expect("the premium should be carried").above, 100_000);
+    assert!((fetched.cost_split(0, 200_000, 0, 0, 0) - 200_000.0 * 0.5 / 1e6).abs() < 1e-12);
+    let local = p.lookup(Some("vendor"), "tiered-model").expect("the agent catalogue should be found");
+    assert_eq!(local.tier.expect("the premium should be carried").above, 100_000);
+    assert!((local.cost_split(0, 200_000, 0, 0, 0) - 200_000.0 * 1.0 / 1e6).abs() < 1e-12);
 }
 
 /// DSH keeps its sessions as zstd-compressed JSONL.
@@ -506,10 +726,10 @@ fn antigravity_transcripts_carry_the_model_the_tokens_and_the_tools() {
     assert_eq!(row.tools, 2);
     // Antigravity runs on a plan, so the row says so.
     assert_eq!(row.billing, Billing::Subscription);
-    assert_eq!(row.day, "2026-01-01");
+    assert_eq!(row.day, day_of("2026-01-01T00:00:00Z"));
 
     // The next day is a row of its own.
-    let next = stats.rows.iter().find(|r| r.agent == "Antigravity" && r.day == "2026-01-02").expect("the second day should be there");
+    let next = stats.rows.iter().find(|r| r.agent == "Antigravity" && r.day == day_of("2026-01-02T00:00:00Z")).expect("the second day should be there");
     assert_eq!(next.requests, 1);
     assert_eq!(next.input, 100);
 }
@@ -537,7 +757,7 @@ fn pi_sessions_carry_the_tokens_of_every_assistant_message() {
     assert_eq!(row.cache_read, 95000);
     assert_eq!(row.output, 10);
     assert_eq!(row.tools, 1);
-    assert_eq!(row.day, "2026-01-01");
+    assert_eq!(row.day, day_of("2026-01-01T00:00:00Z"));
     // OpenAI bills per token, so the row is priced.
     assert_eq!(row.billing, Billing::Api);
     assert!(row.cost_known);
@@ -762,11 +982,30 @@ fn a_1h_cache_write_is_priced_at_its_own_rate() {
     assert_eq!(r.cache_write, 1000);
     assert_eq!(r.cache_write_1h, 1000);
     assert!(r.cost_known);
-    // The 1-hour write costs twice the 5-minute rate, and the 5-minute rate
-    // is 1.25x the base input price when the catalog has no cache-write
-    // price of its own.
-    let expected = 1000.0 * (3.0 * 1.25 * 2.0) / 1e6;
+    // The 1-hour write costs twice the base input price, and the 5-minute
+    // write costs 1.25x it - so the two are not the same number.
+    let expected = 1000.0 * (3.0 * 2.0) / 1e6;
     assert!((r.cost - expected).abs() < 1e-9, "cost {} expected {expected}", r.cost);
+}
+
+/// The 1-hour cache write rate is twice the input price, not twice the
+/// 5-minute write price.
+///
+/// The Claude Code CLI writes down what it charged, and for claude-opus-5-5
+/// (input $4 per million, 5-minute write $5) a session only adds up at $8 per
+/// million for the 1-hour writes. At $10 the charge is 25% too high.
+#[test]
+fn the_1h_cache_write_rate_is_twice_the_input_price() {
+    let p = crate::pricing::Price { i: 4.0, o: 20.0, cr: 0.2, cw: 5.0, ..Default::default() };
+    assert_eq!(p.cache_write_1h_rate(), 8.0);
+    // A catalog with no cache-write price of its own still works out: the
+    // 5-minute write is 1.25x the input price, the 1-hour one is twice it.
+    let q = crate::pricing::Price { i: 4.0, o: 20.0, cr: 0.2, cw: 0.0, ..Default::default() };
+    assert_eq!(q.cache_write_1h_rate(), 8.0);
+    // And a 1-hour write costs more than sending the same tokens as input,
+    // so it is not a saving.
+    assert_eq!(p.savings_split(0, 0, 1000, 1000), 0.0);
+    assert!((p.cost_split(0, 0, 1000, 1000, 0) - 1000.0 * 8.0 / 1e6).abs() < 1e-12);
 }
 
 #[test]
@@ -785,7 +1024,7 @@ fn a_published_artifact_is_collected_once() {
     assert_eq!(stats.artifacts.len(), 1);
     assert_eq!(stats.artifacts[0].url, "https://claude.ai/code/artifact/abc123");
     assert_eq!(stats.artifacts[0].title, "A chart");
-    assert_eq!(stats.artifacts[0].day, "2026-01-01");
+    assert_eq!(stats.artifacts[0].day, day_of("2026-01-01T00:00:00Z"));
 }
 
 #[test]
@@ -939,7 +1178,7 @@ fn live_quota_check() {
     let stats = scan_home_with(&sandbox.0, &|_| {}, reports, "2026-10-21T00:00:00Z".into());
     println!("  alerts from the live windows:");
     for a in &stats.alerts {
-        println!("    [{}] {} — {}", a.severity as u8, a.title, a.detail);
+        println!("    [{}] {} â€” {}", a.severity as u8, a.title, a.detail);
     }
     println!("  plans: {:?}", stats.plans);
 }
@@ -1031,6 +1270,49 @@ fn real_home_day_check() {
     }
     for (model, (requests, input, cache_read, cache_write, output)) in per_model {
         println!("ROW\t{model}\t{requests}\t{input}\t{cache_read}\t{cache_write}\t{output}");
+    }
+    // The cost the collector worked out, and what the agent itself said the
+    // work cost, so the two can be compared.
+    let mut per_model_cost: std::collections::BTreeMap<String, (f64, Option<f64>)> = Default::default();
+    for r in &rows {
+        let e = per_model_cost.entry(r.model.clone()).or_insert((0.0, None));
+        e.0 += r.cost;
+        if let Some(reported) = r.cost_reported {
+            e.1 = Some(e.1.unwrap_or(0.0) + reported);
+        }
+    }
+    for (model, (cost, reported)) in per_model_cost {
+        println!(
+            "COST\t{model}\t{cost:.6}\t{}",
+            reported.map(|c| format!("{c:.6}")).unwrap_or_else(|| "-".into())
+        );
+    }
+    // The totals the dashboard shows per agent, over every day the scan found,
+    // so the numbers on screen can be checked against the logs.
+    let mut per_agent: std::collections::BTreeMap<String, (u64, u64, f64, bool, bool)> = Default::default();
+    for r in &stats.rows {
+        let e = per_agent.entry(r.agent.clone()).or_insert((0, 0, 0.0, true, false));
+        e.0 += r.requests;
+        e.1 += r.tokens();
+        e.2 += r.cost;
+        e.3 = e.3 && r.cost_known;
+        e.4 = e.4 || r.cost_partial;
+    }
+    for (agent, (requests, tokens, cost, known, partial)) in per_agent {
+        println!("AGENT\t{agent}\t{requests}\t{tokens}\t{cost:.6}\tknown={known}\tpartial={partial}");
+    }
+    // The models whose price is unknown, so the tokens they carry can be seen.
+    let mut unpriced: std::collections::BTreeMap<String, (u64, f64)> = Default::default();
+    for r in &stats.rows {
+        if r.cost_known || r.tokens() == 0 {
+            continue;
+        }
+        let e = unpriced.entry(r.agent.clone()).or_insert((0, 0.0));
+        e.0 += r.tokens();
+        e.1 += r.cost;
+    }
+    for (agent, (tokens, cost)) in unpriced {
+        println!("UNPRICED\t{agent}\t{tokens}\t{cost:.6}");
     }
     // The token totals on their own, for the agent whose tokens come out of a
     // database rather than out of a log line. The requests are left out on

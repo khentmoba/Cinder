@@ -15,11 +15,12 @@
 // The two sets have to be identical for the numbers to be right.
 
 import { readdirSync, readFileSync } from 'node:fs';
+import { localDay } from './local-day.mjs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { zstdDecompressSync } from 'node:zlib';
 
-const day = process.argv[2] || new Date(Date.now() - 2 * 86400000).toISOString().slice(0, 10);
+const day = process.argv[2] || localDay(Date.now() - 2 * 86400000);
 const root = join(homedir(), '.dsh', 'sessions');
 
 function walk(dir, out = []) {
@@ -38,7 +39,7 @@ function walk(dir, out = []) {
 }
 
 // The day of a millisecond moment.
-const dayOf = (ms) => (ms > 0 ? new Date(Math.floor(ms / 1000) * 1000).toISOString().slice(0, 10) : '');
+const dayOf = (ms) => (ms > 0 ? localDay(Math.floor(ms / 1000) * 1000) : '');
 
 // DSH writes a session as a chain of zstd frames, one per chunk. Node's zstd
 // reads the first frame and stops, so the frames are walked by hand: the next

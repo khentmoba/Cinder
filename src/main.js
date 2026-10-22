@@ -126,10 +126,16 @@ const billingBadge = mode => {
 // grouped under one honest name instead of an empty row.
 const projectLabel = project => project || 'No project';
 
+// The day a date falls on, in this machine's own time.
+//
+// The collector files a row under the reader's own day, so the day the
+// dashboard calls "today" has to be the same day, and not the UTC one.
+const localDayStr = d => new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+
 function todayStr(offsetDays = 0) {
   const d = new Date();
-  d.setUTCDate(d.getUTCDate() + offsetDays);
-  return d.toISOString().slice(0, 10);
+  d.setDate(d.getDate() + offsetDays);
+  return localDayStr(d);
 }
 
 // ---------- aggregation ----------

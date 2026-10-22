@@ -15,10 +15,11 @@
 // The two sets have to be identical for the numbers to be right.
 
 import { readdirSync, readFileSync } from 'node:fs';
+import { localDay } from './local-day.mjs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
-const day = process.argv[2] || new Date(Date.now() - 2 * 86400000).toISOString().slice(0, 10);
+const day = process.argv[2] || localDay(Date.now() - 2 * 86400000);
 const home = homedir();
 
 function walk(dir, out = []) {
@@ -72,7 +73,7 @@ for (const file of files) {
     const ty = v.type;
     const p = v.payload || {};
     const ts = typeof v.timestamp === 'string' ? v.timestamp : '';
-    if (ty === 'session_meta' && !fileDay) fileDay = ts.slice(0, 10);
+    if (ty === 'session_meta' && !fileDay) fileDay = localDay(ts);
     if (ty === 'turn_context' && typeof p.model === 'string') model = p.model.trim();
     if (ty !== 'event_msg' || p.type !== 'token_count') continue;
     const info = p.info;
@@ -85,7 +86,7 @@ for (const file of files) {
     const key = `${ts}|${input}|${output}|${cached}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    const d = ts.slice(0, 10) || fileDay;
+    const d = localDay(ts) || fileDay;
     if (d !== day) continue;
     const uncached = Math.max(0, input - cached);
     const e = perModel.get(model) || [0, 0, 0, 0, 0];

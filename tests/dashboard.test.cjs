@@ -256,3 +256,19 @@ test('dashboard totals and stacked bar display prompt cache stats and percentage
   assert.match(legendHtml, /Cache read/);
   assert.match(legendHtml, /legend-pct/);
 });
+
+test("today is the reader's own day, not the UTC one", () => {
+  const { run } = dashboard();
+  const now = new Date();
+  const local = new Date(now.getTime() - now.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+  const utc = now.toISOString().slice(0, 10);
+  // The collector files a row under the reader's own day, so the day the
+  // dashboard calls "today" has to be that day.
+  assert.equal(run('todayStr()'), local);
+  // Off UTC the two differ, and the dashboard has to follow the reader.
+  if (local !== utc) assert.notEqual(run('todayStr()'), utc);
+  // And the window that ends today ends on that day.
+  const yesterday = new Date(now.getTime() - now.getTimezoneOffset() * 60000 - 86400000)
+    .toISOString().slice(0, 10);
+  assert.equal(run('todayStr(-1)'), yesterday);
+});
