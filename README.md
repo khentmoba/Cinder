@@ -66,6 +66,36 @@ still fully visible: use the **Requests** metric. Cost/tokens views show a `—`
 for them by design, so the agent list also prints the request count next to
 the cost.
 
+Each source is read on its own: one agent whose logs trip the parser up does
+not take the rest of the dashboard with it. The **Data sources** panel says
+which source failed and why, so a gap in the numbers is explained rather than
+just missing.
+
+### OpenCode, precisely
+
+OpenCode writes its usage into a SQLite database that is kept in write-ahead
+mode, and it has changed shape: the current version keeps the messages in
+`session_message`, with the model and the content inside the message, while
+the older `message` table is left behind holding a copy of the older ones.
+Only the current table is read — the old one holds the same messages, so
+reading both would count them twice. The stamp of the write-ahead log beside
+the database is part of the cache key, so a message written a moment ago
+counts even before it is checkpointed into the file.
+
+Two things are worth knowing about the numbers:
+
+- a **compaction** is a model call of its own, and the tokens it cost are
+  counted, even though the messages it replaced may be gone;
+- the tokens of messages OpenCode has **deleted** — a branch or a revert
+  takes them away — are counted by OpenCode's own session totals but cannot
+  be read from the log, because no message is left to read them from. They
+  are about 0.4% of the input tokens on a machine with a long history, and
+  no reader can do better.
+
+`scripts/check-opencode-logs.mjs` reads the same database with an
+implementation that shares no code with the collector, and the two have to
+agree line for line.
+
 Daily ranges use UTC dates; **Today** is a UTC calendar day, not a rolling
 24-hour window. Costs marked **≥** exclude some unpriced token usage. Codex
 cache counts are kept as reported, without borrowing ratios from other agents.
@@ -98,26 +128,6 @@ several. A checkout that has since been cleaned up still rolls up through the
 A delegated child run (Claude Code writes it to `<session>/subagents/`) is
 counted once, on its own row, badged as a subagent and tagged with the model
 it actually ran on — which is often a cheaper one than its parent.
-
-## Live quotas
-
-The **Limits** view shows two kinds of window: the ones an agent wrote into
-its own session files, and the ones fetched live from the provider. The live
-ones use the OAuth token the agent already stored on disk, and are refreshed
-every five minutes in the background, so a scan never waits on the network.
-
-| Agent | Where the credential is | Endpoint |
-|---|---|---|
-| Claude Code | `~/.claude/.credentials.json` | `api.anthropic.com/api/oauth/usage` |
-| Codex | `~/.codex/auth.json` | `chatgpt.com/backend-api/wham/usage` |
-| GitHub Copilot | `~/.config/github-copilot/apps.json` | `api.github.com/copilot_internal/user` |
-| Gemini CLI | `~/.gemini/oauth_creds.json` | `cloudcode-pa.googleapis.com` |
-| OpenCode | `OPENCODE_API_KEY` or `~/.local/share/opencode/auth.json` | `opencode.ai/api/usage` |
-
-A provider that is not signed in is skipped; one that is signed in but fails
-says so in the panel instead of showing a stale number. A window whose reset
-time has already passed is dropped rather than shown as if it were still
-running.
 
 ## Alerts
 
@@ -156,8 +166,122 @@ and are read against the current month.
 
 Cinder puts an icon in the tray whose tooltip carries the live quota
 percentages, so the window that matters can be read without opening the app.
-Left-click brings the dashboard back, right-click opens **Open Cinder**,
-**Rescan now** and **Quit Cinder**.
+**Clicking the icon opens a popover** next to it with the whole picture:
+
+- one card per provider that is signed in on this machine, with how much of
+  each quota window is gone, when it resets, and the plan it is on;
+- the alerts that are worth interrupting the user about;
+- the plans the user declared, and what the work was worth against them;
+- what today cost, in tokens and in money.
+
+Right-click opens **Open Cinder**, **Rescan now** and **Quit Cinder**. The
+popover closes when it loses the focus, the way a menu does, and the refresh
+button in its corner asks the providers again.
+
+A provider that cannot be read says so in its card rather than showing a
+number that is not true. A provider whose newest refresh failed keeps the
+last numbers that did come back, badged **stale**, so a flaky network never
+blanks the panel.
+
+> `CINDER_TRAY_POPOVER=1 cinder` opens the popover at start-up, which is how
+> it is checked without a mouse. `CINDER_DEBUG=1` prints what the tray is
+> doing to the console. `scripts/screenshot.ps1` and `scripts/tray-click.ps1`
+> take a picture of the screen and click the tray icon through UI Automation,
+> so the popover can be looked at on a machine with no hands on the mouse.
+
+## Live quotas, and keeping them true
+
+The **Limits** view shows two kinds of window: the ones an agent wrote into
+its own session files, and the ones fetched live from the provider. The live
+ones use the OAuth token the agent already stored on disk, and are refreshed
+every five minutes in the background, so a scan never waits on the network.
+
+| Agent | Where the credential is | Endpoint |
+|---|---|---|
+| Claude Code | `~/.claude/.credentials.json` | `api.anthropic.com/api/oauth/usage` |
+| Codex | `~/.codex/auth.json` | `chatgpt.com/backend-api/wham/usage` |
+| GitHub Copilot | `~/.config/github-copilot/apps.json` | `api.github.com/copilot_internal/user` |
+| Gemini CLI | `~/.gemini/oauth_creds.json` | `cloudcode-pa.googleapis.com` |
+| OpenCode | `~/.local/share/opencode/auth.json` | `opencode.ai/zen/go/v1/usage` |
+| Kimi Code | `~/.kimi/credentials/*.json` | `api.kimi.com/coding/v1/usages` |
+| OpenRouter | `OPENROUTER_API_KEY` or the agent catalogs | `openrouter.ai/api/v1/credits` |
+| DeepSeek | `DEEPSEEK_API_KEY` or the agent catalogs | `api.deepseek.com/user/balance` |
+
+Each endpoint was taken from the provider's own code or its published API,
+and each was checked to answer 401 rather than 404 — the route is there and
+it wants a bearer token. A provider Cinder cannot find a key for gets no card:
+an agent that is not used here is not a problem.
+
+### Adding a provider of your own
+
+Not every service worth watching answers with a shape Cinder knows. A provider
+of your own is a file, `~/.cinder/providers.json`:
+
+```json
+{
+  "providers": [
+    {
+      "name": "My Router",
+      "url": "https://api.example.com/usage",
+      "token": "sk-...",
+      "percent": "data.usage.percent",
+      "reset": "data.usage.reset_at",
+      "detail": "data.usage.label"
+    }
+  ]
+}
+```
+
+`percent` is a dotted path to the number that is the percentage used, or to an
+object with `used` and `limit` in it. `reset` and `detail` are optional. The
+token is sent as `Authorization: Bearer <token>`, so only point it at a
+service you trust with it.
+
+A provider that is not signed in is skipped; one that is signed in but fails
+says so in the panel instead of showing a stale number. A window whose reset
+time has already passed is dropped rather than shown as if it were still
+running.
+
+When a provider explains itself, the card quotes it: an expired key says
+*"This API key has expired. Create a new API key in OpenCode Console and
+replace it in your client"*, which is more use than "HTTP 401".
+
+Anthropic sends the list of the windows a plan has, and Cinder reads it: it
+names windows the named fields do not (a weekly Opus limit, say), and it
+carries the reset time for the ones that leave it out.
+
+The list also carries a flag that says whether a window is active. Cinder does
+not read it: on a real account a session window sits at 22% with a reset time
+four hours away and is still flagged inactive, so the flag does not mean what
+it looks like. The percentage and the reset time are the truth.
+
+The fetcher is built for a bad day, not only for a good one:
+
+- a request that fails is **tried again** with a backoff — and a rate limit
+  waits longer, because it means "not yet";
+- a provider that keeps failing is **benched** for a while (a minute, then
+  two, then five, then a quarter of an hour) instead of being asked every
+  few minutes;
+- the last windows that did come back are **kept and marked stale**, so a
+  flaky network never blanks the panel;
+- the snapshot is **written to disk**, so a launch shows the last known state
+  instead of an empty tray while the first refresh is in flight;
+- a token that is about to expire is **refreshed** before it is used, and the
+  new token is written back, which also keeps the agent signed in;
+- a machine with two Claude or Codex logins gets a **card for each** of them.
+
+## Prices
+
+Every token is priced against the public list prices, so the dollar figure on
+screen is an *equivalent value*, never an invoice. The bundled price list is
+a snapshot; a fresh one is fetched once a day in the background and kept in
+`~/.cinder/prices.json`, so a model that appeared last week is priced at this
+week's price instead of showing up as unpriced. The bundled list is still
+there underneath, so a fetch that fails changes nothing.
+
+When a model has no price at all, but the agent itself wrote down what the
+call cost, that figure is used instead: the number the agent knows is better
+than no number. Those rows are marked as **reported** rather than estimated.
 
 ## Speed
 
@@ -201,8 +325,79 @@ Tests use temporary home directories, not your real agent logs.
 
 `cargo test --manifest-path src-tauri/Cargo.toml -- --ignored real_home_scan`
 scans the machine you are on and prints what it found, for a human to eyeball.
-`-- --ignored live_quota_check` asks the providers for their live quota, which
-reaches the network.
+`-- --ignored live_quota_check` asks the providers for their live quota, and
+`-- --ignored live_price_refresh` fetches the real price list. Both reach the
+network.
+
+### Checking the numbers against the logs
+
+The collector and the raw logs are checked against each other, so a number on
+the screen is a number that can be accounted for:
+
+```bash
+powershell -File scripts/check-logs.ps1                              # Claude Code
+powershell -File scripts/check-logs.ps1 -Agent Codex                 # Codex
+powershell -File scripts/check-logs.ps1 -Agent Pi                    # Pi
+powershell -File scripts/check-logs.ps1 -Agent OpenCode              # OpenCode
+powershell -File scripts/check-logs.ps1 -Agent DSH                   # DSH
+powershell -File scripts/check-logs.ps1 -Agent Antigravity           # T3's Antigravity
+powershell -File scripts/check-logs.ps1 -Agent Codex 2026-10-19 2026-10-20
+```
+
+`scripts/check-claude-logs.mjs`, `scripts/check-codex-logs.mjs`,
+`scripts/check-pi-logs.mjs`, `scripts/check-opencode-logs.mjs`,
+`scripts/check-dsh-logs.mjs` and `scripts/check-t3-logs.mjs` read the agents'
+own logs with an implementation that shares no code with the collector, and
+the `real_home_day_check` test prints what the collector made of the same
+files. The two have to agree line for line, per model, on requests and on
+every kind of token:
+
+```
+=== 2026-10-21 ===
+  OK: 2 models, the collector and the raw logs agree
+    ROW	gpt-6.1-sol	972	4203575	151414400	0	452778
+    ROW	gpt-6-luna	957	5115851	123688064	0	986159
+```
+
+The Codex check is the interesting one: it pins down the split between cached
+and uncached input, the model switching in the middle of a file, and the
+forked rollouts that replay their parent's earlier turns. The DSH one has to
+walk the chain of zstd frames the sessions are written in, and the Antigravity
+one reads the same usage out of two places — T3's own orchestration database
+and the IDE transcripts — where the model is named in a line of prose.
+
+### Checking the popover against the provider's own numbers
+
+The numbers on the popover come from the provider's own quota API, and they
+are checked against the provider's own record of them:
+
+```bash
+node scripts/check-live-quota.mjs
+```
+
+The Codex CLI writes its copy of the limits into its own session log, so
+there are three numbers to compare: what the CLI wrote down, what the usage
+API answers now, and what Cinder reads out of that API. The first two are
+independent of each other — the CLI writes the server's answer into the log,
+and the second is a fresh fetch — so when they agree, the number on the
+popover is the provider's number:
+
+```
+the CLI wrote its limits at 2026-10-21T21:45:47.547Z
+  5-hour window  log  70%  api  70%  gap 0  reset the same
+  7-day window   log  89%  api  89%  gap 0  reset the same
+  the popover shows the provider's own numbers
+```
+
+The reset times have to match exactly; the percentages may have moved a
+little between the log being written and the fetch, so they are compared
+with a small tolerance.
+
+Anthropic sends the list of the windows a plan has, and Cinder reads it for
+the windows the named fields do not carry and for the reset times they leave
+out. The flag in that list that says whether a window is active is left
+alone: on a real account a session window sits at 22% with a reset time four
+hours away and is still flagged inactive.
 
 Add agents by extending `parse_*` functions in `src-tauri/src/main.rs` and
 `src-tauri/src/agents.rs`.

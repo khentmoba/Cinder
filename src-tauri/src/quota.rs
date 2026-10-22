@@ -45,6 +45,10 @@ pub struct LiveQuota {
     /// The size of that allowance, in dollars.
     #[serde(default)]
     pub limit_amount: f64,
+    /// The money left, for a provider whose allowance is a balance rather
+    /// than a window.
+    #[serde(default)]
+    pub balance: f64,
 }
 
 /// Why a provider could not be read.
@@ -100,6 +104,18 @@ pub struct QuotaReport {
     /// Which account this is about, when a machine holds more than one.
     #[serde(default)]
     pub account: String,
+}
+
+/// The report for a provider that could not be matched to a sign-in.
+///
+/// No sign-in at all is not a problem worth a card: the agent is simply not
+/// used here. A sign-in that could not be read is a problem, and it is said
+/// out loud.
+fn unmatched(agent: &str, problems: Vec<String>) -> QuotaReport {
+    if problems.is_empty() {
+        return QuotaReport::absent(agent);
+    }
+    QuotaReport::failed(agent, ErrorKind::Unauthorized, problems.join("; "))
 }
 
 impl QuotaReport {
@@ -163,6 +179,9 @@ pub const REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const ATTEMPTS: u32 = 3;
 /// The wait before the second attempt. It doubles from there.
 const RETRY_BASE: Duration = Duration::from_millis(400);
+/// The wait before the second attempt when the provider says it is rate
+/// limiting us. That answer means "not yet", so the wait is longer.
+const RETRY_BASE_LIMITED: Duration = Duration::from_secs(2);
 /// The version of the on-disk snapshot, so an old file is not misread.
 const CACHE_VERSION: u32 = 1;
 
@@ -197,7 +216,7 @@ impl Default for Endpoints {
             codex_token: "https://auth.openai.com/oauth/token".into(),
             copilot_usage: "https://api.github.com/copilot_internal/user".into(),
             gemini_usage: "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist".into(),
-            opencode_usage: "https://opencode.ai/api/usage".into(),
+            opencode_usage: "https://opencode.ai/zen/go/v1/usage".into(),
         }
     }
 }
@@ -223,8 +242,7 @@ struct Credential {
 }
 
 fn read_json(path: &Path) -> Option<serde_json::Value> {
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+    crate::read_json_file(path)
 }
 
 /// Write a JSON file without leaving a half-written one behind.
@@ -324,15 +342,34 @@ fn config_dirs(home: &Path, env: &str, default: &str) -> Vec<PathBuf> {
     dirs
 }
 
-/// The Claude Code accounts signed in on this machine.
-fn claude_credentials(home: &Path) -> Vec<Credential> {
+/// The Claude Code accounts signed in on this machine, and what went wrong
+/// where there is a sign-in but it could not be read.
+///
+/// A credential file that exists but cannot be parsed is not the same as no
+/// sign-in at all: the user is signed in and something is wrong, and the card
+/// has to say which.
+fn claude_credentials(home: &Path) -> (Vec<Credential>, Vec<String>) {
     let mut out = Vec::new();
+    let mut problems = Vec::new();
     for dir in config_dirs(home, "CLAUDE_CONFIG_DIR", ".claude") {
         let path = dir.join(".credentials.json");
-        let Some(v) = read_json(&path) else { continue };
-        let Some(o) = v.get("claudeAiOauth") else { continue };
-        let Some(token) = o.get("accessToken").and_then(|x| x.as_str()) else { continue };
+        if !path.exists() {
+            continue;
+        }
+        let Some(v) = read_json(&path) else {
+            problems.push(format!("{} could not be read", path.display()));
+            continue;
+        };
+        let Some(o) = v.get("claudeAiOauth") else {
+            problems.push(format!("{} holds no sign-in", path.display()));
+            continue;
+        };
+        let Some(token) = o.get("accessToken").and_then(|x| x.as_str()) else {
+            problems.push(format!("{} holds no access token", path.display()));
+            continue;
+        };
         if token.trim().is_empty() {
+            problems.push(format!("{} holds an empty access token", path.display()));
             continue;
         }
         let (mut account, mut expires_at) = token_identity(token);
@@ -354,18 +391,33 @@ fn claude_credentials(home: &Path) -> Vec<Credential> {
             account,
         });
     }
-    out
+    (out, problems)
 }
 
-/// The ChatGPT accounts Codex is signed in with on this machine.
-fn codex_credentials(home: &Path) -> Vec<Credential> {
+/// The ChatGPT accounts Codex is signed in with on this machine, and what went
+/// wrong where there is a sign-in but it could not be read.
+fn codex_credentials(home: &Path) -> (Vec<Credential>, Vec<String>) {
     let mut out = Vec::new();
+    let mut problems = Vec::new();
     for dir in config_dirs(home, "CODEX_HOME", ".codex") {
         let path = dir.join("auth.json");
-        let Some(v) = read_json(&path) else { continue };
-        let Some(t) = v.get("tokens") else { continue };
-        let Some(token) = t.get("access_token").and_then(|x| x.as_str()) else { continue };
+        if !path.exists() {
+            continue;
+        }
+        let Some(v) = read_json(&path) else {
+            problems.push(format!("{} could not be read", path.display()));
+            continue;
+        };
+        let Some(t) = v.get("tokens") else {
+            problems.push(format!("{} holds no sign-in", path.display()));
+            continue;
+        };
+        let Some(token) = t.get("access_token").and_then(|x| x.as_str()) else {
+            problems.push(format!("{} holds no access token", path.display()));
+            continue;
+        };
         if token.trim().is_empty() {
+            problems.push(format!("{} holds an empty access token", path.display()));
             continue;
         }
         let (mut account, expires_at) = token_identity(token);
@@ -381,11 +433,11 @@ fn codex_credentials(home: &Path) -> Vec<Credential> {
             account,
         });
     }
-    out
+    (out, problems)
 }
 
 /// The GitHub token the Copilot extension stores.
-fn copilot_token(home: &Path) -> Option<String> {
+fn copilot_token(home: &Path) -> (Option<String>, Vec<String>) {
     let mut candidates = vec![
         home.join(".config").join("github-copilot").join("apps.json"),
         home.join(".config").join("github-copilot").join("hosts.json"),
@@ -397,47 +449,89 @@ fn copilot_token(home: &Path) -> Option<String> {
             candidates.push(base.join("hosts.json"));
         }
     }
+    let mut problems = Vec::new();
     for path in candidates {
-        let Some(v) = read_json(&path) else { continue };
+        if !path.exists() {
+            continue;
+        }
+        let Some(v) = read_json(&path) else {
+            problems.push(format!("{} could not be read", path.display()));
+            continue;
+        };
         // Both shapes are maps of account id -> credential object.
-        let Some(accounts) = v.as_object() else { continue };
+        let Some(accounts) = v.as_object() else {
+            problems.push(format!("{} holds no sign-in", path.display()));
+            continue;
+        };
         for (_id, cred) in accounts {
             if let Some(t) = str_at(cred, &["oauth_token", "token", "access_token"]) {
-                return Some(t);
+                return (Some(t), problems);
             }
         }
+        problems.push(format!("{} holds no access token", path.display()));
     }
-    None
+    (None, problems)
 }
 
 /// The Google access token the Gemini CLI stores.
-fn gemini_token(home: &Path) -> Option<String> {
+fn gemini_token(home: &Path) -> (Option<String>, Vec<String>) {
+    let mut problems = Vec::new();
     for path in [home.join(".gemini").join("oauth_creds.json")] {
-        let Some(v) = read_json(&path) else { continue };
-        if let Some(t) = str_at(&v, &["access_token", "accessToken"]) {
-            return Some(t);
+        if !path.exists() {
+            continue;
         }
+        let Some(v) = read_json(&path) else {
+            problems.push(format!("{} could not be read", path.display()));
+            continue;
+        };
+        if let Some(t) = str_at(&v, &["access_token", "accessToken"]) {
+            return (Some(t), problems);
+        }
+        problems.push(format!("{} holds no access token", path.display()));
     }
-    None
+    (None, problems)
 }
 
 /// The OpenCode API key, if the user configured one.
-fn opencode_token(home: &Path) -> Option<String> {
+///
+/// The newer auth file holds one entry per provider, so the account's own
+/// entry is picked out of that map: the usage API wants the account's key,
+/// not the key of whichever provider the CLI happens to be talking to.
+fn opencode_token(home: &Path) -> (Option<String>, Vec<String>) {
     if let Ok(t) = std::env::var("OPENCODE_API_KEY") {
         if !t.trim().is_empty() {
-            return Some(t);
+            return (Some(t), Vec::new());
         }
     }
+    let mut problems = Vec::new();
     for path in [
         home.join(".local").join("share").join("opencode").join("auth.json"),
         home.join(".config").join("opencode").join("auth.json"),
     ] {
-        let Some(v) = read_json(&path) else { continue };
-        if let Some(t) = str_at(&v, &["opencode", "apiKey", "api_key", "token"]) {
-            return Some(t);
+        if !path.exists() {
+            continue;
         }
+        let Some(v) = read_json(&path) else {
+            problems.push(format!("{} could not be read", path.display()));
+            continue;
+        };
+        // The older shape: one key at the top.
+        if let Some(t) = str_at(&v, &["opencode", "apiKey", "api_key", "token"]) {
+            return (Some(t), problems);
+        }
+        // The newer shape: one entry per provider.
+        if let Some(accounts) = v.as_object() {
+            for name in ["opencode-go", "opencode-zen", "opencode"] {
+                if let Some(entry) = accounts.get(name) {
+                    if let Some(t) = str_at(entry, &["key", "apiKey", "api_key", "token"]) {
+                        return (Some(t), problems);
+                    }
+                }
+            }
+        }
+        problems.push(format!("{} holds no access token", path.display()));
     }
-    None
+    (None, problems)
 }
 
 // ------------------------------------------------------------ token refreshing
@@ -612,6 +706,55 @@ fn percent(v: &serde_json::Value) -> Option<f64> {
     Some((used / total * 100.0).clamp(0.0, 100.0))
 }
 
+/// The name, the length and the description of a window the provider names.
+fn claude_window(kind: &str) -> (&'static str, i64, &'static str) {
+    match kind {
+        "session" | "five_hour" => ("5h", 300, "5-hour session window"),
+        "weekly_all" | "seven_day" => ("7d", 7 * 24 * 60, "7-day window"),
+        "weekly_opus" | "seven_day_opus" => ("7d-opus", 7 * 24 * 60, "Weekly Opus limit"),
+        "weekly_sonnet" | "seven_day_sonnet" => ("7d-sonnet", 7 * 24 * 60, "Weekly Sonnet limit"),
+        "weekly_haiku" | "seven_day_haiku" => ("7d-haiku", 7 * 24 * 60, "Weekly Haiku limit"),
+        "weekly_cowork" | "seven_day_cowork" => ("7d-cowork", 7 * 24 * 60, "Weekly Cowork limit"),
+        _ => ("window", 0, "Rate limit window"),
+    }
+}
+
+/// The provider's own list of windows.
+///
+/// Anthropic sends a `limits` array that names the windows the plan has. It
+/// is worth reading because it names windows Cinder does not know about, and
+/// it carries the reset time for the ones the named fields leave out.
+///
+/// It also carries an `is_active` flag, which is not read: on this machine a
+/// session window sits at 22% with a reset time four hours away and is still
+/// flagged inactive, so the flag does not mean what it looks like.
+fn parse_claude_limits(v: &serde_json::Value, plan: &str) -> Vec<LiveQuota> {
+    let Some(limits) = v.get("limits").and_then(|x| x.as_array()) else { return Vec::new() };
+    let mut out = Vec::new();
+    for l in limits {
+        let Some(kind) = l
+            .get("kind")
+            .and_then(|x| x.as_str())
+            .or_else(|| l.get("group").and_then(|x| x.as_str()))
+        else {
+            continue;
+        };
+        let Some(pct) = l.get("percent").and_then(percent) else { continue };
+        let (id, minutes, detail) = claude_window(kind);
+        out.push(LiveQuota {
+            agent: "Claude Code".into(),
+            window: id.into(),
+            used_percent: pct,
+            window_minutes: minutes,
+            resets_at: l.get("resets_at").map(parse_resets_at).unwrap_or(0),
+            plan: plan.into(),
+            detail: detail.into(),
+            ..Default::default()
+        });
+    }
+    out
+}
+
 /// Claude's usage payload: five_hour, seven_day, seven_day_sonnet, ...
 fn parse_claude_usage(v: &serde_json::Value, plan: &str) -> Vec<LiveQuota> {
     let mut out = Vec::new();
@@ -636,6 +779,19 @@ fn parse_claude_usage(v: &serde_json::Value, plan: &str) -> Vec<LiveQuota> {
             ..Default::default()
         });
     }
+    // The provider's own list of windows: it names the ones Cinder does not
+    // know about, and it carries the reset time for the ones the named
+    // fields leave out.
+    for l in parse_claude_limits(v, plan) {
+        match out.iter_mut().find(|w| w.window == l.window) {
+            Some(existing) => {
+                if existing.resets_at == 0 {
+                    existing.resets_at = l.resets_at;
+                }
+            }
+            None => out.push(l),
+        }
+    }
     // Extra usage is a credit balance, not a window: report how much of the
     // monthly allowance is gone.
     if let Some(extra) = v.get("extra_usage") {
@@ -652,6 +808,7 @@ fn parse_claude_usage(v: &serde_json::Value, plan: &str) -> Vec<LiveQuota> {
                 detail: "Extra usage credits".into(),
                 used_amount: used,
                 limit_amount: limit,
+                ..Default::default()
             });
         }
     }
@@ -821,26 +978,29 @@ fn parse_gemini_usage(v: &serde_json::Value) -> Vec<LiveQuota> {
 }
 
 /// OpenCode's usage payload: rolling five-hour, weekly and monthly windows.
+///
+/// The console answers with the percentage of each window that is gone, how
+/// long until it resets, and whether the window has run out.
 fn parse_opencode_usage(v: &serde_json::Value) -> Vec<LiveQuota> {
     let mut out = Vec::new();
     let windows: [(&str, &str, i64, &str); 3] = [
-        ("five_hour", "5h", 300, "5-hour session window"),
-        ("weekly", "7d", 7 * 24 * 60, "7-day window"),
-        ("monthly", "30d", 30 * 24 * 60, "30-day window"),
+        ("rollingUsage", "5h", 300, "5-hour session window"),
+        ("weeklyUsage", "7d", 7 * 24 * 60, "7-day window"),
+        ("monthlyUsage", "30d", 30 * 24 * 60, "30-day window"),
     ];
     for (key, id, minutes, detail) in windows {
         let Some(w) = v.get(key) else { continue };
-        let Some(pct) = w.get("utilization").and_then(percent).or_else(|| w.as_f64().map(|n| n.clamp(0.0, 100.0))) else {
-            continue;
-        };
+        let Some(pct) = w.get("usagePercent").and_then(percent) else { continue };
+        let reset = w.get("resetInSec").and_then(|x| x.as_i64()).unwrap_or(0);
+        let spent = w.get("status").and_then(|x| x.as_str()) == Some("rate-limited");
         out.push(LiveQuota {
             agent: "OpenCode".into(),
             window: id.into(),
             used_percent: pct,
             window_minutes: minutes,
-            resets_at: w.get("resets_at").map(parse_resets_at).unwrap_or(0),
+            resets_at: if reset > 0 { now_secs() + reset } else { 0 },
             plan: String::new(),
-            detail: detail.into(),
+            detail: if spent { format!("{detail} — spent") } else { detail.into() },
             ..Default::default()
         });
     }
@@ -856,8 +1016,8 @@ enum FetchError {
     Network(String),
     /// The provider took too long.
     Timeout(String),
-    /// The provider answered with an error status.
-    Status(u16),
+    /// The provider answered with an error status, and what it said.
+    Status(u16, String),
     /// The answer was not JSON.
     BadJson(String),
 }
@@ -869,7 +1029,7 @@ impl FetchError {
             FetchError::Network(_) | FetchError::Timeout(_) => true,
             // A server-side error or a rate limit is worth another attempt; a
             // refused token is not.
-            FetchError::Status(code) => *code == 429 || *code >= 500,
+            FetchError::Status(code, _) => *code == 429 || *code >= 500,
             FetchError::BadJson(_) => false,
         }
     }
@@ -879,8 +1039,8 @@ impl FetchError {
         match self {
             FetchError::Network(_) => ErrorKind::Unreachable,
             FetchError::Timeout(_) => ErrorKind::Timeout,
-            FetchError::Status(401) | FetchError::Status(403) => ErrorKind::Unauthorized,
-            FetchError::Status(_) => ErrorKind::Status,
+            FetchError::Status(401, _) | FetchError::Status(403, _) => ErrorKind::Unauthorized,
+            FetchError::Status(_, _) => ErrorKind::Status,
             FetchError::BadJson(_) => ErrorKind::BadPayload,
         }
     }
@@ -889,7 +1049,15 @@ impl FetchError {
         match self {
             FetchError::Network(m) => m.clone(),
             FetchError::Timeout(m) => m.clone(),
-            FetchError::Status(code) => format!("HTTP {code}"),
+            FetchError::Status(code, said) => {
+                // The provider usually says what went wrong; a card that
+                // repeats it is more use than one that says "HTTP 403".
+                if said.is_empty() {
+                    format!("HTTP {code}")
+                } else {
+                    format!("HTTP {code}: {said}")
+                }
+            }
             FetchError::BadJson(m) => m.clone(),
         }
     }
@@ -924,7 +1092,29 @@ async fn try_json(
     })?;
     let status = resp.status();
     if !status.is_success() {
-        return Err(FetchError::Status(status.as_u16()));
+        // The body usually says what went wrong: "OpenCode Go subscription
+        // required." is more use than "HTTP 403".
+        let body = resp.text().await.unwrap_or_default();
+        let said = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| {
+                v.get("error")
+                    .and_then(|e| e.get("message"))
+                    .or_else(|| v.get("message"))
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| {
+                // A short plain answer is worth repeating too. A long one -
+                // an error page, say - is not.
+                let trimmed = body.trim();
+                if trimmed.is_empty() || trimmed.len() > 120 || trimmed.starts_with('<') {
+                    String::new()
+                } else {
+                    trimmed.to_string()
+                }
+            });
+        return Err(FetchError::Status(status.as_u16(), said));
     }
     resp.json::<serde_json::Value>().await.map_err(|e| FetchError::BadJson(e.to_string()))
 }
@@ -944,8 +1134,13 @@ async fn get_json(
             Ok(v) => return Ok(v),
             Err(e) if e.retryable() && attempt < ATTEMPTS => {
                 // The wait doubles each time, with a little jitter so two
-                // providers failing together do not retry in lockstep.
-                let backoff = RETRY_BASE * 2u32.pow(attempt - 1);
+                // providers failing together do not retry in lockstep. A rate
+                // limit waits longer, because it says "not yet".
+                let base = match &e {
+                    FetchError::Status(429, _) => RETRY_BASE_LIMITED,
+                    _ => RETRY_BASE,
+                };
+                let backoff = base * 2u32.pow(attempt - 1);
                 let jitter = (attempt as u64 * 37) % 120;
                 tokio::time::sleep(backoff + Duration::from_millis(jitter)).await;
             }
@@ -965,13 +1160,63 @@ fn account_label(agent: &str, cred: &Credential, many: bool) -> String {
     format!("{agent} \u{b7} {}", cred.account)
 }
 
+/// The providers whose token can be refreshed.
+#[derive(Clone, Copy, PartialEq)]
+enum Account {
+    Claude,
+    Codex,
+}
+
+/// Refresh the account's token, if it can be.
+async fn refresh_account(
+    client: &reqwest::Client,
+    endpoints: &Endpoints,
+    account: Account,
+    cred: &Credential,
+) -> Option<Credential> {
+    match account {
+        Account::Claude => refresh_claude(client, endpoints, cred).await,
+        Account::Codex => refresh_codex(client, endpoints, cred).await,
+    }
+}
+
+/// Ask for the usage, refreshing the token once if it is refused.
+///
+/// A token can be refused before its expiry is known — the clock moved, or the
+/// agent stored no expiry at all — so asking again with a fresh token is
+/// worth one attempt.
+async fn get_usage(
+    client: &reqwest::Client,
+    endpoints: &Endpoints,
+    account: Account,
+    cred: &mut Credential,
+    url: &str,
+    extra: &[(&str, &str)],
+) -> Result<serde_json::Value, FetchError> {
+    let first = get_json(client, url, &cred.token, extra).await;
+    let Err(FetchError::Status(401, said)) = first else { return first };
+    let Some(next) = refresh_account(client, endpoints, account, cred).await else {
+        return Err(FetchError::Status(401, said));
+    };
+    let token = next.token.clone();
+    *cred = next;
+    match get_json(client, url, &token, extra).await {
+        // The fresh token was refused too: the old answer is the one to keep.
+        Err(FetchError::Status(401, _)) => Err(FetchError::Status(401, said)),
+        other => other,
+    }
+}
+
 /// The Claude Code usage for one account.
 async fn claude_code(client: reqwest::Client, endpoints: Endpoints, cred: Credential, many: bool) -> QuotaReport {
     let label = account_label("Claude Code", &cred, many);
-    let v = match get_json(
+    let mut cred = cred;
+    let v = match get_usage(
         &client,
+        &endpoints,
+        Account::Claude,
+        &mut cred,
         &endpoints.claude_usage,
-        &cred.token,
         &[("anthropic-beta", "oauth-2025-04-20")],
     )
     .await
@@ -1004,12 +1249,14 @@ async fn claude_code(client: reqwest::Client, endpoints: Endpoints, cred: Creden
 }
 
 /// The Codex usage for one account.
-async fn codex(client: reqwest::Client, endpoints: Endpoints, cred: Credential, many: bool) -> QuotaReport {
+async fn codex(client: reqwest::Client, endpoints: Endpoints, mut cred: Credential, many: bool) -> QuotaReport {
     let label = account_label("Codex", &cred, many);
-    let usage = get_json(
+    let usage = get_usage(
         &client,
+        &endpoints,
+        Account::Codex,
+        &mut cred,
         &endpoints.codex_usage,
-        &cred.token,
         &[("OpenAI-Beta", "codex-1")],
     )
     .await;
@@ -1053,8 +1300,9 @@ async fn codex(client: reqwest::Client, endpoints: Endpoints, cred: Credential, 
 
 /// The Copilot usage.
 async fn copilot(client: reqwest::Client, endpoints: Endpoints, home: PathBuf) -> QuotaReport {
-    let Some(token) = copilot_token(&home) else {
-        return QuotaReport::absent("GitHub Copilot");
+    let (token, problems) = copilot_token(&home);
+    let Some(token) = token else {
+        return unmatched("GitHub Copilot", problems);
     };
     let v = match get_json(
         &client,
@@ -1082,8 +1330,9 @@ async fn copilot(client: reqwest::Client, endpoints: Endpoints, home: PathBuf) -
 
 /// The Gemini CLI usage.
 async fn gemini_cli(client: reqwest::Client, endpoints: Endpoints, home: PathBuf) -> QuotaReport {
-    let Some(token) = gemini_token(&home) else {
-        return QuotaReport::absent("Gemini CLI");
+    let (token, problems) = gemini_token(&home);
+    let Some(token) = token else {
+        return unmatched("Gemini CLI", problems);
     };
     let v = match get_json(
         &client,
@@ -1109,8 +1358,9 @@ async fn gemini_cli(client: reqwest::Client, endpoints: Endpoints, home: PathBuf
 
 /// The OpenCode usage.
 async fn opencode(client: reqwest::Client, endpoints: Endpoints, home: PathBuf) -> QuotaReport {
-    let Some(token) = opencode_token(&home) else {
-        return QuotaReport::absent("OpenCode");
+    let (token, problems) = opencode_token(&home);
+    let Some(token) = token else {
+        return unmatched("OpenCode", problems);
     };
     let v = match get_json(&client, &endpoints.opencode_usage, &token, &[]).await {
         Ok(v) => v,
@@ -1124,6 +1374,419 @@ async fn opencode(client: reqwest::Client, endpoints: Endpoints, home: PathBuf) 
     report.updated_at = now_secs();
     report
 }
+// ------------------------------------------------------- the simple providers
+
+/// A provider whose quota is one JSON answer.
+///
+/// The providers that need an OAuth dance of their own (Claude Code, Codex)
+/// have code of their own; the rest are a credential, a URL and a shape.
+struct QuotaProvider {
+    /// The name on the card.
+    agent: &'static str,
+    /// Where the credential is, and what to make of it.
+    credential: fn(&Path) -> (Option<String>, Vec<String>),
+    /// The endpoint to ask.
+    url: &'static str,
+    /// The headers the endpoint wants.
+    headers: &'static [(&'static str, &'static str)],
+    /// How to read the answer.
+    parse: fn(&serde_json::Value) -> Vec<LiveQuota>,
+}
+
+/// The providers Cinder can ask with a plain key.
+///
+/// Each endpoint was taken from the provider's own code or its published API,
+/// and each was checked to answer 401 rather than 404 — the route is there
+/// and it wants a bearer token.
+const PROVIDERS: &[QuotaProvider] = &[
+    QuotaProvider {
+        agent: "OpenRouter",
+        credential: openrouter_credential,
+        url: "https://openrouter.ai/api/v1/credits",
+        headers: &[],
+        parse: parse_openrouter_credits,
+    },
+    QuotaProvider {
+        agent: "Kimi Code",
+        credential: kimi_credential,
+        url: "https://api.kimi.com/coding/v1/usages",
+        headers: &[],
+        parse: parse_kimi_usage,
+    },
+    QuotaProvider {
+        agent: "DeepSeek",
+        credential: deepseek_credential,
+        url: "https://api.deepseek.com/user/balance",
+        headers: &[],
+        parse: parse_deepseek_balance,
+    },
+];
+
+/// The key for a provider that is billed per token.
+///
+/// The environment is the usual place. Otherwise the key is where the agents
+/// that use it keep it: the pi agent's own catalog holds the key with the
+/// provider it belongs to.
+fn api_key(home: &Path, env: &str, provider: &str) -> (Option<String>, Vec<String>) {
+    if let Ok(k) = std::env::var(env) {
+        if !k.trim().is_empty() {
+            return (Some(k), Vec::new());
+        }
+    }
+    let mut problems = Vec::new();
+    for path in [
+        home.join(".pi").join("agent").join("models.json"),
+        home.join(".pi").join("agent").join("models-store.json"),
+    ] {
+        if !path.exists() {
+            continue;
+        }
+        let Some(v) = read_json(&path) else {
+            problems.push(format!("{} could not be read", path.display()));
+            continue;
+        };
+        let Some(providers) = v.get("providers").filter(|p| p.is_object()) else { continue };
+        let Some(entry) = providers.get(provider) else { continue };
+        if let Some(k) = str_at(entry, &["apiKey", "api_key", "key"]) {
+            return (Some(k), problems);
+        }
+        if let Some(models) = entry.get("models").and_then(|m| m.as_array()) {
+            for m in models {
+                if let Some(k) = str_at(m, &["apiKey", "api_key", "key"]) {
+                    return (Some(k), problems);
+                }
+            }
+        }
+    }
+    (None, problems)
+}
+
+/// The OpenRouter key.
+fn openrouter_credential(home: &Path) -> (Option<String>, Vec<String>) {
+    api_key(home, "OPENROUTER_API_KEY", "openrouter")
+}
+
+/// The DeepSeek key.
+fn deepseek_credential(home: &Path) -> (Option<String>, Vec<String>) {
+    api_key(home, "DEEPSEEK_API_KEY", "deepseek")
+}
+
+/// The Kimi Code key.
+///
+/// The Kimi CLI keeps its sign-in in `~/.kimi/credentials`, under the name
+/// its own config gives it.
+fn kimi_credential(home: &Path) -> (Option<String>, Vec<String>) {
+    if let Ok(k) = std::env::var("KIMI_API_KEY") {
+        if !k.trim().is_empty() {
+            return (Some(k), Vec::new());
+        }
+    }
+    let mut problems = Vec::new();
+    let dir = home.join(".kimi").join("credentials");
+    let Ok(entries) = std::fs::read_dir(&dir) else { return (None, problems) };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(v) = read_json(&path) else {
+            problems.push(format!("{} could not be read", path.display()));
+            continue;
+        };
+        if let Some(k) = str_at(&v, &["access_token", "accessToken", "api_key", "apiKey"]) {
+            return (Some(k), problems);
+        }
+    }
+    (None, problems)
+}
+
+/// OpenRouter's credits: what was bought and what has been spent of it.
+fn parse_openrouter_credits(v: &serde_json::Value) -> Vec<LiveQuota> {
+    let Some(data) = v.get("data") else { return Vec::new() };
+    let total = data.get("total_credits").and_then(|x| x.as_f64()).unwrap_or(0.0);
+    let used = data.get("total_usage").and_then(|x| x.as_f64()).unwrap_or(0.0);
+    if total <= 0.0 {
+        return Vec::new();
+    }
+    vec![LiveQuota {
+        agent: "OpenRouter".into(),
+        window: "credits".into(),
+        used_percent: (used / total * 100.0).clamp(0.0, 100.0),
+        window_minutes: 30 * 24 * 60,
+        plan: String::new(),
+        detail: format!("${used:.2} of ${total:.2} spent"),
+        ..Default::default()
+    }]
+}
+
+/// Kimi Code's usage: a summary and a list of limits.
+///
+/// Each limit says what has been used and what the limit is, and sometimes
+/// how long is left of it.
+fn parse_kimi_usage(v: &serde_json::Value) -> Vec<LiveQuota> {
+    let mut out = Vec::new();
+    if let Some(usage) = v.get("usage") {
+        if let Some(w) = kimi_window(usage, usage, "Weekly limit") {
+            out.push(w);
+        }
+    }
+    let Some(limits) = v.get("limits").and_then(|x| x.as_array()) else { return out };
+    for (i, item) in limits.iter().enumerate() {
+        let detail = item.get("detail").filter(|d| d.is_object()).unwrap_or(item);
+        let label = kimi_label(item, detail, i);
+        if let Some(w) = kimi_window(item, detail, &label) {
+            out.push(w);
+        }
+    }
+    out
+}
+
+/// One Kimi limit, as a window.
+fn kimi_window(item: &serde_json::Value, detail: &serde_json::Value, label: &str) -> Option<LiveQuota> {
+    let limit_field = detail.get("limit").and_then(|x| x.as_f64());
+    let used_field = detail.get("used").and_then(|x| x.as_f64());
+    let remaining = detail.get("remaining").and_then(|x| x.as_f64());
+    // A limit that says what is left but not what the limit is still has one:
+    // what has been used and what is left add up to it.
+    let limit = match limit_field {
+        Some(l) => l,
+        None => match (used_field, remaining) {
+            (Some(u), Some(r)) => u + r,
+            _ => 0.0,
+        },
+    };
+    let used = match used_field {
+        Some(u) => u,
+        None => match (remaining, limit_field) {
+            (Some(r), Some(l)) => l - r,
+            _ => return None,
+        },
+    };
+    if limit <= 0.0 && used <= 0.0 {
+        return None;
+    }
+    Some(LiveQuota {
+        agent: "Kimi Code".into(),
+        window: label.to_string(),
+        used_percent: if limit > 0.0 { (used / limit * 100.0).clamp(0.0, 100.0) } else { 0.0 },
+        window_minutes: kimi_minutes(item, detail),
+        resets_at: kimi_reset(item, detail),
+        plan: String::new(),
+        detail: label.to_string(),
+        ..Default::default()
+    })
+}
+
+/// The name of a Kimi limit: what it says it is, or how long it is.
+fn kimi_label(item: &serde_json::Value, detail: &serde_json::Value, index: usize) -> String {
+    for key in ["name", "title", "scope"] {
+        if let Some(v) = item.get(key).or_else(|| detail.get(key)).and_then(|x| x.as_str()) {
+            if !v.trim().is_empty() {
+                return v.to_string();
+            }
+        }
+    }
+    let window = item.get("window").filter(|w| w.is_object());
+    let duration = window
+        .and_then(|w| w.get("duration"))
+        .or_else(|| item.get("duration"))
+        .or_else(|| detail.get("duration"))
+        .and_then(|x| x.as_i64());
+    let unit = window
+        .and_then(|w| w.get("timeUnit"))
+        .or_else(|| item.get("timeUnit"))
+        .or_else(|| detail.get("timeUnit"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+    match duration {
+        Some(d) if unit.contains("MINUTE") && d >= 60 && d % 60 == 0 => {
+            // A week is a week, not a hundred and sixty-eight hours.
+            let hours = d / 60;
+            if hours >= 24 && hours % 24 == 0 {
+                format!("{}d limit", hours / 24)
+            } else {
+                format!("{hours}h limit")
+            }
+        }
+        Some(d) if unit.contains("MINUTE") => format!("{d}m limit"),
+        Some(d) if unit.contains("HOUR") => format!("{d}h limit"),
+        Some(d) if unit.contains("DAY") => format!("{d}d limit"),
+        _ => format!("Limit #{}", index + 1),
+    }
+}
+
+/// How long a Kimi limit runs, in minutes.
+fn kimi_minutes(item: &serde_json::Value, detail: &serde_json::Value) -> i64 {
+    let window = item.get("window").filter(|w| w.is_object());
+    let duration = window
+        .and_then(|w| w.get("duration"))
+        .or_else(|| item.get("duration"))
+        .or_else(|| detail.get("duration"))
+        .and_then(|x| x.as_i64())
+        .unwrap_or(0);
+    let unit = window
+        .and_then(|w| w.get("timeUnit"))
+        .or_else(|| item.get("timeUnit"))
+        .or_else(|| detail.get("timeUnit"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+    if unit.contains("MINUTE") {
+        duration
+    } else if unit.contains("HOUR") {
+        duration * 60
+    } else if unit.contains("DAY") {
+        duration * 24 * 60
+    } else {
+        0
+    }
+}
+
+/// When a Kimi limit resets, when it says.
+fn kimi_reset(item: &serde_json::Value, detail: &serde_json::Value) -> i64 {
+    for key in ["reset_at", "resetAt", "reset_time", "resetTime"] {
+        if let Some(v) = detail.get(key).or_else(|| item.get(key)).and_then(|x| x.as_str()) {
+            let t = parse_resets_at(&serde_json::Value::String(v.to_string()));
+            if t > 0 {
+                return t;
+            }
+        }
+    }
+    for key in ["reset_in", "resetIn", "ttl"] {
+        if let Some(seconds) = detail.get(key).or_else(|| item.get(key)).and_then(|x| x.as_i64()) {
+            if seconds > 0 {
+                return now_secs() + seconds;
+            }
+        }
+    }
+    0
+}
+
+/// DeepSeek's balance: the money in the account.
+fn parse_deepseek_balance(v: &serde_json::Value) -> Vec<LiveQuota> {
+    let Some(infos) = v.get("balance_infos").and_then(|x| x.as_array()) else { return Vec::new() };
+    let Some(first) = infos.first() else { return Vec::new() };
+    let number = |key: &str| {
+        first
+            .get(key)
+            .and_then(|x| x.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
+    let total = number("total_balance");
+    if total <= 0.0 {
+        return Vec::new();
+    }
+    let currency = first.get("currency").and_then(|x| x.as_str()).unwrap_or("");
+    vec![LiveQuota {
+        agent: "DeepSeek".into(),
+        window: "balance".into(),
+        plan: String::new(),
+        detail: if currency.is_empty() {
+            "Account balance".into()
+        } else {
+            format!("Account balance ({currency})")
+        },
+        balance: total,
+        ..Default::default()
+    }]
+}
+
+// ------------------------------------------------------ the user's own providers
+
+/// A provider the user added themselves.
+///
+/// Not every service worth watching answers with a shape Cinder knows. A
+/// provider added here is a URL, a token and where in the answer the
+/// percentage is.
+#[derive(Clone)]
+struct CustomProvider {
+    name: String,
+    url: String,
+    token: String,
+    /// Where the percentage is, as a dotted path.
+    percent: String,
+    /// Where the reset time is, when the answer has one.
+    reset: String,
+    /// Where the label is, when the answer has one.
+    detail: String,
+}
+
+/// The providers the user added, read from `~/.cinder/providers.json`.
+fn custom_providers(home: &Path) -> Vec<CustomProvider> {
+    let path = home.join(".cinder").join("providers.json");
+    let Some(v) = read_json(&path) else { return Vec::new() };
+    let Some(list) = v.get("providers").and_then(|x| x.as_array()) else { return Vec::new() };
+    list.iter()
+        .filter_map(|p| {
+            Some(CustomProvider {
+                name: p.get("name")?.as_str()?.to_string(),
+                url: p.get("url")?.as_str()?.to_string(),
+                token: p.get("token")?.as_str()?.to_string(),
+                percent: p.get("percent").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                reset: p.get("reset").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                detail: p.get("detail").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            })
+        })
+        .filter(|p| !p.name.is_empty() && !p.url.is_empty() && !p.percent.is_empty())
+        .collect()
+}
+
+/// The value at a dotted path: "data.usage.percent" or "limits.0.percent".
+fn json_path<'a>(v: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let mut current = v;
+    for part in path.split('.') {
+        if part.is_empty() {
+            continue;
+        }
+        current = match current {
+            serde_json::Value::Object(m) => m.get(part)?,
+            serde_json::Value::Array(a) => a.get(part.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    Some(current)
+}
+
+/// The percentage at a path: a number, or a share of a used and a limit.
+fn percent_at(v: &serde_json::Value, path: &str) -> Option<f64> {
+    let at = json_path(v, path)?;
+    if let Some(n) = at.as_f64() {
+        return Some(n.clamp(0.0, 100.0));
+    }
+    let used = at.get("used").and_then(|x| x.as_f64())?;
+    let limit = at.get("limit").and_then(|x| x.as_f64())?;
+    if limit <= 0.0 {
+        return None;
+    }
+    Some((used / limit * 100.0).clamp(0.0, 100.0))
+}
+
+/// The window a custom provider answers with.
+fn parse_custom(provider: &CustomProvider, v: &serde_json::Value) -> Vec<LiveQuota> {
+    let Some(pct) = percent_at(v, &provider.percent) else { return Vec::new() };
+    let resets_at = json_path(v, &provider.reset)
+        .map(|x| match x {
+            serde_json::Value::String(s) => parse_resets_at(&serde_json::Value::String(s.clone())),
+            serde_json::Value::Number(n) => n.as_i64().unwrap_or(0),
+            _ => 0,
+        })
+        .unwrap_or(0);
+    let detail = json_path(v, &provider.detail)
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    vec![LiveQuota {
+        agent: provider.name.clone(),
+        window: provider.name.clone(),
+        used_percent: pct,
+        window_minutes: 0,
+        resets_at,
+        plan: String::new(),
+        detail,
+        ..Default::default()
+    }]
+}
+
 // ------------------------------------------------------------- provider state
 
 /// What is known about one provider between refreshes.
@@ -1210,32 +1873,23 @@ fn benched(agent: &str, now: i64) -> Option<QuotaReport> {
     Some(report)
 }
 
-/// A provider fetch, boxed so that the different providers can be waited for
-/// together.
-type Fetch = std::pin::Pin<Box<dyn std::future::Future<Output = QuotaReport> + Send>>;
-
-/// Box a fetch so it can sit in a list next to the others.
-fn boxed<F: std::future::Future<Output = QuotaReport> + Send + 'static>(f: F) -> Fetch {
-    Box::pin(f)
-}
-
 /// Run one provider's fetch, bounded by a timeout, and settle the result.
 ///
 /// The future is only awaited when the provider is not benched, so a provider
 /// that is left alone after failing does not touch the network at all.
-async fn run_provider<F>(agent: &str, fetch: F, timeout: Duration) -> QuotaReport
+async fn run_provider<F>(agent: String, fetch: F, timeout: Duration) -> QuotaReport
 where
     F: std::future::Future<Output = QuotaReport> + Send,
 {
     let now = now_secs();
-    if let Some(report) = benched(agent, now) {
+    if let Some(report) = benched(&agent, now) {
         return report;
     }
     let result = tokio::time::timeout(timeout, fetch).await;
     match result {
         Ok(report) => settle(report, now_secs()),
         Err(_) => settle(
-            QuotaReport::failed(agent, ErrorKind::Timeout, "the provider did not answer in time"),
+            QuotaReport::failed(&agent, ErrorKind::Timeout, "the provider did not answer in time"),
             now_secs(),
         ),
     }
@@ -1265,8 +1919,8 @@ pub async fn fetch_all_with(home: &Path, endpoints: &Endpoints) -> Vec<QuotaRepo
 
     // Each account is fetched on its own, so a machine with two Claude
     // logins gets a card for each of them.
-    let mut claude_creds = claude_credentials(home);
-    let mut codex_creds = codex_credentials(home);
+    let (mut claude_creds, claude_problems) = claude_credentials(home);
+    let (mut codex_creds, codex_problems) = codex_credentials(home);
     // With a single account the plain name is used, so the alerts read the
     // way they always did.
     let many_claude = claude_creds.len() > 1;
@@ -1289,40 +1943,126 @@ pub async fn fetch_all_with(home: &Path, endpoints: &Endpoints) -> Vec<QuotaRepo
         }
     }
 
-    let mut fetches: Vec<Fetch> = Vec::new();
+    // The providers are asked at the same time, not one after the other: a
+    // provider that is slow or down must not hold the others up.
+    let mut set = tokio::task::JoinSet::new();
     for cred in claude_creds.iter() {
-        fetches.push(boxed(run_provider(
-            "Claude Code",
+        set.spawn(run_provider(
+            "Claude Code".to_string(),
             claude_code(client.clone(), endpoints.clone(), cred.clone(), many_claude),
             PROVIDER_TIMEOUT,
-        )));
+        ));
     }
     for cred in codex_creds.iter() {
-        fetches.push(boxed(run_provider(
-            "Codex",
+        set.spawn(run_provider(
+            "Codex".to_string(),
             codex(client.clone(), endpoints.clone(), cred.clone(), many_codex),
             PROVIDER_TIMEOUT,
-        )));
+        ));
     }
-    fetches.push(boxed(run_provider(
-        "GitHub Copilot",
+    set.spawn(run_provider(
+        "GitHub Copilot".to_string(),
         copilot(client.clone(), endpoints.clone(), home.to_path_buf()),
         PROVIDER_TIMEOUT,
-    )));
-    fetches.push(boxed(run_provider(
-        "Gemini CLI",
+    ));
+    set.spawn(run_provider(
+        "Gemini CLI".to_string(),
         gemini_cli(client.clone(), endpoints.clone(), home.to_path_buf()),
         PROVIDER_TIMEOUT,
-    )));
-    fetches.push(boxed(run_provider(
-        "OpenCode",
+    ));
+    set.spawn(run_provider(
+        "OpenCode".to_string(),
         opencode(client.clone(), endpoints.clone(), home.to_path_buf()),
         PROVIDER_TIMEOUT,
-    )));
+    ));
 
-    let mut reports = Vec::new();
-    for f in fetches {
-        reports.push(f.await);
+    // The providers that answer with one JSON document.
+    let mut broken = Vec::new();
+    for provider in PROVIDERS {
+        let (token, problems) = (provider.credential)(home);
+        let Some(token) = token else {
+            // No sign-in is not a problem; a sign-in that cannot be read is.
+            if !problems.is_empty() {
+                broken.push(unmatched(provider.agent, problems));
+            }
+            continue;
+        };
+        let url = provider.url.to_string();
+        let headers: Vec<(&str, &str)> = provider.headers.to_vec();
+        let parse = provider.parse;
+        let agent = provider.agent;
+        let client = client.clone();
+        set.spawn(run_provider(
+            agent.to_string(),
+            async move {
+                let v = match get_json(&client, &url, &token, &headers).await {
+                    Ok(v) => v,
+                    Err(e) => return QuotaReport::failed(agent, e.kind(), e.message()),
+                };
+                let windows = parse(&v);
+                if windows.is_empty() {
+                    return QuotaReport::failed(agent, ErrorKind::BadPayload, "unexpected usage payload");
+                }
+                let mut report = QuotaReport::ok(agent, windows);
+                report.updated_at = now_secs();
+                report
+            },
+            PROVIDER_TIMEOUT,
+        ));
+    }
+
+    // The providers the user added themselves.
+    for provider in custom_providers(home) {
+        let url = provider.url.clone();
+        let token = provider.token.clone();
+        let name = provider.name.clone();
+        let parse_provider = provider.clone();
+        let client = client.clone();
+        set.spawn(run_provider(
+            name.clone(),
+            async move {
+                let v = match get_json(&client, &url, &token, &[]).await {
+                    Ok(v) => v,
+                    Err(e) => return QuotaReport::failed(&name, e.kind(), e.message()),
+                };
+                let windows = parse_custom(&parse_provider, &v);
+                if windows.is_empty() {
+                    return QuotaReport::failed(&name, ErrorKind::BadPayload, "unexpected usage payload");
+                }
+                let mut report = QuotaReport::ok(&name, windows);
+                report.updated_at = now_secs();
+                report
+            },
+            PROVIDER_TIMEOUT,
+        ));
+    }
+
+    let mut reports = broken;
+    // A sign-in that could not be read is worth a card of its own: the user
+    // is signed in and something is wrong, and saying nothing would be a lie.
+    for (agent, problems, has_account) in [
+        ("Claude Code", &claude_problems, !claude_creds.is_empty()),
+        ("Codex", &codex_problems, !codex_creds.is_empty()),
+    ] {
+        if problems.is_empty() {
+            continue;
+        }
+        if !has_account {
+            reports.push(unmatched(agent, problems.clone()));
+            continue;
+        }
+        for problem in problems {
+            reports.push(QuotaReport::failed(agent, ErrorKind::Unauthorized, problem.clone()));
+        }
+    }
+    while let Some(finished) = set.join_next().await {
+        match finished {
+            Ok(report) => reports.push(report),
+            Err(e) => {
+                // A task that panicked is a provider that could not be read.
+                reports.push(QuotaReport::failed("Cinder", ErrorKind::Unreachable, e.to_string()));
+            }
+        }
     }
     drop_spent(&mut reports, now_secs());
     reports
@@ -1467,6 +2207,16 @@ mod tests {
     use super::*;
     use crate::testserver::{MockServer, Reply};
     use serde_json::json;
+
+    /// The provider state is one map for the whole app, so the tests that use
+    /// it take a lock. One test clearing it while another is looking would
+    /// fail for reasons that have nothing to do with the code.
+    static STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the provider state for the length of a test.
+    fn state_guard() -> std::sync::MutexGuard<'static, ()> {
+        STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn claude_usage_reads_every_window() {
@@ -1626,7 +2376,7 @@ mod tests {
         let server = MockServer::start(vec![Reply::status(401, "nope")]);
         let rt = tokio::runtime::Runtime::new().unwrap();
         let v = rt.block_on(get_json(&server.client(), &server.url("/usage"), "t", &[]));
-        assert_eq!(v.unwrap_err(), FetchError::Status(401));
+        assert_eq!(v.unwrap_err(), FetchError::Status(401, "nope".to_string()));
         assert_eq!(server.requests().len(), 1);
     }
 
@@ -1653,6 +2403,7 @@ mod tests {
 
     #[test]
     fn a_failure_keeps_the_last_windows_and_marks_them_stale() {
+        let _guard = state_guard();
         STATE.lock().unwrap().clear();
         let now = now_secs();
         let good = QuotaReport::ok(
@@ -1674,6 +2425,7 @@ mod tests {
 
     #[test]
     fn a_provider_that_keeps_failing_is_benched() {
+        let _guard = state_guard();
         STATE.lock().unwrap().clear();
         let now = now_secs();
         settle(QuotaReport::failed("Bench Provider", ErrorKind::Timeout, "too slow"), now);
@@ -1688,6 +2440,7 @@ mod tests {
 
     #[test]
     fn a_good_read_clears_the_bench() {
+        let _guard = state_guard();
         STATE.lock().unwrap().clear();
         let now = now_secs();
         settle(QuotaReport::failed("Clear Provider", ErrorKind::Timeout, "too slow"), now);
@@ -1755,11 +2508,14 @@ mod tests {
 
     #[test]
     fn a_provider_that_does_not_answer_in_time_is_given_up_on() {
+        // It settles into the provider state like any other, so it takes the
+        // lock too.
+        let _guard = state_guard();
         STATE.lock().unwrap().clear();
         let server = MockServer::start(vec![Reply::slow(r#"{"ok":true}"#, 400)]);
         let rt = tokio::runtime::Runtime::new().unwrap();
         let report = rt.block_on(run_provider(
-            "Slow Provider",
+            "Slow Provider".to_string(),
             async {
                 get_json(&server.client(), &server.url("/usage"), "t", &[])
                     .await
@@ -1771,6 +2527,67 @@ mod tests {
         assert_eq!(report.error_kind, Some(ErrorKind::Timeout));
         assert!(report.error.contains("did not answer"));
         STATE.lock().unwrap().clear();
+    }
+
+    #[test]
+    fn a_refused_token_is_refreshed_and_asked_again() {
+        let server = MockServer::start(vec![
+            // The usage is refused...
+            Reply::status(401, "the token has expired"),
+            // ...the refresh gives a new one...
+            Reply::ok(r#"{"access_token":"fresh","expires_in":3600}"#),
+            // ...and the second ask works.
+            Reply::ok(r#"{"five_hour": {"utilization": 12}}"#),
+        ]);
+        let dir = std::env::temp_dir().join(format!("cinder-refresh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".credentials.json");
+        std::fs::write(&path, r#"{"claudeAiOauth": {"accessToken": "old"}}"#).unwrap();
+        let cred = Credential {
+            path: path.clone(),
+            token: "old".into(),
+            refresh: Some("the-refresh-token".into()),
+            expires_at: 0,
+            plan: String::new(),
+            account: String::new(),
+        };
+        let endpoints = Endpoints {
+            claude_usage: server.url("/usage"),
+            claude_token: server.url("/token"),
+            ..Endpoints::default()
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let report = rt.block_on(claude_code(server.client(), endpoints, cred, false));
+        assert!(report.error.is_empty(), "the retry should have worked: {}", report.error);
+        assert_eq!(report.windows.len(), 1);
+        assert_eq!(report.windows[0].used_percent, 12.0);
+        // The new token was written back, so the agent stays signed in.
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("fresh"), "the new token should have been written back");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_refused_token_with_nothing_to_refresh_with_stays_refused() {
+        let server = MockServer::start(vec![Reply::status(401, "the token has expired")]);
+        let cred = Credential {
+            path: PathBuf::from("nowhere"),
+            token: "old".into(),
+            refresh: None,
+            expires_at: 0,
+            plan: String::new(),
+            account: String::new(),
+        };
+        let endpoints = Endpoints {
+            claude_usage: server.url("/usage"),
+            ..Endpoints::default()
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let report = rt.block_on(claude_code(server.client(), endpoints, cred, false));
+        assert!(report.error.contains("401"), "got: {}", report.error);
+        assert!(report.error.contains("the token has expired"), "the provider's own words: {}", report.error);
+        // And it was not asked twice.
+        assert_eq!(server.requests().len(), 1);
     }
 
     #[test]
@@ -1791,7 +2608,388 @@ mod tests {
     }
 
     #[test]
+    fn a_file_written_with_a_byte_order_mark_is_still_read() {
+        // Notepad and PowerShell both write one, and it is not part of the
+        // document: a file with one must still be read.
+        let path = std::env::temp_dir().join(format!("cinder-bom-{}.json", std::process::id()));
+        std::fs::write(&path, "\u{feff}{\"hello\": \"world\"}").unwrap();
+        let v = read_json(&path).expect("the file should be read");
+        assert_eq!(v.get("hello").and_then(|x| x.as_str()), Some("world"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_provider_the_user_added_is_read_from_their_own_file() {
+        let home = std::env::temp_dir().join(format!("cinder-custom-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".cinder")).unwrap();
+        std::fs::write(
+            home.join(".cinder/providers.json"),
+            r#"{"providers": [
+                {"name": "My Router", "url": "https://api.example.com/usage", "token": "sk-x",
+                 "percent": "data.usage.percent", "reset": "data.usage.reset_at", "detail": "data.usage.label"}
+            ]}"#,
+        )
+        .unwrap();
+        let providers = custom_providers(&home);
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].name, "My Router");
+        assert_eq!(providers[0].percent, "data.usage.percent");
+
+        // The answer is read at the path the user gave.
+        let v = json!({"data": {"usage": {"percent": 37.5, "reset_at": "2026-10-26T18:59:59Z", "label": "Monthly"}}});
+        let w = parse_custom(&providers[0], &v);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].agent, "My Router");
+        assert_eq!(w[0].used_percent, 37.5);
+        assert_eq!(w[0].detail, "Monthly");
+        assert!(w[0].resets_at > 0);
+        // A path that is not there is no window.
+        assert!(parse_custom(&providers[0], &json!({"data": {}})).is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_percentage_may_be_a_share_of_a_used_and_a_limit() {
+        let v = json!({"data": {"usage": {"used": 25, "limit": 100}}});
+        assert_eq!(percent_at(&v, "data.usage"), Some(25.0));
+        assert_eq!(percent_at(&v, "data.nothing"), None);
+        assert_eq!(percent_at(&v, "data.usage.used"), Some(25.0));
+    }
+
+    #[test]
+    fn a_dotted_path_walks_into_objects_and_arrays() {
+        let v = json!({"limits": [{"percent": 12}, {"percent": 34}]});
+        assert_eq!(json_path(&v, "limits.1.percent").and_then(|x| x.as_f64()), Some(34.0));
+        assert_eq!(json_path(&v, "limits.9.percent"), None);
+        assert_eq!(json_path(&v, "nothing.here"), None);
+    }
+
+    #[test]
+    fn the_openrouter_credits_are_read_as_a_window() {
+        let v = json!({"data": {"total_credits": 50.0, "total_usage": 12.5}});
+        let w = parse_openrouter_credits(&v);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].agent, "OpenRouter");
+        assert_eq!(w[0].used_percent, 25.0);
+        assert!(w[0].detail.contains("$12.50"), "got: {}", w[0].detail);
+        assert!(w[0].detail.contains("$50.00"));
+        // An answer with nothing in it is not a window.
+        assert!(parse_openrouter_credits(&json!({"data": {}})).is_empty());
+    }
+
+    #[test]
+    fn the_kimi_limits_are_read_as_windows() {
+        // The shape the Kimi CLI's own code reads.
+        let v = json!({
+            "usage": {"name": "Weekly limit", "used": 30, "limit": 100},
+            "limits": [
+                {"name": "5-hour session", "window": {"duration": 300, "timeUnit": "MINUTE"},
+                 "detail": {"used": 10, "limit": 100, "reset_in": 3600}},
+                {"window": {"duration": 10080, "timeUnit": "MINUTE"},
+                 "detail": {"used": 40, "remaining": 60}}
+            ]
+        });
+        let w = parse_kimi_usage(&v);
+        assert_eq!(w.len(), 3);
+        assert_eq!(w[0].window, "Weekly limit");
+        assert_eq!(w[0].used_percent, 30.0);
+        assert_eq!(w[1].window, "5-hour session");
+        assert_eq!(w[1].used_percent, 10.0);
+        assert_eq!(w[1].window_minutes, 300);
+        assert!(w[1].resets_at > now_secs(), "a reset countdown becomes a moment");
+        // A limit with no name is named after how long it runs.
+        assert_eq!(w[2].window, "7d limit");
+        assert_eq!(w[2].window_minutes, 7 * 24 * 60);
+        // "remaining" is turned into what has been used.
+        assert_eq!(w[2].used_percent, 40.0);
+    }
+
+    #[test]
+    fn the_deepseek_balance_is_read_as_money() {
+        let v = json!({"balance_infos": [
+            {"currency": "CNY", "total_balance": "110.00", "granted_balance": "10.00", "topped_up_balance": "100.00"}
+        ]});
+        let w = parse_deepseek_balance(&v);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].agent, "DeepSeek");
+        assert_eq!(w[0].balance, 110.0);
+        assert!(w[0].detail.contains("CNY"));
+        // A balance is not a window, so it carries no percentage.
+        assert_eq!(w[0].used_percent, 0.0);
+        assert!(parse_deepseek_balance(&json!({"balance_infos": []})).is_empty());
+    }
+
+    #[test]
+    fn a_key_is_found_where_the_agents_keep_it() {
+        let home = std::env::temp_dir().join(format!("cinder-keys-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".pi/agent")).unwrap();
+        std::fs::write(
+            home.join(".pi/agent/models.json"),
+            r#"{"providers": {"openrouter": {"models": [{"id": "x", "apiKey": "sk-the-key"}]}}}"#,
+        )
+        .unwrap();
+        let (key, problems) = openrouter_credential(&home);
+        assert_eq!(key.as_deref(), Some("sk-the-key"));
+        assert!(problems.is_empty());
+        // A provider that is not there has no key, and that is not a problem.
+        let (key, problems) = deepseek_credential(&home);
+        assert!(key.is_none());
+        assert!(problems.is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_kimi_sign_in_is_read_from_where_the_cli_keeps_it() {
+        let home = std::env::temp_dir().join(format!("cinder-kimi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".kimi/credentials")).unwrap();
+        std::fs::write(
+            home.join(".kimi/credentials/oauth-kimi-code.json"),
+            r#"{"access_token": "the-token"}"#,
+        )
+        .unwrap();
+        let (key, problems) = kimi_credential(&home);
+        assert_eq!(key.as_deref(), Some("the-token"));
+        assert!(problems.is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn every_provider_cinder_asks_has_a_name_and_a_parser() {
+        for provider in PROVIDERS {
+            assert!(!provider.agent.is_empty());
+            assert!(provider.url.starts_with("https://"));
+            // The parser of a provider that was asked for is never empty.
+            let empty = (provider.parse)(&serde_json::json!({}));
+            assert!(empty.is_empty(), "{} should not make a window of nothing", provider.agent);
+        }
+    }
+
+    #[test]
+    fn the_opencode_usage_is_read_out_of_the_console_answer() {
+        // The shape the console answers with: a percentage of each window
+        // that is gone, how long until it resets, and whether it ran out.
+        let v = json!({
+            "useBalance": false,
+            "rollingUsage": {"status": "ok", "resetInSec": 3600, "usagePercent": 42},
+            "weeklyUsage": {"status": "ok", "resetInSec": 86400, "usagePercent": 7},
+            "monthlyUsage": {"status": "rate-limited", "resetInSec": 7200, "usagePercent": 100}
+        });
+        let w = parse_opencode_usage(&v);
+        assert_eq!(w.len(), 3);
+        assert_eq!(w[0].window, "5h");
+        assert_eq!(w[0].used_percent, 42.0);
+        assert_eq!(w[0].window_minutes, 300);
+        assert!(w[0].resets_at > now_secs(), "the reset countdown becomes a moment");
+        assert_eq!(w[1].window, "7d");
+        assert_eq!(w[1].used_percent, 7.0);
+        assert_eq!(w[2].window, "30d");
+        assert_eq!(w[2].used_percent, 100.0);
+        assert!(w[2].detail.contains("spent"), "a window that ran out says so");
+    }
+
+    #[test]
+    fn the_opencode_account_key_is_picked_out_of_the_per_provider_map() {
+        let home = std::env::temp_dir().join(format!("cinder-opencode-key-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".local/share/opencode")).unwrap();
+        // The newer auth file: one entry per provider, of which only the
+        // account's own one is the key the usage API wants.
+        std::fs::write(
+            home.join(".local/share/opencode/auth.json"),
+            r#"{"opencode-go": {"type": "api", "key": "sk-the-account"},
+                "meta": {"type": "api", "key": "local"}}"#,
+        )
+        .unwrap();
+        let (token, problems) = opencode_token(&home);
+        assert_eq!(token.as_deref(), Some("sk-the-account"));
+        assert!(problems.is_empty(), "a key that was found is not a problem");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_opencode_file_with_no_key_says_so() {
+        let home = std::env::temp_dir().join(format!("cinder-opencode-nokey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".local/share/opencode")).unwrap();
+        std::fs::write(home.join(".local/share/opencode/auth.json"), r#"{"meta": {"key": "local"}}"#).unwrap();
+        let (token, problems) = opencode_token(&home);
+        assert!(token.is_none());
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("no access token"), "got: {}", problems[0]);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_provider_that_says_why_is_quoted() {
+        let server = MockServer::start(vec![Reply::status(
+            403,
+            r#"{"type":"error","error":{"type":"EntitlementError","message":"OpenCode Go subscription required."}}"#,
+        )]);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let v = rt.block_on(get_json(&server.client(), &server.url("/usage"), "t", &[]));
+        let e = v.unwrap_err();
+        assert_eq!(e.message(), "HTTP 403: OpenCode Go subscription required.");
+    }
+
+    #[test]
+    fn a_provider_that_says_nothing_is_quoted_by_its_status() {
+        let server = MockServer::start(vec![Reply::status(404, "")]);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let v = rt.block_on(get_json(&server.client(), &server.url("/usage"), "t", &[]));
+        assert_eq!(v.unwrap_err().message(), "HTTP 404");
+    }
+
+    #[test]
+    fn the_providers_own_list_of_windows_is_the_authority() {
+        // The shape Anthropic sends: the named windows, and the list of the
+        // windows the plan actually has.
+        let v = json!({
+            "five_hour": {"utilization": 22.0, "resets_at": "2026-10-22T06:59:59.795833+00:00"},
+            "seven_day": {"utilization": 46.0, "resets_at": "2026-10-26T18:59:59.795861+00:00"},
+            "limits": [
+                {"kind": "session", "group": "session", "percent": 22,
+                 "resets_at": "2026-10-22T06:59:59.795833+00:00", "is_active": false},
+                {"kind": "weekly_all", "group": "weekly", "percent": 46,
+                 "resets_at": "2026-10-26T18:59:59.795861+00:00", "is_active": true}
+            ]
+        });
+        let w = parse_claude_usage(&v, "pro");
+        let session = w.iter().find(|x| x.window == "5h").unwrap();
+        let weekly = w.iter().find(|x| x.window == "7d").unwrap();
+        // The session window is at 22% and resets in a few hours, even though
+        // the provider's own flag calls it inactive. The flag is not read: the
+        // percentage and the reset time are the truth.
+        assert_eq!(session.used_percent, 22.0);
+        assert!(session.resets_at > 0, "a window that is counting has a reset time");
+        assert_eq!(weekly.used_percent, 46.0);
+        assert_eq!(weekly.window_minutes, 7 * 24 * 60);
+        assert!(weekly.resets_at > 0);
+    }
+
+    #[test]
+    fn a_window_the_provider_names_and_cinder_does_not_is_still_shown() {
+        // A window the list names and the named fields do not have.
+        let v = json!({
+            "five_hour": {"utilization": 10.0},
+            "limits": [
+                {"kind": "session", "percent": 10, "is_active": true},
+                {"kind": "weekly_opus", "percent": 30, "resets_at": "2026-10-26T18:59:59Z", "is_active": true}
+            ]
+        });
+        let w = parse_claude_usage(&v, "max");
+        let opus = w.iter().find(|x| x.window == "7d-opus").expect("the window should be there");
+        assert_eq!(opus.used_percent, 30.0);
+        assert_eq!(opus.window_minutes, 7 * 24 * 60);
+        assert!(opus.resets_at > 0);
+        // The window the named fields know about is still there.
+        assert!(w.iter().any(|x| x.window == "5h"));
+    }
+
+    #[test]
+    fn a_payload_without_a_list_of_windows_is_read_as_it_was() {
+        let v = json!({
+            "five_hour": {"utilization": 29.0, "resets_at": "2026-10-21T18:00:00Z"},
+            "seven_day": {"utilization": 44.0}
+        });
+        let w = parse_claude_usage(&v, "max");
+        assert_eq!(w.len(), 2);
+        let session = w.iter().find(|x| x.window == "5h").unwrap();
+        assert!(session.resets_at > 0);
+    }
+
+    #[test]
+    fn a_sign_in_that_cannot_be_read_says_so_instead_of_looking_like_no_sign_in() {
+        let home = std::env::temp_dir().join(format!("cinder-quota-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        // The file is there, but it is not JSON: the user is signed in and
+        // something is wrong.
+        std::fs::write(home.join(".claude").join(".credentials.json"), "{ this is not json").unwrap();
+
+        let (creds, problems) = claude_credentials(&home);
+        assert!(creds.is_empty(), "there is no usable sign-in");
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("could not be read"), "got: {}", problems[0]);
+
+        // The report says what went wrong, and is not simply skipped.
+        let report = unmatched("Claude Code", problems);
+        assert!(!report.skipped, "a broken sign-in is not the same as no sign-in");
+        assert!(!report.error.is_empty());
+        assert_eq!(report.error_kind, Some(ErrorKind::Unauthorized));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn no_sign_in_at_all_is_not_a_problem() {
+        let home = std::env::temp_dir().join(format!("cinder-quota-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let (creds, problems) = claude_credentials(&home);
+        assert!(creds.is_empty());
+        assert!(problems.is_empty());
+        // No sign-in means no card at all.
+        let report = unmatched("Claude Code", problems);
+        assert!(report.skipped);
+        assert!(report.error.is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_providers_are_asked_at_the_same_time_not_one_after_the_other() {
+        let home = std::env::temp_dir().join(format!("cinder-quota-parallel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(
+            home.join(".claude").join(".credentials.json"),
+            r#"{"claudeAiOauth": {"accessToken": "a", "subscriptionType": "max"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            home.join(".codex").join("auth.json"),
+            r#"{"tokens": {"access_token": "b"}}"#,
+        )
+        .unwrap();
+
+        // Two providers, each a good half second behind.
+        let claude = MockServer::start(vec![Reply::slow(
+            r#"{"five_hour": {"utilization": 10}}"#,
+            600,
+        )]);
+        let codex = MockServer::start(vec![Reply::slow(
+            r#"{"plan_type": "plus", "rate_limit": {"primary_window": {"used_percent": 20}}}"#,
+            600,
+        )]);
+        let endpoints = Endpoints {
+            claude_usage: claude.url("/usage"),
+            codex_usage: codex.url("/usage"),
+            ..Endpoints::default()
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let started = std::time::Instant::now();
+        let reports = rt.block_on(fetch_all_with(&home, &endpoints));
+        let elapsed = started.elapsed();
+
+        assert_eq!(reports.len(), 5, "every provider is asked");
+        let claude_report = reports.iter().find(|r| r.agent == "Claude Code").unwrap();
+        assert_eq!(claude_report.windows.len(), 1, "the slow answer should still be read");
+        // Asked one after the other, this would take more than a second and a
+        // bit. Asked at the same time, it takes about one delay.
+        assert!(
+            elapsed < Duration::from_millis(1000),
+            "the providers should be asked at the same time, but it took {elapsed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn a_provider_that_is_benched_is_not_asked_again() {
+        let _guard = state_guard();
         STATE.lock().unwrap().clear();
         // Three failures in a row: the request is tried three times and then
         // the provider is benched.
@@ -1802,7 +3000,7 @@ mod tests {
         ]);
         let rt = tokio::runtime::Runtime::new().unwrap();
         let first = rt.block_on(run_provider(
-            "Benched Provider",
+            "Benched Provider".to_string(),
             async {
                 get_json(&server.client(), &server.url("/usage"), "t", &[])
                     .await
@@ -1816,7 +3014,7 @@ mod tests {
         // The second attempt inside the bench window does not reach the
         // network at all.
         let second = rt.block_on(run_provider(
-            "Benched Provider",
+            "Benched Provider".to_string(),
             async {
                 get_json(&server.client(), &server.url("/usage"), "t", &[])
                     .await

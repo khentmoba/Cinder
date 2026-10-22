@@ -27,6 +27,14 @@ impl Home {
         self.write(path, &lines.iter().map(Value::to_string).collect::<Vec<_>>().join("\n"));
     }
 
+    /// A zstd-compressed file, the way DSH keeps its sessions.
+    fn zstd(&self, path: &str, text: &str) {
+        let path = self.0.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes = zstd::stream::encode_all(text.as_bytes(), 0).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+
     fn db(&self, path: &str) -> rusqlite::Connection {
         let path = self.0.join(path);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -301,6 +309,294 @@ fn opencode_uses_message_dates_models_and_request_counts() {
         assert_eq!(stats.sessions[0].sessions, 1);
         assert!(!stats.rows.iter().any(|r| r.day == "2026-01-03"));
     }
+}
+
+/// The current OpenCode schema keeps the messages in `session_message`, with
+/// the model and the content inside the message, and the parts table is left
+/// behind.
+///
+/// A database that has both tables holds the old messages twice over, so only
+/// the current one may be read.
+#[test]
+fn the_current_opencode_schema_is_read() {
+    let home = Home::new();
+    let db = home.db(".local/share/opencode/opencode.db");
+    db.execute_batch("CREATE TABLE session_v2 (id TEXT, directory TEXT, parent_id TEXT, time_created INTEGER);
+        INSERT INTO session_v2 VALUES ('s', '/work/project', NULL, 1767225600000);
+        CREATE TABLE session_message (id TEXT, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);
+        CREATE TABLE message (id TEXT, session_id TEXT, data TEXT, time_created INTEGER);
+        CREATE TABLE part (message_id TEXT, data TEXT, time_created INTEGER);").unwrap();
+    // The old table, with the same messages in it, to make sure they are not
+    // counted twice.
+    for (id, model, ts, input) in [
+        ("a", "gpt-5", 1767225600000_i64, 100),
+        ("b", "gpt-4.1", 1767312000000, 200),
+    ] {
+        let data = json!({"model": {"id": model, "providerID": "openai", "variant": "max"},
+            "tokens": {"input": input, "output": 10, "reasoning": 2, "cache": {"read": 20, "write": 5}},
+            "cost": 1.0,
+            "content": [{"type": "text", "text": "hi"}, {"type": "tool", "id": "t1", "name": "read"}]})
+        .to_string();
+        db.execute(
+            "INSERT INTO session_message VALUES (?, 's', 'assistant', 1, ?, ?, ?)",
+            rusqlite::params![id, ts, ts, data],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO message VALUES (?, 's', ?, ?)",
+            rusqlite::params![id, data, ts],
+        )
+        .unwrap();
+    }
+    // A user message and a broken one are not requests.
+    db.execute("INSERT INTO session_message VALUES ('u', 's', 'user', 0, 1767225600000, 1767225600000, '{}')", []).unwrap();
+    db.execute("INSERT INTO session_message VALUES ('bad', 's', 'assistant', 2, 1767225600000, 1767225600000, 'not JSON')", []).unwrap();
+    // A compaction is a model call of its own: the summary it wrote cost
+    // tokens, and those are spent whether or not the messages it replaced
+    // are still there.
+    db.execute(
+        "INSERT INTO session_message VALUES ('c', 's', 'compaction', 3, 1767225600000, 1767225600000, ?)",
+        [json!({"time": {"created": 1767225600000i64}, "status": "done", "reason": "auto",
+            "model": {"id": "gpt-5", "providerID": "openai", "variant": "max"},
+            "summary": "a summary", "cost": 0.5,
+            "tokens": {"input": 7, "output": 3, "reasoning": 0, "cache": {"read": 0, "write": 0}}})
+        .to_string()],
+    )
+    .unwrap();
+
+    let stats = scan_home(&home.0, &|_| {});
+    let first = stats.rows.iter().find(|r| r.day == "2026-01-01").expect("the OpenCode row should be there");
+    assert_eq!(first.model, "openai/gpt-5");
+    assert_eq!(first.requests, 2, "the compaction is a request of its own");
+    assert_eq!(first.input, 107, "the compaction's own tokens are counted");
+    assert_eq!(first.output, 13);
+    assert_eq!(first.cache_read, 20);
+    assert_eq!(first.cache_write, 5);
+    assert_eq!(first.reasoning, 2);
+    assert_eq!(first.tools, 1, "the tool call is inside the message");
+    assert_eq!(first.cost, 1.5);
+    assert_eq!(first.project, "project");
+    let second = stats.rows.iter().find(|r| r.day == "2026-01-02").expect("the second day should be there");
+    assert_eq!(second.model, "openai/gpt-4.1");
+    assert_eq!((second.requests, second.input, second.tools), (1, 200, 1));
+}
+
+/// DSH keeps its sessions as zstd-compressed JSONL.
+///
+/// The fixture is the shape the real files have: a `session` line with the
+/// moment the session started, a `model/selection` line, and
+/// `assistant/message` lines carrying the usage and the tool calls.
+#[test]
+fn dsh_sessions_carry_the_model_the_tokens_and_the_tools() {
+    let home = Home::new();
+    let created = 1_790_952_026_524_i64;
+    let answered = 1_790_952_106_926_i64;
+    let lines = [
+        json!({"type": "session", "version": 4, "id": "session-1", "createdAt": created, "cwd": "C:\\work"}),
+        json!({"type": "model/selection", "data": {"provider": "deepseek", "model": "deepseek-chat"}}),
+        // The message names its own model, which wins over the selection.
+        json!({"type": "assistant/message", "seq": 16, "time": answered, "data": {
+            "turn": 1,
+            "step": 1,
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "reasoning", "text": ""},
+                    {"type": "tool-call", "id": "call-1", "name": "pwsh", "arguments": "{}"}
+                ],
+                "source": {"kind": "model", "provider": "meta", "model": "muse-spark-1.3-contributor"}
+            },
+            "usage": {
+                "inputTokens": 9152,
+                "outputTokens": 211,
+                "cacheReadTokens": 300,
+                "cacheWriteTokens": 40,
+                "reasoningTokens": 7
+            }
+        }}),
+        // This one does not, so it keeps the model that was selected.
+        json!({"type": "assistant/message", "seq": 17, "time": answered + 1000, "data": {
+            "turn": 1,
+            "step": 2,
+            "message": {"role": "assistant", "content": []},
+            "usage": {"inputTokens": 100, "outputTokens": 20}
+        }}),
+    ];
+    home.zstd(
+        ".dsh/sessions/session-1/session.v4.jsonl.zstd",
+        &lines.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n"),
+    );
+
+    let stats = scan_home(&home.0, &|_| {});
+    // The message that named its own model.
+    let named = stats
+        .rows
+        .iter()
+        .find(|r| r.agent == "DSH" && r.model == "meta/muse-spark-1.3-contributor")
+        .expect("the DSH row should be there");
+    assert_eq!(named.day, ms_day(answered));
+    assert_eq!(named.requests, 1);
+    assert_eq!(named.input, 9152);
+    assert_eq!(named.output, 211);
+    assert_eq!(named.cache_read, 300);
+    assert_eq!(named.cache_write, 40);
+    assert_eq!(named.reasoning, 7);
+    assert_eq!(named.tools, 1, "a tool call is a tool call");
+    // A route that is not billed against a public list price is not priced
+    // from one: the number would be fiction.
+    assert!(!named.cost_known, "a contributor route has no list price to stand in");
+    assert!(named.cost_partial);
+
+    // The message that kept the selected model, on a route that is priced.
+    let selected = stats
+        .rows
+        .iter()
+        .find(|r| r.agent == "DSH" && r.model == "deepseek/deepseek-chat")
+        .expect("the selected model should be priced");
+    assert_eq!(selected.input, 100);
+    assert_eq!(selected.output, 20);
+    assert_eq!(selected.requests, 1);
+    assert!(selected.cost_known, "a per-token route has a list price");
+    assert!(selected.cost > 0.0);
+
+    // The session is counted once, on the day it started.
+    assert_eq!(stats.sessions.len(), 1);
+    assert_eq!(stats.sessions[0].agent, "DSH");
+    assert_eq!(stats.sessions[0].day, ms_day(created));
+}
+
+/// A DSH file that is not readable is not a reason to lose the rest.
+#[test]
+fn a_dsh_file_that_is_not_compressed_leaves_nothing_behind() {
+    let home = Home::new();
+    home.write(".dsh/sessions/session-1/session.v4.jsonl.zstd", "this is not zstd at all");
+    let stats = scan_home(&home.0, &|_| {});
+    assert!(!stats.rows.iter().any(|r| r.agent == "DSH"));
+    assert!(!stats.sessions.iter().any(|s| s.agent == "DSH"));
+}
+
+/// Antigravity's transcripts carry the model in a line of prose and the usage
+/// in a planner response.
+///
+/// The same step can be written twice when a transcript tail is re-appended,
+/// so the step index is what makes a request unique.
+#[test]
+fn antigravity_transcripts_carry_the_model_the_tokens_and_the_tools() {
+    let home = Home::new();
+    home.lines(".gemini/antigravity/brain/abc/transcript.jsonl", &[
+        json!({"content": "Model Selection` from Gemini 3 Pro to Claude Opus 4.6 (Thinking). The model was switched by the user."}),
+        json!({"type": "PLANNER_RESPONSE", "step_index": 3, "created_at": "2026-01-01T00:00:00Z",
+               "tool_calls": [{"name": "read_file"}, {"name": "write_file"}],
+               "input_tokens": 1200, "cache_read_tokens": 34000, "output_tokens": 450}),
+        // The same step again: a re-appended tail, not a second request.
+        json!({"type": "PLANNER_RESPONSE", "step_index": 3, "created_at": "2026-01-01T00:00:00Z",
+               "tool_calls": [{"name": "read_file"}, {"name": "write_file"}],
+               "input_tokens": 1200, "cache_read_tokens": 34000, "output_tokens": 450}),
+        json!({"type": "PLANNER_RESPONSE", "step_index": 4, "created_at": "2026-01-02T00:00:00Z",
+               "tool_calls": [], "input_tokens": 100, "output_tokens": 20}),
+    ]);
+    let stats = scan_home(&home.0, &|_| {});
+    let row = stats.rows.iter().find(|r| r.agent == "Antigravity").expect("the Antigravity row should be there");
+    // The model name ends at the sentence, not at the first dot.
+    assert_eq!(row.model, "Claude Opus 4.6 (Thinking)");
+    assert_eq!(row.requests, 1, "a step written twice is one request");
+    assert_eq!(row.input, 1200);
+    assert_eq!(row.cache_read, 34000);
+    assert_eq!(row.output, 450);
+    assert_eq!(row.tools, 2);
+    // Antigravity runs on a plan, so the row says so.
+    assert_eq!(row.billing, Billing::Subscription);
+    assert_eq!(row.day, "2026-01-01");
+
+    // The next day is a row of its own.
+    let next = stats.rows.iter().find(|r| r.agent == "Antigravity" && r.day == "2026-01-02").expect("the second day should be there");
+    assert_eq!(next.requests, 1);
+    assert_eq!(next.input, 100);
+}
+
+/// Pi writes the usage of every assistant message into its session file.
+#[test]
+fn pi_sessions_carry_the_tokens_of_every_assistant_message() {
+    let home = Home::new();
+    home.lines(".pi/agent/sessions/pi.jsonl", &[
+        json!({"type": "session", "timestamp": "2026-01-01T00:00:00Z"}),
+        json!({"type": "message", "timestamp": "2026-01-01T00:00:00Z", "message": {
+            "role": "assistant", "model": "gpt-5", "provider": "openai",
+            "content": [{"type": "toolCall", "name": "read"}],
+            "usage": {"input": 5000, "cacheRead": 95000, "output": 10}
+        }}),
+        // A message with nothing in it is not a request.
+        json!({"type": "message", "timestamp": "2026-01-01T00:01:00Z", "message": {
+            "role": "user", "model": "gpt-5", "usage": {"input": 5000}
+        }}),
+    ]);
+    let stats = scan_home(&home.0, &|_| {});
+    let row = stats.rows.iter().find(|r| r.agent == "Pi").expect("the Pi row should be there");
+    assert_eq!(row.requests, 1);
+    assert_eq!(row.input, 5000);
+    assert_eq!(row.cache_read, 95000);
+    assert_eq!(row.output, 10);
+    assert_eq!(row.tools, 1);
+    assert_eq!(row.day, "2026-01-01");
+    // OpenAI bills per token, so the row is priced.
+    assert_eq!(row.billing, Billing::Api);
+    assert!(row.cost_known);
+}
+
+/// LM Studio keeps a conversation as a JSON file with the messages and the
+/// versions of each message, and the model that was used.
+///
+/// Only the selected version of a message counts: an edited message has the
+/// older versions kept next to it, and those were never sent.
+#[test]
+fn lm_studio_conversations_carry_the_model_and_the_answered_messages() {
+    let home = Home::new();
+    let created = 1_757_000_000_000_i64;
+    let conversation = json!({
+        "createdAt": created,
+        "lastUsedModel": {
+            "indexedModelIdentifier": "C:\\models\\qwen3-8b-q4_k_m.gguf",
+            "identifier": "qwen3-8b"
+        },
+        "messages": [
+            {"currentlySelected": 0, "versions": [{"role": "user", "content": "hello"}]},
+            {"currentlySelected": 1, "versions": [
+                {"role": "assistant", "content": "first"},
+                {"role": "assistant", "content": "edited"}
+            ]},
+            {"currentlySelected": 0, "versions": [{"role": "user", "content": "and again"}]}
+        ]
+    });
+    home.write(".lmstudio/conversations/one.conversation.json", &conversation.to_string());
+
+    let stats = scan_home(&home.0, &|_| {});
+    let row = stats.rows.iter().find(|r| r.agent == "LM Studio").expect("the LM Studio row should be there");
+    // The model is named after the file, not after the folder it sits in.
+    assert_eq!(row.model, "qwen3-8b-q4_k_m");
+    assert_eq!(row.day, ms_day(created));
+    // One answered message: the edited one is still one message, and the
+    // user's messages are not requests.
+    assert_eq!(row.requests, 1);
+    // A local model costs nothing, and says so.
+    assert_eq!(row.billing, Billing::Local);
+    assert_eq!(row.cost, 0.0);
+    assert_eq!(stats.sessions.len(), 1);
+    assert_eq!(stats.sessions[0].agent, "LM Studio");
+}
+
+/// A conversation with no answers leaves no rows behind, but it is still a
+/// conversation: the user opened it and typed.
+#[test]
+fn an_empty_lm_studio_conversation_leaves_no_rows_behind() {
+    let home = Home::new();
+    home.write(".lmstudio/conversations/one.conversation.json", &json!({"createdAt": 1_757_000_000_000_i64}).to_string());
+    home.write(".lmstudio/conversations/two.conversation.json", "not JSON at all");
+    let stats = scan_home(&home.0, &|_| {});
+    assert!(!stats.rows.iter().any(|r| r.agent == "LM Studio"));
+    // The file that could not be read contributes nothing at all; the one
+    // that could is still a session.
+    assert_eq!(stats.sessions.len(), 1);
+    assert_eq!(stats.sessions[0].agent, "LM Studio");
 }
 
 #[test]
@@ -689,5 +985,69 @@ fn real_home_scan() {
     }
     for r in stats.rows.iter().filter(|r| r.subagent).take(8) {
         println!("  subagent row agent={} model={} project={}", r.agent, r.model, r.project);
+    }
+}
+
+/// Prints the rows for one agent on one day, so they can be checked against
+/// the raw logs by something that does not share the collector's code.
+///
+/// `cargo test --bin cinder -- --ignored --nocapture real_home_day_check`
+///
+/// The day and the agent can be chosen with `CINDER_CHECK_DAY` and
+/// `CINDER_CHECK_AGENT`; the day before yesterday is the default, because
+/// today is still being written to.
+#[test]
+#[ignore]
+fn real_home_day_check() {
+    let home = dirs::home_dir().unwrap();
+    let day = std::env::var("CINDER_CHECK_DAY")
+        .unwrap_or_else(|_| unix_day(now_secs() - 2 * 86_400));
+    let agent = std::env::var("CINDER_CHECK_AGENT").unwrap_or_else(|_| "Claude Code".to_string());
+    let stats = scan_home(&home, &|_| {});
+    let mut rows: Vec<&Row> = stats
+        .rows
+        .iter()
+        .filter(|r| r.day == day && r.agent == agent)
+        .collect();
+    rows.sort_by(|a, b| a.model.cmp(&b.model).then(a.project.cmp(&b.project)));
+    println!("DAY\t{day}\t{agent}");
+    // Every row on its own, so a gap can be traced to a project.
+    for r in &rows {
+        println!(
+            "DETAIL\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            r.model, r.project, r.subagent, r.requests, r.input, r.cache_read, r.cache_write, r.output
+        );
+    }
+    // And the same numbers per model, which is what another implementation of
+    // the collector can be compared against.
+    let mut per_model: std::collections::BTreeMap<String, (u64, u64, u64, u64, u64)> = Default::default();
+    for r in &rows {
+        let e = per_model.entry(r.model.clone()).or_default();
+        e.0 += r.requests;
+        e.1 += r.input;
+        e.2 += r.cache_read;
+        e.3 += r.cache_write;
+        e.4 += r.output;
+    }
+    for (model, (requests, input, cache_read, cache_write, output)) in per_model {
+        println!("ROW\t{model}\t{requests}\t{input}\t{cache_read}\t{cache_write}\t{output}");
+    }
+    // The token totals on their own, for the agent whose tokens come out of a
+    // database rather than out of a log line. The requests are left out on
+    // purpose: they depend on the transcripts as well, and the check is about
+    // the tokens.
+    let mut per_model_tokens: std::collections::BTreeMap<String, (u64, u64, u64)> = Default::default();
+    for r in &rows {
+        let e = per_model_tokens.entry(r.model.clone()).or_default();
+        e.0 += r.input;
+        e.1 += r.cache_read;
+        e.2 += r.output;
+    }
+    for (model, (input, cache_read, output)) in per_model_tokens {
+        // A model with no tokens at all is a row that carries requests only.
+        if input == 0 && cache_read == 0 && output == 0 {
+            continue;
+        }
+        println!("TOKENS\t{model}\t{input}\t{cache_read}\t{output}");
     }
 }

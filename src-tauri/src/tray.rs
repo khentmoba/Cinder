@@ -125,7 +125,7 @@ fn cards(reports: &[QuotaReport]) -> Vec<TrayCard> {
 pub fn summary() -> TraySummary {
     let (reports, checked_at, _, restored) = quota::snapshot();
     let scan = SCAN.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    TraySummary {
+    let out = TraySummary {
         cards: cards(&reports),
         alerts: scan.alerts,
         plans: scan.plans,
@@ -137,8 +137,22 @@ pub fn summary() -> TraySummary {
         checked_at,
         restored,
         scanned_at: scan.scanned_at,
+    };
+    if std::env::var("CINDER_DEBUG").is_ok() {
+        // What the popover is about to show, so a card can be read without
+        // a mouse. Only when it changes, so the log stays readable.
+        let cards = serde_json::to_string(&out.cards).unwrap_or_default();
+        let mut last = LAST_CARDS.lock().unwrap_or_else(|e| e.into_inner());
+        if *last != cards {
+            eprintln!("tray cards: {cards}");
+            *last = cards;
+        }
     }
+    out
 }
+
+/// The cards the last debug print showed.
+static LAST_CARDS: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 // ----------------------------------------------------------------- the window
 
@@ -229,7 +243,9 @@ fn place(app: &AppHandle, tray: Option<&TrayIcon>) {
 
 /// Open the popover if it is closed, close it if it is open.
 pub fn toggle(app: &AppHandle, tray: Option<&TrayIcon>) {
-    if popover_visible(app) {
+    let visible = popover_visible(app);
+    debug(&format!("toggle, visible={visible}"));
+    if visible {
         hide_popover(app);
         return;
     }
@@ -238,10 +254,18 @@ pub fn toggle(app: &AppHandle, tray: Option<&TrayIcon>) {
 
 /// Show the popover, wherever it belongs.
 fn show(app: &AppHandle, tray: Option<&TrayIcon>) {
+    debug("showing the popover");
     if let Some(window) = app.get_webview_window(POPOVER) {
         place(app, tray);
         let _ = window.show();
         let _ = window.set_focus();
+    }
+}
+
+/// Print something when the app runs with CINDER_DEBUG set.
+fn debug(message: &str) {
+    if std::env::var("CINDER_DEBUG").is_ok() {
+        eprintln!("{message}");
     }
 }
 
@@ -323,6 +347,13 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
         builder = builder.icon(icon.clone());
     }
     let tray = builder.build(app)?;
+    if std::env::var("CINDER_DEBUG").is_ok() {
+        if let Ok(rect) = tray.rect() {
+            eprintln!("tray icon at {rect:?}");
+        } else {
+            eprintln!("the tray icon did not say where it is");
+        }
+    }
     let mut guard = TRAY.lock().unwrap_or_else(|e| e.into_inner());
     *guard = Some(tray);
     Ok(())
@@ -366,6 +397,7 @@ pub fn watch_popover(window: &tauri::WebviewWindow) {
             if now_millis() - last < BLUR_GRACE_MS {
                 return;
             }
+            debug("the popover lost the focus, so it closes");
             let _ = handle.hide();
         }
         WindowEvent::CloseRequested { api, .. } => {
@@ -376,4 +408,33 @@ pub fn watch_popover(window: &tauri::WebviewWindow) {
         }
         _ => {}
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_signed_in_provider_gets_a_card() {
+        quota::publish(vec![
+            QuotaReport::ok("Claude Code", vec![LiveQuota { agent: "Claude Code".into(), window: "5h".into(), used_percent: 29.0, ..Default::default() }]),
+            QuotaReport::ok("Codex", vec![LiveQuota { agent: "Codex".into(), window: "5h".into(), used_percent: 48.0, ..Default::default() }]),
+            QuotaReport::absent("OpenCode"),
+        ]);
+        let summary = summary();
+        let agents: Vec<&str> = summary.cards.iter().map(|c| c.agent.as_str()).collect();
+        assert_eq!(agents, vec!["Claude Code", "Codex"]);
+        // A provider that is not signed in gets no card.
+        assert!(!agents.contains(&"OpenCode"));
+    }
+
+    #[test]
+    fn the_title_says_how_much_of_the_tightest_window_is_gone() {
+        let reports = vec![
+            QuotaReport::ok("Claude Code", vec![LiveQuota { used_percent: 29.0, ..Default::default() }]),
+            QuotaReport::ok("Codex", vec![LiveQuota { used_percent: 86.0, ..Default::default() }]),
+        ];
+        assert_eq!(title(&reports), "86%");
+        assert_eq!(title(&[]), "");
+    }
 }

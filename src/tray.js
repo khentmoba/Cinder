@@ -102,11 +102,14 @@ function planName(plan) {
 function windowRow(w) {
   const pct = Math.min(100, Math.max(0, w.used_percent || 0));
   const colour = pct > 80 ? 'var(--bad)' : pct > 50 ? 'var(--warn)' : 'var(--accent)';
+  // A provider whose allowance is a balance has no window to draw.
+  const balance = w.balance > 0 ? `$${Number(w.balance).toFixed(2)}` : '';
+  const right = balance || `${Math.round(pct)}%`;
   const reset = w.resets_at ? untilReset(w.resets_at) : '';
   const detail = w.detail && w.detail !== windowName(w.window) ? w.detail : '';
   return `<div class="wrow">
-    <div class="wtop"><span class="wname">${esc(windowName(w.window))}</span><span class="wpct" style="color:${colour}">${Math.round(pct)}%</span></div>
-    <div class="track"><i class="bar" style="width:${pct}%;background:${colour}"></i></div>
+    <div class="wtop"><span class="wname">${esc(windowName(w.window))}</span><span class="wpct" style="color:${balance ? 'var(--text)' : colour}">${esc(right)}</span></div>
+    ${balance ? '' : `<div class="track"><i class="bar" style="width:${pct}%;background:${colour}"></i></div>`}
     <div class="wmeta"><span>${esc(detail)}</span><span>${esc(reset)}</span></div>
   </div>`;
 }
@@ -124,14 +127,14 @@ function cardHTML(c) {
       ${stale}
     </div>`;
   if (c.error) {
-    return `<section class="card failed">${head}
+    return `<section class="pcard failed">${head}
       <div class="err">${esc(c.error)}</div>
     </section>`;
   }
   if (!c.windows || !c.windows.length) {
-    return `<section class="card">${head}<div class="err">No windows reported.</div></section>`;
+    return `<section class="pcard">${head}<div class="err">No windows reported.</div></section>`;
   }
-  return `<section class="card">${head}${c.windows.map(windowRow).join('')}</section>`;
+  return `<section class="pcard">${head}${c.windows.map(windowRow).join('')}</section>`;
 }
 
 function alertHTML(a) {
@@ -191,7 +194,10 @@ function render() {
   }
   const today = document.getElementById('today');
   if (today) {
-    const cost = fmtUsd(s.today_cost, s.today_cost_known !== false, s.today_cost_partial);
+    // A partial figure is still worth showing: it says what is known, and
+    // the "≥" says there is more.
+    const known = s.today_cost_known !== false || s.today_cost_partial;
+    const cost = fmtUsd(s.today_cost, known, s.today_cost_partial);
     today.innerHTML = `<b>${esc(cost)}</b> today · ${esc(fmtTok(s.today_tokens))} tokens · ${esc(String(s.today_requests || 0))} requests`;
   }
 }

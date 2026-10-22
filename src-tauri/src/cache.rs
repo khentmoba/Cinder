@@ -29,6 +29,13 @@ pub struct CachedFile {
 pub struct CachedDb {
     pub mtime_ns: u128,
     pub size: u64,
+    /// The stamp of the write-ahead log beside the database.
+    ///
+    /// A database in write-ahead mode keeps the newest writes in that log
+    /// until it is checkpointed, so the file alone does not say when the data
+    /// last changed.
+    #[serde(default)]
+    pub wal: (u128, u64),
     pub count: u64,
     pub rows: Vec<Row>,
     pub sessions: Vec<(String, String)>,
@@ -39,7 +46,7 @@ pub struct CachedDb {
 /// A change to the shape or the meaning of a row bumps it, so a cache written
 /// by an older build is rebuilt instead of being replayed with values that no
 /// longer mean what they say.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct ScanCache {
