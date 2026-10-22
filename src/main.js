@@ -1083,11 +1083,9 @@ function renderLimits() {
       }
     }
 
-    const reset = l.inactive
-      ? 'not active'
-      : (l.resets_at
-        ? `resets ${untilReset(l.resets_at)} <span class="lm-when">(${new Date(l.resets_at * 1000).toLocaleString()})</span>`
-        : 'reset time unknown');
+    const reset = l.resets_at
+      ? `resets ${untilReset(l.resets_at)} <span class="lm-when">(${new Date(l.resets_at * 1000).toLocaleString()})</span>`
+      : 'reset time unknown';
 
     // Linear pace marker: expected % usage if burning evenly across the window
     const paceMarker = (elapsed > 0.05 && elapsed < 0.95)

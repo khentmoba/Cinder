@@ -188,10 +188,14 @@ When a provider explains itself, the card quotes it: an expired key says
 *"This API key has expired. Create a new API key in OpenCode Console and
 replace it in your client"*, which is more use than "HTTP 401".
 
-Anthropic sends the list of the windows a plan has, and says which of them
-are running. That list is the authority where it is there, so a session
-window that has just reset reads **not active** rather than pretending to be
-a window that is counting.
+Anthropic sends the list of the windows a plan has, and Cinder reads it: it
+names windows the named fields do not (a weekly Opus limit, say), and it
+carries the reset time for the ones that leave it out.
+
+The list also carries a flag that says whether a window is active. Cinder does
+not read it: on a real account a session window sits at 22% with a reset time
+four hours away and is still flagged inactive, so the flag does not mean what
+it looks like. The percentage and the reset time are the truth.
 
 The fetcher is built for a bad day, not only for a good one:
 
@@ -331,10 +335,11 @@ The reset times have to match exactly; the percentages may have moved a
 little between the log being written and the fetch, so they are compared
 with a small tolerance.
 
-Anthropic sends the list of the windows the plan has, and says which of them
-are running. That list is the authority where it is there, so a session
-window that has just reset reads **not running** rather than pretending to
-be a window that is counting.
+Anthropic sends the list of the windows a plan has, and Cinder reads it for
+the windows the named fields do not carry and for the reset times they leave
+out. The flag in that list that says whether a window is active is left
+alone: on a real account a session window sits at 22% with a reset time four
+hours away and is still flagged inactive.
 
 Add agents by extending `parse_*` functions in `src-tauri/src/main.rs` and
 `src-tauri/src/agents.rs`.
