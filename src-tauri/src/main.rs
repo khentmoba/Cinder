@@ -87,10 +87,35 @@ impl Route {
 }
 
 /// Read a small JSON file, if it is there and it parses.
-fn read_json_file(path: &Path) -> Option<serde_json::Value> {
+///
+/// A file written by Notepad or by PowerShell starts with a byte order mark,
+/// which is not part of the document and which the parser refuses, so it is
+/// taken off first.
+pub fn read_json_file(path: &Path) -> Option<serde_json::Value> {
     let text = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    serde_json::from_str(text).ok()
 }
+
+/// Tell Windows which app this is.
+///
+/// Without it, a notification raised by a run that was started from a terminal
+/// is filed under the terminal's name, and the toast says "Windows
+/// PowerShell" instead of "Cinder". The id is the one the installer puts on
+/// the shortcut, so the notifications group with the installed app.
+#[cfg(windows)]
+fn claim_app_id(id: &str) {
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SetCurrentProcessExplicitAppUserModelID(pszappid: *const u16) -> i32;
+    }
+    let wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
+    // The call is told which app this is; it says whether it took.
+    let _ = unsafe { SetCurrentProcessExplicitAppUserModelID(wide.as_ptr()) };
+}
+
+#[cfg(not(windows))]
+fn claim_app_id(_id: &str) {}
 
 /// How Claude Code is signed in on this machine.
 fn claude_route(home: &Path) -> Route {
@@ -2679,24 +2704,27 @@ fn spawn_quota_refresher(app: AppHandle) {
 /// The same alert is not announced twice, and one that clears is forgotten so
 /// it can fire again later.
 fn announce(app: &AppHandle, alerts: &[Alert]) {
-    use tauri_plugin_notification::NotificationExt;
+    let id = app.config().identifier.clone();
     for alert in alerts::take_new(alerts) {
-        let _ = app
-            .notification()
-            .builder()
-            .title(&alert.title)
-            .body(&alert.detail)
-            .show();
+        let mut n = notify_rust::Notification::new();
+        n.summary(&alert.title);
+        n.body(&alert.detail);
+        // Without this the notification is filed under the PowerShell app id,
+        // and the toast says "Windows PowerShell" instead of "Cinder".
+        n.app_id(&id);
+        let _ = n.show();
     }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // The window and the notifications are Cinder's, not the name of whatever
+    // started them.
+    claim_app_id("com.cinder.usage");
     tauri::Builder::default()
         // Remember where the user put the window instead of resetting to the
         // config default on every launch.
         .plugin(tauri_plugin_window_state::Builder::default().build())
-        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             spawn_log_watcher(app.handle().clone());
             spawn_quota_refresher(app.handle().clone());

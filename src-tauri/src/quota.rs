@@ -242,8 +242,7 @@ struct Credential {
 }
 
 fn read_json(path: &Path) -> Option<serde_json::Value> {
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+    crate::read_json_file(path)
 }
 
 /// Write a JSON file without leaving a half-written one behind.
@@ -2606,6 +2605,17 @@ mod tests {
         assert_eq!(body["grant_type"], "refresh_token");
         assert_eq!(body["client_id"], "client-1");
         assert_eq!(body["refresh_token"], "refresh-1");
+    }
+
+    #[test]
+    fn a_file_written_with_a_byte_order_mark_is_still_read() {
+        // Notepad and PowerShell both write one, and it is not part of the
+        // document: a file with one must still be read.
+        let path = std::env::temp_dir().join(format!("cinder-bom-{}.json", std::process::id()));
+        std::fs::write(&path, "\u{feff}{\"hello\": \"world\"}").unwrap();
+        let v = read_json(&path).expect("the file should be read");
+        assert_eq!(v.get("hello").and_then(|x| x.as_str()), Some("world"));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

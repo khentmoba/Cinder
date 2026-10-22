@@ -676,8 +676,7 @@ fn price_from_json(v: &serde_json::Value) -> Option<Price> {
 /// ~/.pi/agent/models-store.json : { provider: { models: [ { id, cost: {...} } ] } }
 /// (older builds used an object keyed by model id; both shapes are accepted)
 fn load_pi_catalog(path: &std::path::Path, out: &mut HashMap<String, Price>) {
-    let Ok(text) = std::fs::read_to_string(path) else { return };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return };
+    let Some(v) = crate::read_json_file(path) else { return };
     let providers = if let Some(pv) = v.get("providers").and_then(|p| p.as_object()) {
         pv
     } else if let Some(pv) = v.as_object() {
@@ -715,8 +714,7 @@ fn load_pi_catalog(path: &std::path::Path, out: &mut HashMap<String, Price>) {
 
 /// ~/.pi/agent/clinepass-prices.json : { models: { key: { input, output, cacheRead } } }
 fn load_clinepass(path: &std::path::Path, out: &mut HashMap<String, Price>) {
-    let Ok(text) = std::fs::read_to_string(path) else { return };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return };
+    let Some(v) = crate::read_json_file(path) else { return };
     let Some(models) = v.get("models").and_then(|m| m.as_object()) else { return };
     for (id, mv) in models {
         if let Some(p) = price_from_json(mv) {
