@@ -114,10 +114,34 @@ fn local_price_conflicts_include_cache_prices_and_do_not_pick_a_provider() {
         "other": {"models": [{"id": "gpt-5", "cost": {"input": 2, "output": 3, "cacheRead": 1}}]}
     }).to_string());
     let p = Pricing::load(&home.0);
-    assert!(p.lookup(None, "gpt-5").is_none());
-    assert!(p.lookup(None, "gpt-5-1m").is_none());
+    // Each route is priced with its own price.
     assert_eq!(p.lookup(Some("openai"), "gpt-5").unwrap().cr, 0.2);
     assert_eq!(p.lookup(Some("other"), "gpt-5").unwrap().cr, 1.0);
+    // A bare name does not pick one of the two local prices: the route that
+    // served the request is not known. It gets the public list price, which is
+    // neither of them and is what the dashboard quotes everywhere else.
+    let bare = p.lookup(None, "gpt-5").expect("the public list price should be used");
+    assert_ne!(bare.cr, 0.2);
+    assert_ne!(bare.cr, 1.0);
+    assert_eq!(bare.i, 1.25, "the public price for gpt-5");
+    assert_eq!(bare.o, 10.0);
+    assert_eq!(p.lookup(None, "gpt-5-1m").expect("the public list price should be used").i, 1.25);
+}
+
+/// A context-size variant is the same model at the same price.
+///
+/// "gpt-5-1m" is gpt-5 with a bigger window, not a different model, so it
+/// carries the same list price. Normalizing the name away to "gpt" would
+/// leave it unpriced.
+#[test]
+fn a_context_size_variant_is_priced_as_its_model() {
+    let home = Home::new();
+    let p = Pricing::load(&home.0);
+    let base = p.lookup(None, "gpt-5").expect("gpt-5 has a list price");
+    let variant = p.lookup(None, "gpt-5-1m").expect("the 1M-context variant has the same price");
+    assert_eq!(variant.i, base.i);
+    assert_eq!(variant.o, base.o);
+    assert_eq!(variant.cr, base.cr);
 }
 
 #[test]
@@ -141,7 +165,7 @@ fn unicode_model_names_do_not_panic_and_context_variants_still_match() {
         {"id": "audit-model", "cost": {"input": 2, "output": 3}}
     ]}}).to_string());
     let p = Pricing::load(&home.0);
-    for model in ["custom-é", "custom-模型", "custom-🦀", "custom-m"] {
+    for model in ["custom-Ã©", "custom-æ¨¡åž‹", "custom-ðŸ¦€", "custom-m"] {
         assert!(p.lookup(Some("vendor"), model).is_none());
     }
     assert_eq!(p.lookup(Some("vendor"), "audit-model-1m").unwrap().i, 2.0);
@@ -379,6 +403,75 @@ fn the_current_opencode_schema_is_read() {
     let second = stats.rows.iter().find(|r| r.day == "2026-01-02").expect("the second day should be there");
     assert_eq!(second.model, "openai/gpt-4.1");
     assert_eq!((second.requests, second.input, second.tools), (1, 200, 1));
+}
+
+/// When the local agent catalogues disagree about a model, the run is still
+/// worth something.
+///
+/// Two routes can price the same model differently â€” a subscription route and
+/// a pay-as-you-go one â€” and a request that does not say which route served
+/// it cannot use either price. That is no reason to call the work free: the
+/// public list price is the better answer, and it is the one the dashboard
+/// quotes everywhere else.
+#[test]
+fn a_model_the_local_catalogues_disagree_about_is_still_priced() {
+    let home = Home::new();
+    // Two routes, two prices, for the same model.
+    home.write(
+        ".pi/agent/clinepass-prices.json",
+        &json!({"models": {
+            "opencode/claude-opus-4-5": {"input": 4.0, "output": 20.0, "cacheRead": 0.2, "cacheWrite": 5.0},
+            "antigravity/claude-opus-4-5": {"input": 15.0, "output": 75.0, "cacheRead": 1.5, "cacheWrite": 18.75}
+        }})
+        .to_string(),
+    );
+    home.lines(".claude/projects/c/s.jsonl", &[
+        json!({"type": "assistant", "timestamp": "2026-01-01T00:00:00Z", "message": {
+            "role": "assistant", "model": "claude-opus-4-5",
+            "usage": {"input_tokens": 1000, "output_tokens": 100, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+        }}),
+    ]);
+    let stats = scan_home(&home.0, &|_| {});
+    let row = stats.rows.iter().find(|r| r.agent == "Claude Code").expect("the Claude Code row should be there");
+    assert!(row.cost_known, "the model should be priced");
+    assert!(row.cost > 0.0, "the work was not free, so the cost should not be zero");
+    assert!(!row.cost_partial, "and the figure should not be marked as unknown");
+    // The public list price for claude-opus-4-5 is 5 in and 25 out per million.
+    let expected = (1000.0 * 5.0 + 100.0 * 25.0) / 1e6;
+    assert!((row.cost - expected).abs() < 1e-9, "got {}, expected {}", row.cost, expected);
+}
+
+/// A turn that the CLI writes down twice is counted once.
+///
+/// Claude Code writes one record per content block of a turn - the thinking
+/// block, then one for each tool call - and every record carries the whole
+/// turn's usage. Counting every record counts a turn once per tool call it
+/// made. The API message id is the same in all of them, and the CLI's own
+/// session total agrees with counting it once.
+#[test]
+fn a_turn_written_down_twice_is_counted_once() {
+    let home = Home::new();
+    let usage = json!({"input_tokens": 100, "output_tokens": 50,
+        "cache_read_input_tokens": 1000, "cache_creation_input_tokens": 200});
+    let turn = |content: Value| {
+        json!({"type": "assistant", "cwd": "C:/repo", "timestamp": "2026-01-01T00:00:00Z",
+            "message": {"role": "assistant", "id": "msg_01same", "model": "claude-sonnet-4-5",
+                "content": content, "usage": usage}})
+    };
+    home.lines(".claude/projects/-C--repo/s.jsonl", &[
+        turn(json!([{"type": "thinking", "thinking": "hmm"}])),
+        turn(json!([{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {}}])),
+        turn(json!([{"type": "tool_use", "id": "toolu_2", "name": "Read", "input": {}}])),
+    ]);
+    let stats = scan_home(&home.0, &|_| {});
+    let r = stats.rows.iter().find(|r| r.agent == "Claude Code").expect("the Claude Code row should be there");
+    assert_eq!(r.requests, 1, "the turn is one request");
+    assert_eq!(r.input, 100);
+    assert_eq!(r.output, 50);
+    assert_eq!(r.cache_read, 1000);
+    assert_eq!(r.cache_write, 200);
+    // The tool calls are still counted: each block is written exactly once.
+    assert_eq!(r.tools, 2);
 }
 
 /// DSH keeps its sessions as zstd-compressed JSONL.
@@ -762,11 +855,30 @@ fn a_1h_cache_write_is_priced_at_its_own_rate() {
     assert_eq!(r.cache_write, 1000);
     assert_eq!(r.cache_write_1h, 1000);
     assert!(r.cost_known);
-    // The 1-hour write costs twice the 5-minute rate, and the 5-minute rate
-    // is 1.25x the base input price when the catalog has no cache-write
-    // price of its own.
-    let expected = 1000.0 * (3.0 * 1.25 * 2.0) / 1e6;
+    // The 1-hour write costs twice the base input price, and the 5-minute
+    // write costs 1.25x it - so the two are not the same number.
+    let expected = 1000.0 * (3.0 * 2.0) / 1e6;
     assert!((r.cost - expected).abs() < 1e-9, "cost {} expected {expected}", r.cost);
+}
+
+/// The 1-hour cache write rate is twice the input price, not twice the
+/// 5-minute write price.
+///
+/// The Claude Code CLI writes down what it charged, and for claude-opus-5-5
+/// (input $4 per million, 5-minute write $5) a session only adds up at $8 per
+/// million for the 1-hour writes. At $10 the charge is 25% too high.
+#[test]
+fn the_1h_cache_write_rate_is_twice_the_input_price() {
+    let p = crate::pricing::Price { i: 4.0, o: 20.0, cr: 0.2, cw: 5.0 };
+    assert_eq!(p.cache_write_1h_rate(), 8.0);
+    // A catalog with no cache-write price of its own still works out: the
+    // 5-minute write is 1.25x the input price, the 1-hour one is twice it.
+    let q = crate::pricing::Price { i: 4.0, o: 20.0, cr: 0.2, cw: 0.0 };
+    assert_eq!(q.cache_write_1h_rate(), 8.0);
+    // And a 1-hour write costs more than sending the same tokens as input,
+    // so it is not a saving.
+    assert_eq!(p.savings_split(0, 1000, 1000), 0.0);
+    assert!((p.cost_split(0, 0, 1000, 1000, 0) - 1000.0 * 8.0 / 1e6).abs() < 1e-12);
 }
 
 #[test]
@@ -939,7 +1051,7 @@ fn live_quota_check() {
     let stats = scan_home_with(&sandbox.0, &|_| {}, reports, "2026-10-21T00:00:00Z".into());
     println!("  alerts from the live windows:");
     for a in &stats.alerts {
-        println!("    [{}] {} — {}", a.severity as u8, a.title, a.detail);
+        println!("    [{}] {} â€” {}", a.severity as u8, a.title, a.detail);
     }
     println!("  plans: {:?}", stats.plans);
 }
@@ -1031,6 +1143,36 @@ fn real_home_day_check() {
     }
     for (model, (requests, input, cache_read, cache_write, output)) in per_model {
         println!("ROW\t{model}\t{requests}\t{input}\t{cache_read}\t{cache_write}\t{output}");
+    }
+    // The cost the collector worked out, and what the agent itself said the
+    // work cost, so the two can be compared.
+    let mut per_model_cost: std::collections::BTreeMap<String, (f64, Option<f64>)> = Default::default();
+    for r in &rows {
+        let e = per_model_cost.entry(r.model.clone()).or_insert((0.0, None));
+        e.0 += r.cost;
+        if let Some(reported) = r.cost_reported {
+            e.1 = Some(e.1.unwrap_or(0.0) + reported);
+        }
+    }
+    for (model, (cost, reported)) in per_model_cost {
+        println!(
+            "COST\t{model}\t{cost:.6}\t{}",
+            reported.map(|c| format!("{c:.6}")).unwrap_or_else(|| "-".into())
+        );
+    }
+    // The totals the dashboard shows per agent, over every day the scan found,
+    // so the numbers on screen can be checked against the logs.
+    let mut per_agent: std::collections::BTreeMap<String, (u64, u64, f64, bool, bool)> = Default::default();
+    for r in &stats.rows {
+        let e = per_agent.entry(r.agent.clone()).or_insert((0, 0, 0.0, true, false));
+        e.0 += r.requests;
+        e.1 += r.tokens();
+        e.2 += r.cost;
+        e.3 = e.3 && r.cost_known;
+        e.4 = e.4 || r.cost_partial;
+    }
+    for (agent, (requests, tokens, cost, known, partial)) in per_agent {
+        println!("AGENT\t{agent}\t{requests}\t{tokens}\t{cost:.6}\tknown={known}\tpartial={partial}");
     }
     // The token totals on their own, for the agent whose tokens come out of a
     // database rather than out of a log line. The requests are left out on

@@ -283,6 +283,14 @@ When a model has no price at all, but the agent itself wrote down what the
 call cost, that figure is used instead: the number the agent knows is better
 than no number. Those rows are marked as **reported** rather than estimated.
 
+The agent catalogues on this machine (Pi's model store, the Cline pass price
+list) know what each route charges, and that price is used when the route is
+known. When they disagree about a bare model name - a subscription route and a
+pay-as-you-go route pricing the same model - the route that served the
+request is not known, so the public list price is used instead. The work was
+not free, and a list price is the same figure the rest of the dashboard
+quotes.
+
 ## Speed
 
 The session logs on a busy machine run to gigabytes, and a scan has to find
@@ -365,6 +373,62 @@ forked rollouts that replay their parent's earlier turns. The DSH one has to
 walk the chain of zstd frames the sessions are written in, and the Antigravity
 one reads the same usage out of two places — T3's own orchestration database
 and the IDE transcripts — where the model is named in a line of prose.
+
+### Checking the numbers against the agent's own record
+
+Claude Code writes down what it charged and the usage that made up the charge,
+in a `cost-state` line per session. That is the agent's own record of the
+same turns the collector reads from the transcript, so the two can be
+compared:
+
+```bash
+node scripts/check-claude-sessions.mjs          # session by session
+node scripts/check-claude-sessions.mjs --no-dedup   # what counting every record gives
+node scripts/check-claude-price.mjs             # the price list against what it charged
+node scripts/check-claude-own-totals.mjs 2026-10-22
+```
+
+This is how the biggest counting bug was found. Claude Code writes one record
+per content block of a turn - the thinking block, then one for each tool call
+- and every one of those records carries the whole turn's usage. Counting the
+records as they come counts a turn once per tool call it made, and the
+transcript then holds about twice the usage the CLI recorded:
+
+```
+sessions with a cost-state: 34
+  the transcript and the CLI's total agree exactly: 7
+  median ratio transcript/CLI: 0.999      # one record per message id
+  median ratio transcript/CLI: 2.067      # every record counted
+```
+
+The API message id is the same in all of a turn's records, so the usage is
+counted once per id. The tool calls are still counted from every record,
+because each block is written exactly once.
+
+The same file answers a second question: what the CLI charged against the
+price list. Five of the six models it used agree with the list price to a
+tenth of a percent:
+
+```
+claude-opus-5-5              charged $105.7749  list price $105.7913  diff +0.0%
+claude-sonnet-5-5            charged $20.4019   list price $20.4091   diff +0.0%
+claude-haiku-4-5             charged $0.0260    list price $0.0260    diff +0.0%
+claude-opus-5-5[1m]          charged $11.1364   list price $11.1364   diff +0.0%
+claude-haiku-5-5             charged $17.5566   list price $4.7297    diff -73.1%
+```
+
+The last one is a known gap: Anthropic prices that model with a premium past
+a hundred thousand tokens, and Cinder estimates with one flat rate, so the
+figure is too low for it. The premium is not modelled yet, and the check says
+so rather than hiding it.
+
+Two price bugs came out of the same comparison. A 1-hour cache write is
+billed at twice the *input* price, not twice the 5-minute write price, which
+is 25% more than it should be - the upstream catalogue carries the rate as
+`cache_creation_input_token_cost_above_1hr`. And when the agent catalogues on
+this machine disagree about a model's price, the public list price is used
+instead of nothing at all: Claude Code's opus row went from $0.00 a day to
+$30.94, and the day's figure from a partial `$10.42` to a complete one.
 
 ### Checking the popover against the provider's own numbers
 

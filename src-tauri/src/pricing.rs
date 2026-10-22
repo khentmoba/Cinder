@@ -31,14 +31,16 @@ impl Price {
     pub fn cost(&self, input: u64, cache_read: u64, cache_write: u64, output: u64) -> f64 {
         (input as f64 * self.i + cache_read as f64 * self.cr + cache_write as f64 * self.cw + output as f64 * self.o) / 1e6
     }
-    /// The 1-hour ephemeral cache write rate: twice the 5-minute rate.
+    /// The 1-hour ephemeral cache write rate: twice the base input price.
     ///
-    /// Anthropic bills a 1-hour cache write at twice what the 5-minute write
-    /// costs, and the 5-minute write costs 1.25x the base input price when the
-    /// catalog has no cache-write price of its own.
+    /// Anthropic bills a 1-hour cache write at twice the input price, and a
+    /// 5-minute write at 1.25x it - so the 1-hour write is 1.6x the 5-minute
+    /// one, not twice it. The rate the CLI itself charges agrees: for
+    /// claude-opus-5-5, where the input price is $4 per million, a session
+    /// matches to the cent at $8 per million for the 1-hour writes and not at
+    /// $10.
     pub fn cache_write_1h_rate(&self) -> f64 {
-        let five_min = if self.cw > 0.0 { self.cw } else { self.i * 1.25 };
-        five_min * 2.0
+        self.i * 2.0
     }
     /// The cost of a request where part of the cache writes are billed at the
     /// 1-hour ephemeral rate. `cache_write` is the total written, of which
@@ -85,7 +87,6 @@ pub struct Pricing {
     local_by_provider: HashMap<String, Price>,
     /// bare "id" -> price, only when every provider agrees on the price
     local_bare: HashMap<String, Price>,
-    local_conflicts: std::collections::HashSet<String>,
     pub source: String,
     pub embedded_count: usize,
     pub local_count: usize,
@@ -126,10 +127,12 @@ fn norm(s: &str) -> String {
     // strip a trailing context-size tag like -1m (gpt-6-luna-1m is the 1M-context
     // variant of gpt-6-luna at the same base price; tiers above 272k input
     // tokens cost more, which this estimate does not capture)
+    let mut context_variant = false;
     if let Some(dash) = base.rfind('-') {
         let suf = &base[dash + 1..];
         if suf.strip_suffix('m').is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())) {
             base.truncate(dash);
+            context_variant = true;
         }
     }
     // strip trailing date digits group like -20250929 or -v2
@@ -139,7 +142,10 @@ fn norm(s: &str) -> String {
     while i > 0 && bytes[i - 1].is_ascii_digit() {
         i -= 1;
     }
-    if i < bytes.len() && i > 0 && bytes[i - 1] == '-' {
+    let digits = bytes.len() - i;
+    // A context variant keeps its own version: "gpt-5-1m" is priced as gpt-5,
+    // not as gpt. A date tag is still stripped, so "gpt-4-0613-1m" finds gpt-4.
+    if i < bytes.len() && i > 0 && bytes[i - 1] == '-' && (digits >= 4 || !context_variant) {
         cut = i - 1;
     }
     // strip a bare trailing digit group (gpt-5-4 -> keep) only when preceded by '-'
@@ -385,7 +391,6 @@ impl Pricing {
             embedded_tail,
             local_by_provider: local,
             local_bare,
-            local_conflicts,
             source,
             fingerprint,
         }
@@ -537,9 +542,12 @@ impl Pricing {
         };
         let effective_provider = provider.or(inferred_provider);
 
-        if effective_provider.is_none() && [tail(model), norm(model)].iter().any(|id| self.local_conflicts.contains(id)) {
-            return None;
-        }
+        // The local catalogues are a refinement: they know what each route
+        // charges. When they disagree about a bare model name, the route that
+        // served the request is not known, so their price cannot be used â€”
+        // but that does not mean the work was free. The public list price is
+        // the better answer than nothing, and it is the one the dashboard
+        // quotes everywhere else.
         if let Some(p) = self.lookup_local(effective_provider, model) {
             return Some(p);
         }
@@ -830,3 +838,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+

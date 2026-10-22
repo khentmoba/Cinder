@@ -974,6 +974,12 @@ fn parse_single_claude(
 ) {
     let mut day = String::new();
     let mut project = String::new();
+    // The CLI writes one record per content block of a turn, and every record
+    // carries the whole turn's usage. The API message id is the same in all of
+    // them, so the usage is counted once per id: counting every record would
+    // count a turn once per tool call it made. The CLI's own session total
+    // (the cost-state line it writes) agrees with the once-per-id count.
+    let mut seen_messages: HashSet<String> = HashSet::new();
     // A file under a subagents/ directory is a delegated child run. The
     // transcript also flags the chain with isSidechain.
     let mut subagent = claude_subagent_file(file);
@@ -1041,6 +1047,18 @@ fn parse_single_claude(
             }
         }
         let model = pricing::normalize_model(msg.get("model").and_then(|m| m.as_str()).unwrap_or("unknown"));
+        // The usage belongs to the turn, not to the block. Only the first
+        // record of a message counts it; the tool calls in the other records
+        // still count, because each block is written exactly once.
+        let first = match msg.get("id").and_then(|x| x.as_str()) {
+            Some(id) => seen_messages.insert(id.to_string()),
+            None => true,
+        };
+        let (requests, input, cache_read, cache_write, cache_write_1h, output, reasoning) = if first {
+            (1u64, input, cache_read, cache_write, cache_write_1h, output, reasoning)
+        } else {
+            (0, 0, 0, 0, 0, 0, 0)
+        };
         // Claude Code writes down what each call cost. It is not used when
         // the catalogue has a price — the dashboard prices every token the
         // same way, so the figures add up — but it is the answer when the
@@ -1051,7 +1069,7 @@ fn parse_single_claude(
             day: day_of(ts),
             agent: "Claude Code".into(),
             model: model.clone(),
-            requests: 1,
+            requests,
             input,
             cache_read,
             cache_write,
