@@ -14,6 +14,7 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { localDay } from './local-day.mjs';
 
 const day = process.argv[2];
 const root = join(homedir(), '.claude', 'projects');
@@ -60,7 +61,7 @@ for (const file of walk(root)) {
 const perModel = new Map();
 let charged = 0;
 for (const v of sessions.values()) {
-  const d = new Date(v.startTime || 0).toISOString().slice(0, 10);
+  const d = localDay(v.startTime || 0);
   if (day && d !== day) continue;
   for (const [model, u] of Object.entries(v.modelUsage || {})) {
     const e = perModel.get(model) || { calls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };

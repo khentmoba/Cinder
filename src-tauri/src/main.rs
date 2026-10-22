@@ -434,8 +434,92 @@ pub fn session(sess: &mut Sess, agent: &str, day: &str) {
     *sess.entry((day.to_string(), agent.to_string())).or_insert(0) += 1;
 }
 
+/// The day a timestamp falls on, in the machine's own time.
+///
+/// The agents write their timestamps in UTC, but the person reading the
+/// dashboard means their own day: on this machine (UTC+8) the day rolls over
+/// at eight in the morning, and a day's usage would otherwise lose its first
+/// eight hours and gain the next day's. The time zone rules of the day the
+/// timestamp falls on are used, so a day that crosses a daylight-saving
+/// change still lands on the right side of it.
+///
+/// A timestamp that cannot be read keeps the date it carries.
 pub(crate) fn day_of(ts: &str) -> String {
-    ts.chars().take(10).filter(|c| *c != '\u{0}').collect()
+    let date: String = ts.chars().take(10).filter(|c| *c != '\u{0}').collect();
+    match local_day_of(ts) {
+        Some(day) => day,
+        None => date,
+    }
+}
+
+/// The day a timestamp falls on, if the timestamp can be read.
+fn local_day_of(ts: &str) -> Option<String> {
+    let secs = epoch_of(ts)?;
+    Some(local_day(secs))
+}
+
+/// The day a number of seconds since the epoch falls on, in the machine's own
+/// time.
+pub(crate) fn local_day(secs: i64) -> String {
+    match chrono::DateTime::from_timestamp(secs, 0) {
+        Some(t) => t.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string(),
+        None => String::new(),
+    }
+}
+
+/// The number of seconds since the epoch an ISO timestamp names.
+///
+/// The shape the agents write is "2026-10-22T05:53:21.228Z", with the zone
+/// either as "Z" or as an offset. A timestamp in any other shape is not read,
+/// and the caller keeps the date it carries.
+fn epoch_of(ts: &str) -> Option<i64> {
+    let b = ts.as_bytes();
+    if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || (b[10] != b'T' && b[10] != b' ') {
+        return None;
+    }
+    let num = |from: usize, to: usize| -> Option<i64> {
+        let s = ts.get(from..to)?;
+        if !s.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        s.parse::<i64>().ok()
+    };
+    let year = num(0, 4)?;
+    let month = num(5, 7)?;
+    let day = num(8, 10)?;
+    let hour = num(11, 13)?;
+    let minute = num(14, 16)?;
+    let second = num(17, 19)?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let mut secs = days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second;
+    // The zone: "Z" is UTC, "+08:00" is that many hours east of it.
+    let rest = ts.get(19..)?.trim_start_matches(|c: char| c == '.' || c.is_ascii_digit());
+    if !rest.starts_with('Z') && !rest.starts_with('z') {
+        if let (Some(sign), Some(h), Some(m)) = (
+            rest.chars().next(),
+            rest.get(1..3).and_then(|s| s.parse::<i64>().ok()),
+            rest.get(4..6).and_then(|s| s.parse::<i64>().ok()),
+        ) {
+            if sign == '+' || sign == '-' {
+                let offset = h * 3600 + m * 60;
+                secs += if sign == '+' { -offset } else { offset };
+            }
+        }
+    }
+    Some(secs)
+}
+
+/// The days since the epoch a civil date falls on.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 fn list_files(root: &Path, ext: &str, name: Option<&str>) -> Vec<PathBuf> {
@@ -1284,7 +1368,7 @@ fn parse_opencode(
             "json_extract(m.data,'$.role') = 'assistant'",
         )
     };
-    let day_expr = "date(CASE WHEN m.time_created > 1000000000000 THEN m.time_created/1000 ELSE m.time_created END,'unixepoch')";
+    let day_expr = "date(CASE WHEN m.time_created > 1000000000000 THEN m.time_created/1000 ELSE m.time_created END,'unixepoch','localtime')";
     let columns = format!(
         "{provider_col}, {model_col},
                    COUNT(*),
@@ -1452,7 +1536,7 @@ fn parse_opencode(
         [
             format!(
                 "SELECT {provider_col}, {model_col},
-                        date(CASE WHEN m.time_created > 1000000000000 THEN m.time_created/1000 ELSE m.time_created END,'unixepoch'), s.directory, COUNT(*)
+                        date(CASE WHEN m.time_created > 1000000000000 THEN m.time_created/1000 ELSE m.time_created END,'unixepoch','localtime'), s.directory, COUNT(*)
                  FROM {message_table} m LEFT JOIN {} s ON m.session_id = s.id, json_each(m.data,'$.content')
                  WHERE json_valid(m.data) AND {assistant} AND json_extract(value,'$.type') = 'tool'
                  GROUP BY 1, 2, 3, 4",
@@ -1460,7 +1544,7 @@ fn parse_opencode(
             ),
             format!(
                 "SELECT {provider_col}, {model_col},
-                        date(CASE WHEN m.time_created > 1000000000000 THEN m.time_created/1000 ELSE m.time_created END,'unixepoch'), NULL, COUNT(*)
+                        date(CASE WHEN m.time_created > 1000000000000 THEN m.time_created/1000 ELSE m.time_created END,'unixepoch','localtime'), NULL, COUNT(*)
                  FROM {message_table} m, json_each(m.data,'$.content')
                  WHERE json_valid(m.data) AND {assistant} AND json_extract(value,'$.type') = 'tool'
                  GROUP BY 1, 2, 3"
@@ -1470,7 +1554,7 @@ fn parse_opencode(
         [
             format!(
                 "SELECT json_extract(m.data, '$.providerID'), json_extract(m.data, '$.modelID'),
-                        date(p.time_created/1000,'unixepoch'), s.directory, COUNT(*)
+                        date(p.time_created/1000,'unixepoch','localtime'), s.directory, COUNT(*)
                  FROM part p JOIN message m ON p.message_id = m.id
                  LEFT JOIN {} s ON m.session_id = s.id
                  WHERE json_valid(p.data) AND json_valid(m.data) AND json_extract(p.data, '$.type') = 'tool'
@@ -1478,7 +1562,7 @@ fn parse_opencode(
                 table
             ),
             "SELECT json_extract(m.data, '$.providerID'), json_extract(m.data, '$.modelID'),
-                        date(p.time_created/1000,'unixepoch'), NULL, COUNT(*)
+                        date(p.time_created/1000,'unixepoch','localtime'), NULL, COUNT(*)
                  FROM part p JOIN message m ON p.message_id = m.id
                  WHERE json_valid(p.data) AND json_valid(m.data) AND json_extract(p.data, '$.type') = 'tool'
                  GROUP BY 1, 2, 3".to_string(),
@@ -2386,18 +2470,7 @@ pub(crate) fn unix_day(secs: i64) -> String {
     if secs <= 0 {
         return String::new();
     }
-    let days = secs / 86_400;
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{:04}-{:02}-{:02}", y, m, d)
+    local_day(secs)
 }
 
 /// Collect the stats. Runs off the UI thread and reports the stage it is on, so a

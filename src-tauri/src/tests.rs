@@ -48,6 +48,16 @@ impl Drop for Home {
     }
 }
 
+/// The day a timestamp falls on, in the machine's own time.
+///
+/// The collector files a row under the day the person reading it means, which
+/// is not the UTC day unless the machine sits on UTC. The tests work it out
+/// the same way, so they hold on any machine.
+fn day_of(ts: &str) -> String {
+    let t = chrono::DateTime::parse_from_rfc3339(ts).expect("the timestamp should be read");
+    t.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string()
+}
+
 #[test]
 fn cache_preserves_rows_and_sessions_and_detects_modification() {
     let home = Home::new();
@@ -265,7 +275,7 @@ fn t3_transcripts_supply_counts_and_usage_database_supplies_tokens() {
     assert_eq!(stats.rows.iter().map(|r| r.tools).sum::<u64>(), 1);
     assert_eq!(stats.rows.iter().map(Row::tokens).sum::<u64>(), 220);
     assert_eq!(stats.sessions.iter().map(|s| s.sessions).sum::<u64>(), 2);
-    assert!(stats.sessions.iter().all(|s| s.day == "2026-01-01"));
+    assert!(stats.sessions.iter().all(|s| s.day == day_of("2026-01-01T00:00:00Z")));
 }
 
 #[test]
@@ -321,17 +331,17 @@ fn opencode_uses_message_dates_models_and_request_counts() {
         db.execute("INSERT INTO message VALUES ('user', 's', ?, 1767225600000)", [json!({"role": "user"}).to_string()]).unwrap();
         db.execute("INSERT INTO message VALUES ('bad', 's', 'not JSON', 1767225600000)", []).unwrap();
         let stats = scan_home(&home.0, &|_| {});
-        let first = stats.rows.iter().find(|r| r.day == "2026-01-01").unwrap();
+        let first = stats.rows.iter().find(|r| r.day == day_of("2026-01-01T00:00:00Z")).unwrap();
         assert_eq!(first.model, "openai/gpt-5");
         assert_eq!((first.requests, first.input, first.cache_read, first.cache_write, first.tools), (2, 150, 40, 10, 1));
         assert_eq!(first.cost, 1.0);
-        let second = stats.rows.iter().find(|r| r.day == "2026-01-02").unwrap();
+        let second = stats.rows.iter().find(|r| r.day == day_of("2026-01-02T00:00:00Z")).unwrap();
         assert_eq!(second.model, "openai/gpt-4.1");
         assert_eq!((second.requests, second.input, second.tools), (1, 200, 1));
         assert_eq!(stats.sessions.len(), 1);
-        assert_eq!(stats.sessions[0].day, "2026-01-01");
+        assert_eq!(stats.sessions[0].day, day_of("2026-01-01T00:00:00Z"));
         assert_eq!(stats.sessions[0].sessions, 1);
-        assert!(!stats.rows.iter().any(|r| r.day == "2026-01-03"));
+        assert!(!stats.rows.iter().any(|r| r.day == day_of("2026-01-03T00:00:00Z")));
     }
 }
 
@@ -389,7 +399,7 @@ fn the_current_opencode_schema_is_read() {
     .unwrap();
 
     let stats = scan_home(&home.0, &|_| {});
-    let first = stats.rows.iter().find(|r| r.day == "2026-01-01").expect("the OpenCode row should be there");
+    let first = stats.rows.iter().find(|r| r.day == day_of("2026-01-01T00:00:00Z")).expect("the OpenCode row should be there");
     assert_eq!(first.model, "openai/gpt-5");
     assert_eq!(first.requests, 2, "the compaction is a request of its own");
     assert_eq!(first.input, 107, "the compaction's own tokens are counted");
@@ -400,7 +410,7 @@ fn the_current_opencode_schema_is_read() {
     assert_eq!(first.tools, 1, "the tool call is inside the message");
     assert_eq!(first.cost, 1.5);
     assert_eq!(first.project, "project");
-    let second = stats.rows.iter().find(|r| r.day == "2026-01-02").expect("the second day should be there");
+    let second = stats.rows.iter().find(|r| r.day == day_of("2026-01-02T00:00:00Z")).expect("the second day should be there");
     assert_eq!(second.model, "openai/gpt-4.1");
     assert_eq!((second.requests, second.input, second.tools), (1, 200, 1));
 }
@@ -439,6 +449,46 @@ fn a_model_the_local_catalogues_disagree_about_is_still_priced() {
     // The public list price for claude-opus-4-5 is 5 in and 25 out per million.
     let expected = (1000.0 * 5.0 + 100.0 * 25.0) / 1e6;
     assert!((row.cost - expected).abs() < 1e-9, "got {}, expected {}", row.cost, expected);
+}
+
+/// A usage is filed under the day the machine thinks it is.
+///
+/// The agents write their timestamps in UTC, but the day on the dashboard is
+/// the reader's own: on this machine (UTC+8) the day rolls over at eight in
+/// the morning, and a day's usage would otherwise lose its first eight hours
+/// and gain the next day's. The time zone rules of the day the timestamp
+/// falls on are used, so a day that crosses a daylight-saving change still
+/// lands on the right side of it.
+#[test]
+fn a_usage_is_filed_under_the_machines_own_day() {
+    let home = Home::new();
+    // An instant in the middle of the UTC day and one near its end: on a
+    // machine east of UTC they can fall on different local days, and on a
+    // machine west of UTC the same thing happens the other way round.
+    let noon = "2026-03-10T12:00:00Z";
+    let evening = "2026-03-10T23:30:00Z";
+    let turn = |ts: &str| {
+        json!({
+            "type": "assistant", "cwd": "C:/repo", "timestamp": ts,
+            "message": {"role": "assistant", "model": "claude-sonnet-4-5",
+                "usage": {"input_tokens": 100, "output_tokens": 50}}
+        })
+    };
+    home.lines(".claude/projects/-C--repo/s.jsonl", &[turn(noon), turn(evening)]);
+    let stats = scan_home(&home.0, &|_| {});
+    let days: Vec<&str> = stats.rows.iter().map(|r| r.day.as_str()).collect();
+    let wanted: Vec<String> = [noon, evening].iter().map(|t| day_of(t)).collect();
+    for day in &wanted {
+        assert!(days.contains(&day.as_str()), "a row should be filed under {day}: {days:?}");
+    }
+    // The day the collector reads for right now is the local one too.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert_eq!(unix_day(now), local_day(now));
+    let local = chrono::DateTime::from_timestamp(now, 0).unwrap().with_timezone(&chrono::Local);
+    assert_eq!(unix_day(now), local.format("%Y-%m-%d").to_string());
 }
 
 /// A turn that the CLI writes down twice is counted once.
@@ -652,10 +702,10 @@ fn antigravity_transcripts_carry_the_model_the_tokens_and_the_tools() {
     assert_eq!(row.tools, 2);
     // Antigravity runs on a plan, so the row says so.
     assert_eq!(row.billing, Billing::Subscription);
-    assert_eq!(row.day, "2026-01-01");
+    assert_eq!(row.day, day_of("2026-01-01T00:00:00Z"));
 
     // The next day is a row of its own.
-    let next = stats.rows.iter().find(|r| r.agent == "Antigravity" && r.day == "2026-01-02").expect("the second day should be there");
+    let next = stats.rows.iter().find(|r| r.agent == "Antigravity" && r.day == day_of("2026-01-02T00:00:00Z")).expect("the second day should be there");
     assert_eq!(next.requests, 1);
     assert_eq!(next.input, 100);
 }
@@ -683,7 +733,7 @@ fn pi_sessions_carry_the_tokens_of_every_assistant_message() {
     assert_eq!(row.cache_read, 95000);
     assert_eq!(row.output, 10);
     assert_eq!(row.tools, 1);
-    assert_eq!(row.day, "2026-01-01");
+    assert_eq!(row.day, day_of("2026-01-01T00:00:00Z"));
     // OpenAI bills per token, so the row is priced.
     assert_eq!(row.billing, Billing::Api);
     assert!(row.cost_known);
@@ -950,7 +1000,7 @@ fn a_published_artifact_is_collected_once() {
     assert_eq!(stats.artifacts.len(), 1);
     assert_eq!(stats.artifacts[0].url, "https://claude.ai/code/artifact/abc123");
     assert_eq!(stats.artifacts[0].title, "A chart");
-    assert_eq!(stats.artifacts[0].day, "2026-01-01");
+    assert_eq!(stats.artifacts[0].day, day_of("2026-01-01T00:00:00Z"));
 }
 
 #[test]

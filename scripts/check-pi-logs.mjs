@@ -15,10 +15,11 @@
 // The two sets have to be identical for the numbers to be right.
 
 import { readdirSync, readFileSync } from 'node:fs';
+import { localDay } from './local-day.mjs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
-const day = process.argv[2] || new Date(Date.now() - 2 * 86400000).toISOString().slice(0, 10);
+const day = process.argv[2] || localDay(Date.now() - 2 * 86400000);
 const root = join(homedir(), '.pi', 'agent', 'sessions');
 
 function walk(dir, out = []) {
@@ -63,7 +64,7 @@ for (const file of files) {
     }
     const ts = typeof v.timestamp === 'string' ? v.timestamp : '';
     if (v.type === 'session') {
-      if (!fileDay) fileDay = ts.slice(0, 10);
+      if (!fileDay) fileDay = localDay(ts);
       continue;
     }
     if (v.type !== 'message') continue;
@@ -76,7 +77,7 @@ for (const file of files) {
     const cacheWrite = u.cacheWrite || 0;
     // A message that used nothing is not a request.
     if (input + output + cacheRead + cacheWrite === 0) continue;
-    const d = ts.slice(0, 10) || fileDay;
+    const d = localDay(ts) || fileDay;
     if (d !== day) continue;
     const model = String(msg.model || 'unknown').trim();
     const e = perModel.get(model) || [0, 0, 0, 0, 0];

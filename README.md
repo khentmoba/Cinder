@@ -102,6 +102,14 @@ cache counts are kept as reported, without borrowing ratios from other agents.
 
 ## What the numbers mean
 
+The days are the reader's own. The agents write their timestamps in UTC, but
+the day on the screen is the one the person reading it means: on this machine
+(UTC+8) the day rolls over at eight in the morning, and a day's usage would
+otherwise lose its first eight hours and gain the next day's - on
+2026-10-20 that was 240.8M tokens against a local day's 351.5M. The time
+zone rules of the day a timestamp falls on are used, so a day that crosses a
+daylight-saving change still lands on the right side of it.
+
 Cinder prices every token against public list prices, so the dollar figure is
 an **equivalent value**, never an invoice. Each row carries the billing mode
 it was collected under, and the dashboard says which one it is looking at:

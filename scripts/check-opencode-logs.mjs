@@ -18,8 +18,9 @@ import { DatabaseSync } from 'node:sqlite';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { localDay } from './local-day.mjs';
 
-const day = process.argv[2] || new Date(Date.now() - 2 * 86400000).toISOString().slice(0, 10);
+const day = process.argv[2] || localDay(Date.now() - 2 * 86400000);
 const path = join(homedir(), '.local', 'share', 'opencode', 'opencode.db');
 if (!existsSync(path)) {
   console.log('OpenCode keeps no database on this machine');
@@ -52,7 +53,7 @@ const rows = hasCurrent
 // The same day the collector uses: a unix second, whatever the column holds.
 const dayOf = (ts) => {
   const secs = ts > 1000000000000 ? Math.floor(ts / 1000) : ts;
-  return new Date(secs * 1000).toISOString().slice(0, 10);
+  return localDay(secs * 1000);
 };
 
 const perModel = new Map();

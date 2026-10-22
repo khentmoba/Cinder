@@ -13,12 +13,13 @@
 // marks the row as estimated.
 
 import { readdirSync, readFileSync } from 'node:fs';
+import { localDay } from './local-day.mjs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
 const days = process.argv.slice(2);
 if (!days.length) {
-  const d = new Date(Date.now() - 2 * 86400000).toISOString().slice(0, 10);
+  const d = localDay(Date.now() - 2 * 86400000);
   days.push(d);
 }
 
@@ -63,7 +64,7 @@ for (const file of files) {
     const cost = typeof v.costUSD === 'number' ? v.costUSD : null;
     if (cost === null) continue;
     numbered++;
-    const d = String(v.timestamp || '').slice(0, 10);
+    const d = localDay(v.timestamp || '');
     if (!days.includes(d)) continue;
     const model = (v.message && v.message.model) || 'unknown';
     const e = perModel.get(model) || { n: 0, cost: 0 };

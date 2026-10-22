@@ -21,8 +21,9 @@ import { DatabaseSync } from 'node:sqlite';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { localDay } from './local-day.mjs';
 
-const day = process.argv[2] || new Date(Date.now() - 2 * 86400000).toISOString().slice(0, 10);
+const day = process.argv[2] || localDay(Date.now() - 2 * 86400000);
 const path = join(homedir(), '.t3', 'userdata', 'statev2.sqlite');
 if (!existsSync(path)) {
   console.log('T3 keeps no usage database on this machine');
@@ -81,7 +82,7 @@ for (const turn of turns) {
   const output = usage.outputTokens || 0;
   if (input + cacheRead + output === 0) continue;
   // The day of the turn, or of the usage itself when the turn does not say.
-  const d = (turn.started || '').slice(0, 10) || (usage.updatedAt || '').slice(0, 10);
+  const d = localDay(turn.started || '') || localDay(usage.updatedAt || '');
   if (d !== day) continue;
   const e = perModel.get(raw) || [0, 0, 0];
   e[0] += input;
@@ -151,7 +152,7 @@ for (const file of ide) {
     const cacheRead = v.cache_read_tokens || 0;
     const output = v.output_tokens || 0;
     if (input + cacheRead + output === 0) continue;
-    const d = (v.created_at || '').slice(0, 10);
+    const d = localDay(v.created_at || '');
     if (d !== day) continue;
     const e = perModelIde.get(model) || [0, 0, 0];
     e[0] += input;
