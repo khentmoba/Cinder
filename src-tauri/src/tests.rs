@@ -962,4 +962,22 @@ fn real_home_day_check() {
     for (model, (requests, input, cache_read, cache_write, output)) in per_model {
         println!("ROW\t{model}\t{requests}\t{input}\t{cache_read}\t{cache_write}\t{output}");
     }
+    // The token totals on their own, for the agent whose tokens come out of a
+    // database rather than out of a log line. The requests are left out on
+    // purpose: they depend on the transcripts as well, and the check is about
+    // the tokens.
+    let mut per_model_tokens: std::collections::BTreeMap<String, (u64, u64, u64)> = Default::default();
+    for r in &rows {
+        let e = per_model_tokens.entry(r.model.clone()).or_default();
+        e.0 += r.input;
+        e.1 += r.cache_read;
+        e.2 += r.output;
+    }
+    for (model, (input, cache_read, output)) in per_model_tokens {
+        // A model with no tokens at all is a row that carries requests only.
+        if input == 0 && cache_read == 0 && output == 0 {
+            continue;
+        }
+        println!("TOKENS\t{model}\t{input}\t{cache_read}\t{output}");
+    }
 }

@@ -267,14 +267,19 @@ the screen is a number that can be accounted for:
 powershell -File scripts/check-logs.ps1                              # Claude Code
 powershell -File scripts/check-logs.ps1 -Agent Codex                 # Codex
 powershell -File scripts/check-logs.ps1 -Agent Pi                    # Pi
+powershell -File scripts/check-logs.ps1 -Agent OpenCode              # OpenCode
+powershell -File scripts/check-logs.ps1 -Agent DSH                   # DSH
+powershell -File scripts/check-logs.ps1 -Agent Antigravity           # T3's Antigravity
 powershell -File scripts/check-logs.ps1 -Agent Codex 2026-10-19 2026-10-20
 ```
 
-`scripts/check-claude-logs.mjs`, `scripts/check-codex-logs.mjs` and
-`scripts/check-pi-logs.mjs` read the agents' own logs with an implementation
-that shares no code with the collector, and the `real_home_day_check` test
-prints what the collector made of the same files. The two have to agree line
-for line, per model, on requests and on every kind of token:
+`scripts/check-claude-logs.mjs`, `scripts/check-codex-logs.mjs`,
+`scripts/check-pi-logs.mjs`, `scripts/check-opencode-logs.mjs`,
+`scripts/check-dsh-logs.mjs` and `scripts/check-t3-logs.mjs` read the agents'
+own logs with an implementation that shares no code with the collector, and
+the `real_home_day_check` test prints what the collector made of the same
+files. The two have to agree line for line, per model, on requests and on
+every kind of token:
 
 ```
 === 2026-10-21 ===
@@ -285,7 +290,10 @@ for line, per model, on requests and on every kind of token:
 
 The Codex check is the interesting one: it pins down the split between cached
 and uncached input, the model switching in the middle of a file, and the
-forked rollouts that replay their parent's earlier turns.
+forked rollouts that replay their parent's earlier turns. The DSH one has to
+walk the chain of zstd frames the sessions are written in, and the Antigravity
+one reads the same usage out of two places — T3's own orchestration database
+and the IDE transcripts — where the model is named in a line of prose.
 
 ### Checking the popover against the provider's own numbers
 

@@ -22,16 +22,25 @@ if ($Days.Count -eq 0) {
     )
 }
 
+# The reader for the agent, and the kind of line it prints: ROW carries the
+# requests and every kind of token, TOKENS carries the tokens only.
 $reader = switch -Regex ($Agent) {
-    'Claude' { 'check-claude-logs.mjs' }
-    'Codex' { 'check-codex-logs.mjs' }
-    'Pi' { 'check-pi-logs.mjs' }
+    'Claude' { @('check-claude-logs.mjs', 'ROW') }
+    'Codex' { @('check-codex-logs.mjs', 'ROW') }
+    'Pi' { @('check-pi-logs.mjs', 'ROW') }
+    'OpenCode' { @('check-opencode-logs.mjs', 'ROW') }
+    'DSH' { @('check-dsh-logs.mjs', 'ROW') }
+    'T3' { @('check-t3-logs.mjs', 'TOKENS') }
+    # T3 drives the Antigravity route, so its rows are counted as Antigravity.
+    'Antigravity' { @('check-t3-logs.mjs', 'TOKENS') }
     default { $null }
 }
 if (-not $reader) {
     Write-Output "there is no independent reader for $Agent yet"
     exit 1
 }
+$script = $reader[0]
+$kind = $reader[1]
 
 $failed = $false
 foreach ($day in $Days) {
@@ -39,8 +48,8 @@ foreach ($day in $Days) {
 
     # The array matters: a pipeline that yields one item comes back as the
     # item itself, and indexing that would index its characters.
-    $mine = @(node "$PSScriptRoot\$reader" $day |
-        Where-Object { $_ -like "ROW`t*" } |
+    $mine = @(node "$PSScriptRoot\$script" $day |
+        Where-Object { $_ -like "$kind`t*" } |
         Sort-Object)
     if ($mine.Count -eq 0) {
         Write-Output "  no $Agent usage that day"
@@ -50,7 +59,7 @@ foreach ($day in $Days) {
     $env:CINDER_CHECK_DAY = $day
     $env:CINDER_CHECK_AGENT = $Agent
     $theirs = cargo test --manifest-path src-tauri\Cargo.toml -- --ignored --nocapture real_home_day_check 2>&1 |
-        Where-Object { $_ -like "ROW`t*" } |
+        Where-Object { $_ -like "$kind`t*" } |
         ForEach-Object { $_.Trim() } |
         Sort-Object
 
