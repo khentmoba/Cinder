@@ -41,6 +41,14 @@ const files = walk(root);
 const perModel = new Map();
 let lines = 0;
 let assistantMessages = 0;
+let repeats = 0;
+
+// The CLI writes one record per content block of a turn, and every record
+// carries the whole turn's usage, so a turn shows up once per tool call it
+// made. The API message id is the same in all of them, so the usage is
+// counted once per id. The CLI's own session total (the cost-state line it
+// writes) agrees with that count and not with the raw line count.
+const seen = new Set();
 
 for (const file of files) {
   let text;
@@ -72,6 +80,14 @@ for (const file of files) {
     const ts = typeof v.timestamp === 'string' ? v.timestamp : '';
     if (ts.slice(0, 10) !== day) continue;
     const model = String((v.message && v.message.model) || 'unknown').trim();
+    const id = v.message && v.message.id;
+    if (id) {
+      if (seen.has(id)) {
+        repeats++;
+        continue;
+      }
+      seen.add(id);
+    }
     const e = perModel.get(model) || [0, 0, 0, 0, 0];
     e[0]++;
     e[1] += input;
@@ -85,6 +101,7 @@ for (const file of files) {
 
 console.log(`DAY\t${day}\tClaude Code`);
 console.log(`read ${files.length} files, ${lines} lines`);
+console.log(`counted ${assistantMessages} turns, skipped ${repeats} repeats of a turn already counted`);
 for (const model of [...perModel.keys()].sort()) {
   const [requests, input, cacheRead, cacheWrite, output] = perModel.get(model);
   console.log(`ROW\t${model}\t${requests}\t${input}\t${cacheRead}\t${cacheWrite}\t${output}`);
