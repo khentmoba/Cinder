@@ -178,6 +178,39 @@ every five minutes in the background, so a scan never waits on the network.
 | GitHub Copilot | `~/.config/github-copilot/apps.json` | `api.github.com/copilot_internal/user` |
 | Gemini CLI | `~/.gemini/oauth_creds.json` | `cloudcode-pa.googleapis.com` |
 | OpenCode | `~/.local/share/opencode/auth.json` | `opencode.ai/zen/go/v1/usage` |
+| Kimi Code | `~/.kimi/credentials/*.json` | `api.kimi.com/coding/v1/usages` |
+| OpenRouter | `OPENROUTER_API_KEY` or the agent catalogs | `openrouter.ai/api/v1/credits` |
+| DeepSeek | `DEEPSEEK_API_KEY` or the agent catalogs | `api.deepseek.com/user/balance` |
+
+Each endpoint was taken from the provider's own code or its published API,
+and each was checked to answer 401 rather than 404 — the route is there and
+it wants a bearer token. A provider Cinder cannot find a key for gets no card:
+an agent that is not used here is not a problem.
+
+### Adding a provider of your own
+
+Not every service worth watching answers with a shape Cinder knows. A provider
+of your own is a file, `~/.cinder/providers.json`:
+
+```json
+{
+  "providers": [
+    {
+      "name": "My Router",
+      "url": "https://api.example.com/usage",
+      "token": "sk-...",
+      "percent": "data.usage.percent",
+      "reset": "data.usage.reset_at",
+      "detail": "data.usage.label"
+    }
+  ]
+}
+```
+
+`percent` is a dotted path to the number that is the percentage used, or to an
+object with `used` and `limit` in it. `reset` and `detail` are optional. The
+token is sent as `Authorization: Bearer <token>`, so only point it at a
+service you trust with it.
 
 A provider that is not signed in is skipped; one that is signed in but fails
 says so in the panel instead of showing a stale number. A window whose reset

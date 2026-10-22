@@ -45,6 +45,10 @@ pub struct LiveQuota {
     /// The size of that allowance, in dollars.
     #[serde(default)]
     pub limit_amount: f64,
+    /// The money left, for a provider whose allowance is a balance rather
+    /// than a window.
+    #[serde(default)]
+    pub balance: f64,
 }
 
 /// Why a provider could not be read.
@@ -805,6 +809,7 @@ fn parse_claude_usage(v: &serde_json::Value, plan: &str) -> Vec<LiveQuota> {
                 detail: "Extra usage credits".into(),
                 used_amount: used,
                 limit_amount: limit,
+                ..Default::default()
             });
         }
     }
@@ -1370,6 +1375,419 @@ async fn opencode(client: reqwest::Client, endpoints: Endpoints, home: PathBuf) 
     report.updated_at = now_secs();
     report
 }
+// ------------------------------------------------------- the simple providers
+
+/// A provider whose quota is one JSON answer.
+///
+/// The providers that need an OAuth dance of their own (Claude Code, Codex)
+/// have code of their own; the rest are a credential, a URL and a shape.
+struct QuotaProvider {
+    /// The name on the card.
+    agent: &'static str,
+    /// Where the credential is, and what to make of it.
+    credential: fn(&Path) -> (Option<String>, Vec<String>),
+    /// The endpoint to ask.
+    url: &'static str,
+    /// The headers the endpoint wants.
+    headers: &'static [(&'static str, &'static str)],
+    /// How to read the answer.
+    parse: fn(&serde_json::Value) -> Vec<LiveQuota>,
+}
+
+/// The providers Cinder can ask with a plain key.
+///
+/// Each endpoint was taken from the provider's own code or its published API,
+/// and each was checked to answer 401 rather than 404 — the route is there
+/// and it wants a bearer token.
+const PROVIDERS: &[QuotaProvider] = &[
+    QuotaProvider {
+        agent: "OpenRouter",
+        credential: openrouter_credential,
+        url: "https://openrouter.ai/api/v1/credits",
+        headers: &[],
+        parse: parse_openrouter_credits,
+    },
+    QuotaProvider {
+        agent: "Kimi Code",
+        credential: kimi_credential,
+        url: "https://api.kimi.com/coding/v1/usages",
+        headers: &[],
+        parse: parse_kimi_usage,
+    },
+    QuotaProvider {
+        agent: "DeepSeek",
+        credential: deepseek_credential,
+        url: "https://api.deepseek.com/user/balance",
+        headers: &[],
+        parse: parse_deepseek_balance,
+    },
+];
+
+/// The key for a provider that is billed per token.
+///
+/// The environment is the usual place. Otherwise the key is where the agents
+/// that use it keep it: the pi agent's own catalog holds the key with the
+/// provider it belongs to.
+fn api_key(home: &Path, env: &str, provider: &str) -> (Option<String>, Vec<String>) {
+    if let Ok(k) = std::env::var(env) {
+        if !k.trim().is_empty() {
+            return (Some(k), Vec::new());
+        }
+    }
+    let mut problems = Vec::new();
+    for path in [
+        home.join(".pi").join("agent").join("models.json"),
+        home.join(".pi").join("agent").join("models-store.json"),
+    ] {
+        if !path.exists() {
+            continue;
+        }
+        let Some(v) = read_json(&path) else {
+            problems.push(format!("{} could not be read", path.display()));
+            continue;
+        };
+        let Some(providers) = v.get("providers").filter(|p| p.is_object()) else { continue };
+        let Some(entry) = providers.get(provider) else { continue };
+        if let Some(k) = str_at(entry, &["apiKey", "api_key", "key"]) {
+            return (Some(k), problems);
+        }
+        if let Some(models) = entry.get("models").and_then(|m| m.as_array()) {
+            for m in models {
+                if let Some(k) = str_at(m, &["apiKey", "api_key", "key"]) {
+                    return (Some(k), problems);
+                }
+            }
+        }
+    }
+    (None, problems)
+}
+
+/// The OpenRouter key.
+fn openrouter_credential(home: &Path) -> (Option<String>, Vec<String>) {
+    api_key(home, "OPENROUTER_API_KEY", "openrouter")
+}
+
+/// The DeepSeek key.
+fn deepseek_credential(home: &Path) -> (Option<String>, Vec<String>) {
+    api_key(home, "DEEPSEEK_API_KEY", "deepseek")
+}
+
+/// The Kimi Code key.
+///
+/// The Kimi CLI keeps its sign-in in `~/.kimi/credentials`, under the name
+/// its own config gives it.
+fn kimi_credential(home: &Path) -> (Option<String>, Vec<String>) {
+    if let Ok(k) = std::env::var("KIMI_API_KEY") {
+        if !k.trim().is_empty() {
+            return (Some(k), Vec::new());
+        }
+    }
+    let mut problems = Vec::new();
+    let dir = home.join(".kimi").join("credentials");
+    let Ok(entries) = std::fs::read_dir(&dir) else { return (None, problems) };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(v) = read_json(&path) else {
+            problems.push(format!("{} could not be read", path.display()));
+            continue;
+        };
+        if let Some(k) = str_at(&v, &["access_token", "accessToken", "api_key", "apiKey"]) {
+            return (Some(k), problems);
+        }
+    }
+    (None, problems)
+}
+
+/// OpenRouter's credits: what was bought and what has been spent of it.
+fn parse_openrouter_credits(v: &serde_json::Value) -> Vec<LiveQuota> {
+    let Some(data) = v.get("data") else { return Vec::new() };
+    let total = data.get("total_credits").and_then(|x| x.as_f64()).unwrap_or(0.0);
+    let used = data.get("total_usage").and_then(|x| x.as_f64()).unwrap_or(0.0);
+    if total <= 0.0 {
+        return Vec::new();
+    }
+    vec![LiveQuota {
+        agent: "OpenRouter".into(),
+        window: "credits".into(),
+        used_percent: (used / total * 100.0).clamp(0.0, 100.0),
+        window_minutes: 30 * 24 * 60,
+        plan: String::new(),
+        detail: format!("${used:.2} of ${total:.2} spent"),
+        ..Default::default()
+    }]
+}
+
+/// Kimi Code's usage: a summary and a list of limits.
+///
+/// Each limit says what has been used and what the limit is, and sometimes
+/// how long is left of it.
+fn parse_kimi_usage(v: &serde_json::Value) -> Vec<LiveQuota> {
+    let mut out = Vec::new();
+    if let Some(usage) = v.get("usage") {
+        if let Some(w) = kimi_window(usage, usage, "Weekly limit") {
+            out.push(w);
+        }
+    }
+    let Some(limits) = v.get("limits").and_then(|x| x.as_array()) else { return out };
+    for (i, item) in limits.iter().enumerate() {
+        let detail = item.get("detail").filter(|d| d.is_object()).unwrap_or(item);
+        let label = kimi_label(item, detail, i);
+        if let Some(w) = kimi_window(item, detail, &label) {
+            out.push(w);
+        }
+    }
+    out
+}
+
+/// One Kimi limit, as a window.
+fn kimi_window(item: &serde_json::Value, detail: &serde_json::Value, label: &str) -> Option<LiveQuota> {
+    let limit_field = detail.get("limit").and_then(|x| x.as_f64());
+    let used_field = detail.get("used").and_then(|x| x.as_f64());
+    let remaining = detail.get("remaining").and_then(|x| x.as_f64());
+    // A limit that says what is left but not what the limit is still has one:
+    // what has been used and what is left add up to it.
+    let limit = match limit_field {
+        Some(l) => l,
+        None => match (used_field, remaining) {
+            (Some(u), Some(r)) => u + r,
+            _ => 0.0,
+        },
+    };
+    let used = match used_field {
+        Some(u) => u,
+        None => match (remaining, limit_field) {
+            (Some(r), Some(l)) => l - r,
+            _ => return None,
+        },
+    };
+    if limit <= 0.0 && used <= 0.0 {
+        return None;
+    }
+    Some(LiveQuota {
+        agent: "Kimi Code".into(),
+        window: label.to_string(),
+        used_percent: if limit > 0.0 { (used / limit * 100.0).clamp(0.0, 100.0) } else { 0.0 },
+        window_minutes: kimi_minutes(item, detail),
+        resets_at: kimi_reset(item, detail),
+        plan: String::new(),
+        detail: label.to_string(),
+        ..Default::default()
+    })
+}
+
+/// The name of a Kimi limit: what it says it is, or how long it is.
+fn kimi_label(item: &serde_json::Value, detail: &serde_json::Value, index: usize) -> String {
+    for key in ["name", "title", "scope"] {
+        if let Some(v) = item.get(key).or_else(|| detail.get(key)).and_then(|x| x.as_str()) {
+            if !v.trim().is_empty() {
+                return v.to_string();
+            }
+        }
+    }
+    let window = item.get("window").filter(|w| w.is_object());
+    let duration = window
+        .and_then(|w| w.get("duration"))
+        .or_else(|| item.get("duration"))
+        .or_else(|| detail.get("duration"))
+        .and_then(|x| x.as_i64());
+    let unit = window
+        .and_then(|w| w.get("timeUnit"))
+        .or_else(|| item.get("timeUnit"))
+        .or_else(|| detail.get("timeUnit"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+    match duration {
+        Some(d) if unit.contains("MINUTE") && d >= 60 && d % 60 == 0 => {
+            // A week is a week, not a hundred and sixty-eight hours.
+            let hours = d / 60;
+            if hours >= 24 && hours % 24 == 0 {
+                format!("{}d limit", hours / 24)
+            } else {
+                format!("{hours}h limit")
+            }
+        }
+        Some(d) if unit.contains("MINUTE") => format!("{d}m limit"),
+        Some(d) if unit.contains("HOUR") => format!("{d}h limit"),
+        Some(d) if unit.contains("DAY") => format!("{d}d limit"),
+        _ => format!("Limit #{}", index + 1),
+    }
+}
+
+/// How long a Kimi limit runs, in minutes.
+fn kimi_minutes(item: &serde_json::Value, detail: &serde_json::Value) -> i64 {
+    let window = item.get("window").filter(|w| w.is_object());
+    let duration = window
+        .and_then(|w| w.get("duration"))
+        .or_else(|| item.get("duration"))
+        .or_else(|| detail.get("duration"))
+        .and_then(|x| x.as_i64())
+        .unwrap_or(0);
+    let unit = window
+        .and_then(|w| w.get("timeUnit"))
+        .or_else(|| item.get("timeUnit"))
+        .or_else(|| detail.get("timeUnit"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+    if unit.contains("MINUTE") {
+        duration
+    } else if unit.contains("HOUR") {
+        duration * 60
+    } else if unit.contains("DAY") {
+        duration * 24 * 60
+    } else {
+        0
+    }
+}
+
+/// When a Kimi limit resets, when it says.
+fn kimi_reset(item: &serde_json::Value, detail: &serde_json::Value) -> i64 {
+    for key in ["reset_at", "resetAt", "reset_time", "resetTime"] {
+        if let Some(v) = detail.get(key).or_else(|| item.get(key)).and_then(|x| x.as_str()) {
+            let t = parse_resets_at(&serde_json::Value::String(v.to_string()));
+            if t > 0 {
+                return t;
+            }
+        }
+    }
+    for key in ["reset_in", "resetIn", "ttl"] {
+        if let Some(seconds) = detail.get(key).or_else(|| item.get(key)).and_then(|x| x.as_i64()) {
+            if seconds > 0 {
+                return now_secs() + seconds;
+            }
+        }
+    }
+    0
+}
+
+/// DeepSeek's balance: the money in the account.
+fn parse_deepseek_balance(v: &serde_json::Value) -> Vec<LiveQuota> {
+    let Some(infos) = v.get("balance_infos").and_then(|x| x.as_array()) else { return Vec::new() };
+    let Some(first) = infos.first() else { return Vec::new() };
+    let number = |key: &str| {
+        first
+            .get(key)
+            .and_then(|x| x.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
+    let total = number("total_balance");
+    if total <= 0.0 {
+        return Vec::new();
+    }
+    let currency = first.get("currency").and_then(|x| x.as_str()).unwrap_or("");
+    vec![LiveQuota {
+        agent: "DeepSeek".into(),
+        window: "balance".into(),
+        plan: String::new(),
+        detail: if currency.is_empty() {
+            "Account balance".into()
+        } else {
+            format!("Account balance ({currency})")
+        },
+        balance: total,
+        ..Default::default()
+    }]
+}
+
+// ------------------------------------------------------ the user's own providers
+
+/// A provider the user added themselves.
+///
+/// Not every service worth watching answers with a shape Cinder knows. A
+/// provider added here is a URL, a token and where in the answer the
+/// percentage is.
+#[derive(Clone)]
+struct CustomProvider {
+    name: String,
+    url: String,
+    token: String,
+    /// Where the percentage is, as a dotted path.
+    percent: String,
+    /// Where the reset time is, when the answer has one.
+    reset: String,
+    /// Where the label is, when the answer has one.
+    detail: String,
+}
+
+/// The providers the user added, read from `~/.cinder/providers.json`.
+fn custom_providers(home: &Path) -> Vec<CustomProvider> {
+    let path = home.join(".cinder").join("providers.json");
+    let Some(v) = read_json(&path) else { return Vec::new() };
+    let Some(list) = v.get("providers").and_then(|x| x.as_array()) else { return Vec::new() };
+    list.iter()
+        .filter_map(|p| {
+            Some(CustomProvider {
+                name: p.get("name")?.as_str()?.to_string(),
+                url: p.get("url")?.as_str()?.to_string(),
+                token: p.get("token")?.as_str()?.to_string(),
+                percent: p.get("percent").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                reset: p.get("reset").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                detail: p.get("detail").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            })
+        })
+        .filter(|p| !p.name.is_empty() && !p.url.is_empty() && !p.percent.is_empty())
+        .collect()
+}
+
+/// The value at a dotted path: "data.usage.percent" or "limits.0.percent".
+fn json_path<'a>(v: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let mut current = v;
+    for part in path.split('.') {
+        if part.is_empty() {
+            continue;
+        }
+        current = match current {
+            serde_json::Value::Object(m) => m.get(part)?,
+            serde_json::Value::Array(a) => a.get(part.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    Some(current)
+}
+
+/// The percentage at a path: a number, or a share of a used and a limit.
+fn percent_at(v: &serde_json::Value, path: &str) -> Option<f64> {
+    let at = json_path(v, path)?;
+    if let Some(n) = at.as_f64() {
+        return Some(n.clamp(0.0, 100.0));
+    }
+    let used = at.get("used").and_then(|x| x.as_f64())?;
+    let limit = at.get("limit").and_then(|x| x.as_f64())?;
+    if limit <= 0.0 {
+        return None;
+    }
+    Some((used / limit * 100.0).clamp(0.0, 100.0))
+}
+
+/// The window a custom provider answers with.
+fn parse_custom(provider: &CustomProvider, v: &serde_json::Value) -> Vec<LiveQuota> {
+    let Some(pct) = percent_at(v, &provider.percent) else { return Vec::new() };
+    let resets_at = json_path(v, &provider.reset)
+        .map(|x| match x {
+            serde_json::Value::String(s) => parse_resets_at(&serde_json::Value::String(s.clone())),
+            serde_json::Value::Number(n) => n.as_i64().unwrap_or(0),
+            _ => 0,
+        })
+        .unwrap_or(0);
+    let detail = json_path(v, &provider.detail)
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    vec![LiveQuota {
+        agent: provider.name.clone(),
+        window: provider.name.clone(),
+        used_percent: pct,
+        window_minutes: 0,
+        resets_at,
+        plan: String::new(),
+        detail,
+        ..Default::default()
+    }]
+}
+
 // ------------------------------------------------------------- provider state
 
 /// What is known about one provider between refreshes.
@@ -1460,19 +1878,19 @@ fn benched(agent: &str, now: i64) -> Option<QuotaReport> {
 ///
 /// The future is only awaited when the provider is not benched, so a provider
 /// that is left alone after failing does not touch the network at all.
-async fn run_provider<F>(agent: &str, fetch: F, timeout: Duration) -> QuotaReport
+async fn run_provider<F>(agent: String, fetch: F, timeout: Duration) -> QuotaReport
 where
     F: std::future::Future<Output = QuotaReport> + Send,
 {
     let now = now_secs();
-    if let Some(report) = benched(agent, now) {
+    if let Some(report) = benched(&agent, now) {
         return report;
     }
     let result = tokio::time::timeout(timeout, fetch).await;
     match result {
         Ok(report) => settle(report, now_secs()),
         Err(_) => settle(
-            QuotaReport::failed(agent, ErrorKind::Timeout, "the provider did not answer in time"),
+            QuotaReport::failed(&agent, ErrorKind::Timeout, "the provider did not answer in time"),
             now_secs(),
         ),
     }
@@ -1531,35 +1949,96 @@ pub async fn fetch_all_with(home: &Path, endpoints: &Endpoints) -> Vec<QuotaRepo
     let mut set = tokio::task::JoinSet::new();
     for cred in claude_creds.iter() {
         set.spawn(run_provider(
-            "Claude Code",
+            "Claude Code".to_string(),
             claude_code(client.clone(), endpoints.clone(), cred.clone(), many_claude),
             PROVIDER_TIMEOUT,
         ));
     }
     for cred in codex_creds.iter() {
         set.spawn(run_provider(
-            "Codex",
+            "Codex".to_string(),
             codex(client.clone(), endpoints.clone(), cred.clone(), many_codex),
             PROVIDER_TIMEOUT,
         ));
     }
     set.spawn(run_provider(
-        "GitHub Copilot",
+        "GitHub Copilot".to_string(),
         copilot(client.clone(), endpoints.clone(), home.to_path_buf()),
         PROVIDER_TIMEOUT,
     ));
     set.spawn(run_provider(
-        "Gemini CLI",
+        "Gemini CLI".to_string(),
         gemini_cli(client.clone(), endpoints.clone(), home.to_path_buf()),
         PROVIDER_TIMEOUT,
     ));
     set.spawn(run_provider(
-        "OpenCode",
+        "OpenCode".to_string(),
         opencode(client.clone(), endpoints.clone(), home.to_path_buf()),
         PROVIDER_TIMEOUT,
     ));
 
-    let mut reports = Vec::new();
+    // The providers that answer with one JSON document.
+    let mut broken = Vec::new();
+    for provider in PROVIDERS {
+        let (token, problems) = (provider.credential)(home);
+        let Some(token) = token else {
+            // No sign-in is not a problem; a sign-in that cannot be read is.
+            if !problems.is_empty() {
+                broken.push(unmatched(provider.agent, problems));
+            }
+            continue;
+        };
+        let url = provider.url.to_string();
+        let headers: Vec<(&str, &str)> = provider.headers.to_vec();
+        let parse = provider.parse;
+        let agent = provider.agent;
+        let client = client.clone();
+        set.spawn(run_provider(
+            agent.to_string(),
+            async move {
+                let v = match get_json(&client, &url, &token, &headers).await {
+                    Ok(v) => v,
+                    Err(e) => return QuotaReport::failed(agent, e.kind(), e.message()),
+                };
+                let windows = parse(&v);
+                if windows.is_empty() {
+                    return QuotaReport::failed(agent, ErrorKind::BadPayload, "unexpected usage payload");
+                }
+                let mut report = QuotaReport::ok(agent, windows);
+                report.updated_at = now_secs();
+                report
+            },
+            PROVIDER_TIMEOUT,
+        ));
+    }
+
+    // The providers the user added themselves.
+    for provider in custom_providers(home) {
+        let url = provider.url.clone();
+        let token = provider.token.clone();
+        let name = provider.name.clone();
+        let parse_provider = provider.clone();
+        let client = client.clone();
+        set.spawn(run_provider(
+            name.clone(),
+            async move {
+                let v = match get_json(&client, &url, &token, &[]).await {
+                    Ok(v) => v,
+                    Err(e) => return QuotaReport::failed(&name, e.kind(), e.message()),
+                };
+                let windows = parse_custom(&parse_provider, &v);
+                if windows.is_empty() {
+                    return QuotaReport::failed(&name, ErrorKind::BadPayload, "unexpected usage payload");
+                }
+                let mut report = QuotaReport::ok(&name, windows);
+                report.updated_at = now_secs();
+                report
+            },
+            PROVIDER_TIMEOUT,
+        ));
+    }
+
+    let mut reports = broken;
     // A sign-in that could not be read is worth a card of its own: the user
     // is signed in and something is wrong, and saying nothing would be a lie.
     for (agent, problems, has_account) in [
@@ -2037,7 +2516,7 @@ mod tests {
         let server = MockServer::start(vec![Reply::slow(r#"{"ok":true}"#, 400)]);
         let rt = tokio::runtime::Runtime::new().unwrap();
         let report = rt.block_on(run_provider(
-            "Slow Provider",
+            "Slow Provider".to_string(),
             async {
                 get_json(&server.client(), &server.url("/usage"), "t", &[])
                     .await
@@ -2127,6 +2606,155 @@ mod tests {
         assert_eq!(body["grant_type"], "refresh_token");
         assert_eq!(body["client_id"], "client-1");
         assert_eq!(body["refresh_token"], "refresh-1");
+    }
+
+    #[test]
+    fn a_provider_the_user_added_is_read_from_their_own_file() {
+        let home = std::env::temp_dir().join(format!("cinder-custom-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".cinder")).unwrap();
+        std::fs::write(
+            home.join(".cinder/providers.json"),
+            r#"{"providers": [
+                {"name": "My Router", "url": "https://api.example.com/usage", "token": "sk-x",
+                 "percent": "data.usage.percent", "reset": "data.usage.reset_at", "detail": "data.usage.label"}
+            ]}"#,
+        )
+        .unwrap();
+        let providers = custom_providers(&home);
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].name, "My Router");
+        assert_eq!(providers[0].percent, "data.usage.percent");
+
+        // The answer is read at the path the user gave.
+        let v = json!({"data": {"usage": {"percent": 37.5, "reset_at": "2026-10-26T18:59:59Z", "label": "Monthly"}}});
+        let w = parse_custom(&providers[0], &v);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].agent, "My Router");
+        assert_eq!(w[0].used_percent, 37.5);
+        assert_eq!(w[0].detail, "Monthly");
+        assert!(w[0].resets_at > 0);
+        // A path that is not there is no window.
+        assert!(parse_custom(&providers[0], &json!({"data": {}})).is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_percentage_may_be_a_share_of_a_used_and_a_limit() {
+        let v = json!({"data": {"usage": {"used": 25, "limit": 100}}});
+        assert_eq!(percent_at(&v, "data.usage"), Some(25.0));
+        assert_eq!(percent_at(&v, "data.nothing"), None);
+        assert_eq!(percent_at(&v, "data.usage.used"), Some(25.0));
+    }
+
+    #[test]
+    fn a_dotted_path_walks_into_objects_and_arrays() {
+        let v = json!({"limits": [{"percent": 12}, {"percent": 34}]});
+        assert_eq!(json_path(&v, "limits.1.percent").and_then(|x| x.as_f64()), Some(34.0));
+        assert_eq!(json_path(&v, "limits.9.percent"), None);
+        assert_eq!(json_path(&v, "nothing.here"), None);
+    }
+
+    #[test]
+    fn the_openrouter_credits_are_read_as_a_window() {
+        let v = json!({"data": {"total_credits": 50.0, "total_usage": 12.5}});
+        let w = parse_openrouter_credits(&v);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].agent, "OpenRouter");
+        assert_eq!(w[0].used_percent, 25.0);
+        assert!(w[0].detail.contains("$12.50"), "got: {}", w[0].detail);
+        assert!(w[0].detail.contains("$50.00"));
+        // An answer with nothing in it is not a window.
+        assert!(parse_openrouter_credits(&json!({"data": {}})).is_empty());
+    }
+
+    #[test]
+    fn the_kimi_limits_are_read_as_windows() {
+        // The shape the Kimi CLI's own code reads.
+        let v = json!({
+            "usage": {"name": "Weekly limit", "used": 30, "limit": 100},
+            "limits": [
+                {"name": "5-hour session", "window": {"duration": 300, "timeUnit": "MINUTE"},
+                 "detail": {"used": 10, "limit": 100, "reset_in": 3600}},
+                {"window": {"duration": 10080, "timeUnit": "MINUTE"},
+                 "detail": {"used": 40, "remaining": 60}}
+            ]
+        });
+        let w = parse_kimi_usage(&v);
+        assert_eq!(w.len(), 3);
+        assert_eq!(w[0].window, "Weekly limit");
+        assert_eq!(w[0].used_percent, 30.0);
+        assert_eq!(w[1].window, "5-hour session");
+        assert_eq!(w[1].used_percent, 10.0);
+        assert_eq!(w[1].window_minutes, 300);
+        assert!(w[1].resets_at > now_secs(), "a reset countdown becomes a moment");
+        // A limit with no name is named after how long it runs.
+        assert_eq!(w[2].window, "7d limit");
+        assert_eq!(w[2].window_minutes, 7 * 24 * 60);
+        // "remaining" is turned into what has been used.
+        assert_eq!(w[2].used_percent, 40.0);
+    }
+
+    #[test]
+    fn the_deepseek_balance_is_read_as_money() {
+        let v = json!({"balance_infos": [
+            {"currency": "CNY", "total_balance": "110.00", "granted_balance": "10.00", "topped_up_balance": "100.00"}
+        ]});
+        let w = parse_deepseek_balance(&v);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].agent, "DeepSeek");
+        assert_eq!(w[0].balance, 110.0);
+        assert!(w[0].detail.contains("CNY"));
+        // A balance is not a window, so it carries no percentage.
+        assert_eq!(w[0].used_percent, 0.0);
+        assert!(parse_deepseek_balance(&json!({"balance_infos": []})).is_empty());
+    }
+
+    #[test]
+    fn a_key_is_found_where_the_agents_keep_it() {
+        let home = std::env::temp_dir().join(format!("cinder-keys-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".pi/agent")).unwrap();
+        std::fs::write(
+            home.join(".pi/agent/models.json"),
+            r#"{"providers": {"openrouter": {"models": [{"id": "x", "apiKey": "sk-the-key"}]}}}"#,
+        )
+        .unwrap();
+        let (key, problems) = openrouter_credential(&home);
+        assert_eq!(key.as_deref(), Some("sk-the-key"));
+        assert!(problems.is_empty());
+        // A provider that is not there has no key, and that is not a problem.
+        let (key, problems) = deepseek_credential(&home);
+        assert!(key.is_none());
+        assert!(problems.is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_kimi_sign_in_is_read_from_where_the_cli_keeps_it() {
+        let home = std::env::temp_dir().join(format!("cinder-kimi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".kimi/credentials")).unwrap();
+        std::fs::write(
+            home.join(".kimi/credentials/oauth-kimi-code.json"),
+            r#"{"access_token": "the-token"}"#,
+        )
+        .unwrap();
+        let (key, problems) = kimi_credential(&home);
+        assert_eq!(key.as_deref(), Some("the-token"));
+        assert!(problems.is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn every_provider_cinder_asks_has_a_name_and_a_parser() {
+        for provider in PROVIDERS {
+            assert!(!provider.agent.is_empty());
+            assert!(provider.url.starts_with("https://"));
+            // The parser of a provider that was asked for is never empty.
+            let empty = (provider.parse)(&serde_json::json!({}));
+            assert!(empty.is_empty(), "{} should not make a window of nothing", provider.agent);
+        }
     }
 
     #[test]
@@ -2362,7 +2990,7 @@ mod tests {
         ]);
         let rt = tokio::runtime::Runtime::new().unwrap();
         let first = rt.block_on(run_provider(
-            "Benched Provider",
+            "Benched Provider".to_string(),
             async {
                 get_json(&server.client(), &server.url("/usage"), "t", &[])
                     .await
@@ -2376,7 +3004,7 @@ mod tests {
         // The second attempt inside the bench window does not reach the
         // network at all.
         let second = rt.block_on(run_provider(
-            "Benched Provider",
+            "Benched Provider".to_string(),
             async {
                 get_json(&server.client(), &server.url("/usage"), "t", &[])
                     .await
