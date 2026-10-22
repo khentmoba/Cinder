@@ -28,18 +28,32 @@ if (!existsSync(path)) {
 
 const db = new DatabaseSync(path, { readOnly: true });
 
+// The current schema keeps the messages in session_message, with the model
+// and the content inside the message. The older one keeps them in message
+// and their parts in part. A database that has both holds the old messages
+// twice over, so only one of the two is read.
+const hasCurrent = db
+  .prepare('select count(*) c from session_message')
+  .get().c > 0;
+const rows = hasCurrent
+  ? db
+      .prepare(
+        `SELECT time_created AS ts, data FROM session_message
+         WHERE type = 'assistant' AND json_valid(data)`
+      )
+      .all()
+  : db
+      .prepare(
+        `SELECT time_created AS ts, data FROM message
+         WHERE json_valid(data) AND json_extract(data,'$.role') = 'assistant'`
+      )
+      .all();
+
 // The same day the collector uses: a unix second, whatever the column holds.
 const dayOf = (ts) => {
   const secs = ts > 1000000000000 ? Math.floor(ts / 1000) : ts;
   return new Date(secs * 1000).toISOString().slice(0, 10);
 };
-
-const rows = db
-  .prepare(
-    `SELECT time_created AS ts, data FROM message
-     WHERE json_valid(data) AND json_extract(data,'$.role') = 'assistant'`
-  )
-  .all();
 
 const perModel = new Map();
 let requests = 0;
@@ -52,9 +66,11 @@ for (const row of rows) {
   }
   const d = dayOf(row.ts);
   if (d !== day) continue;
-  const provider = typeof v.providerID === 'string' && v.providerID ? v.providerID : null;
-  const id = typeof v.modelID === 'string' && v.modelID ? v.modelID : 'unknown';
-  const model = provider ? `${provider}/${id}` : id;
+  const model = hasCurrent
+    ? `${(v.model && v.model.providerID) || ''}/${(v.model && v.model.id) || 'unknown'}`
+    : v.providerID
+      ? `${v.providerID}/${v.modelID || 'unknown'}`
+      : v.modelID || 'unknown';
   const t = v.tokens || {};
   const cache = t.cache || {};
   const e = perModel.get(model) || [0, 0, 0, 0, 0];

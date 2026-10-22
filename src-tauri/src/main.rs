@@ -1169,8 +1169,14 @@ fn parse_opencode(
     let Some((mtime_ns, size)) = file_stamp(&db) else {
         return 0;
     };
+    // The database is written in write-ahead mode, so a message that was
+    // written a moment ago may still be in the log beside it and not in the
+    // file itself. The stamp of that log is part of the key, or the numbers
+    // would sit still until the next checkpoint.
+    let wal = db.with_extension("wal");
+    let wal_stamp = file_stamp(&wal).unwrap_or((0, 0));
     if let Some(cached) = &cache.opencode_db {
-        if cached.mtime_ns == mtime_ns && cached.size == size {
+        if cached.mtime_ns == mtime_ns && cached.size == size && cached.wal == wal_stamp {
             for r in &cached.rows {
                 add(rows, sess, &r.agent, &r.model, &r.day, r.clone());
             }
@@ -1234,8 +1240,32 @@ fn parse_opencode(
     // few hundred thousand messages, while SQLite does the same sum in well
     // under a second. Messages that report a cost are kept apart from those
     // that do not, because the two are priced differently.
+    // The current schema keeps the messages in `session_message`, with the
+    // model and the content inside the message. The older one keeps them in
+    // `message` and their parts in `part`. A database that has both holds
+    // the old messages twice over, so only one of the two may be read.
+    let current = conn
+        .query_row("SELECT COUNT(*) FROM session_message", [], |r| r.get::<_, i64>(0))
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    let (message_table, provider_col, model_col, assistant) = if current {
+        (
+            "session_message",
+            "json_extract(m.data,'$.model.providerID')",
+            "json_extract(m.data,'$.model.id')",
+            "m.type = 'assistant'",
+        )
+    } else {
+        (
+            "message",
+            "json_extract(m.data,'$.providerID')",
+            "json_extract(m.data,'$.modelID')",
+            "json_extract(m.data,'$.role') = 'assistant'",
+        )
+    };
     let day_expr = "date(CASE WHEN m.time_created > 1000000000000 THEN m.time_created/1000 ELSE m.time_created END,'unixepoch')";
-    let columns = "json_extract(m.data,'$.providerID'), json_extract(m.data,'$.modelID'),
+    let columns = format!(
+        "{provider_col}, {model_col},
                    COUNT(*),
                    SUM(COALESCE(json_extract(m.data,'$.tokens.input'),0)),
                    SUM(COALESCE(json_extract(m.data,'$.tokens.output'),0)),
@@ -1243,7 +1273,8 @@ fn parse_opencode(
                    SUM(COALESCE(json_extract(m.data,'$.tokens.cache.write'),0)),
                    SUM(COALESCE(json_extract(m.data,'$.tokens.reasoning'),0)),
                    SUM(COALESCE(json_extract(m.data,'$.cost'),0)),
-                   json_extract(m.data,'$.cost') IS NOT NULL";
+                   json_extract(m.data,'$.cost') IS NOT NULL"
+    );
     // One grouped row of assistant messages.
     struct MsgGroup {
         day: String,
@@ -1266,16 +1297,16 @@ fn parse_opencode(
     let candidates = [
         format!(
             "SELECT {day_expr} AS d, {columns}, s.directory, s.parent_id IS NOT NULL
-             FROM message m LEFT JOIN {} s ON m.session_id = s.id
-             WHERE json_valid(m.data) AND json_extract(m.data,'$.role') = 'assistant'
-             GROUP BY d, 1, 2, 3, 11, 12",
+             FROM {message_table} m LEFT JOIN {} s ON m.session_id = s.id
+             WHERE json_valid(m.data) AND {assistant}
+             GROUP BY d, 2, 3, 12, 13",
             table
         ),
         format!(
             "SELECT {day_expr} AS d, {columns}, NULL, NULL
-             FROM message m
-             WHERE json_valid(m.data) AND json_extract(m.data,'$.role') = 'assistant'
-             GROUP BY d, 1, 2, 3"
+             FROM {message_table} m
+             WHERE json_valid(m.data) AND {assistant}
+             GROUP BY d, 2, 3"
         ),
     ];
     for sql in candidates {
@@ -1333,7 +1364,7 @@ fn parse_opencode(
             }
             add(&mut db_rows, &mut db_sess, "OpenCode", &model, &g.day, r);
         }
-    } else if let Ok(mut stmt) = conn.prepare("SELECT data, time_created, session_id FROM message") {
+    } else if let Ok(mut stmt) = conn.prepare(&format!("SELECT data, time_created, session_id FROM {message_table}")) {
         // An older schema without the token fields: fall back to reading the
         // messages one by one.
         if let Ok(it) = stmt.query_map([], |r| {
@@ -1345,7 +1376,11 @@ fn parse_opencode(
         }) {
             for (data, ts, session_id) in it.flatten() {
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else { continue };
-                if v.get("role").and_then(|x| x.as_str()) != Some("assistant") {
+                if current {
+                    if v.get("type").and_then(|x| x.as_str()) != Some("assistant") {
+                        continue;
+                    }
+                } else if v.get("role").and_then(|x| x.as_str()) != Some("assistant") {
                     continue;
                 }
                 let model = opencode_model(&v);
@@ -1388,24 +1423,50 @@ fn parse_opencode(
     // Group tools in SQLite instead of transferring each call's JSON. The
     // session table carries the working directory, but an older schema does
     // not have that column, so the join is only used when it works.
-    let joined = format!(
-        "SELECT json_extract(m.data, '$.providerID'), json_extract(m.data, '$.modelID'),
-                      date(p.time_created/1000,'unixepoch'), s.directory, COUNT(*)
-               FROM part p JOIN message m ON p.message_id = m.id
-               LEFT JOIN {} s ON m.session_id = s.id
-               WHERE json_valid(p.data) AND json_valid(m.data) AND json_extract(p.data, '$.type') = 'tool'
-               GROUP BY 1, 2, 3, 4",
-        table
-    );
-    let plain = "SELECT json_extract(m.data, '$.providerID'), json_extract(m.data, '$.modelID'),
+    //
+    // The current schema keeps the content inside the message, so the tool
+    // calls are counted from it; the older one keeps the parts in their own
+    // table.
+    let tools_sql = if current {
+        [
+            format!(
+                "SELECT {provider_col}, {model_col},
+                        date(CASE WHEN m.time_created > 1000000000000 THEN m.time_created/1000 ELSE m.time_created END,'unixepoch'), s.directory, COUNT(*)
+                 FROM {message_table} m LEFT JOIN {} s ON m.session_id = s.id, json_each(m.data,'$.content')
+                 WHERE json_valid(m.data) AND {assistant} AND json_extract(value,'$.type') = 'tool'
+                 GROUP BY 1, 2, 3, 4",
+                table
+            ),
+            format!(
+                "SELECT {provider_col}, {model_col},
+                        date(CASE WHEN m.time_created > 1000000000000 THEN m.time_created/1000 ELSE m.time_created END,'unixepoch'), NULL, COUNT(*)
+                 FROM {message_table} m, json_each(m.data,'$.content')
+                 WHERE json_valid(m.data) AND {assistant} AND json_extract(value,'$.type') = 'tool'
+                 GROUP BY 1, 2, 3"
+            ),
+        ]
+    } else {
+        [
+            format!(
+                "SELECT json_extract(m.data, '$.providerID'), json_extract(m.data, '$.modelID'),
+                        date(p.time_created/1000,'unixepoch'), s.directory, COUNT(*)
+                 FROM part p JOIN message m ON p.message_id = m.id
+                 LEFT JOIN {} s ON m.session_id = s.id
+                 WHERE json_valid(p.data) AND json_valid(m.data) AND json_extract(p.data, '$.type') = 'tool'
+                 GROUP BY 1, 2, 3, 4",
+                table
+            ),
+            "SELECT json_extract(m.data, '$.providerID'), json_extract(m.data, '$.modelID'),
                         date(p.time_created/1000,'unixepoch'), NULL, COUNT(*)
                  FROM part p JOIN message m ON p.message_id = m.id
                  WHERE json_valid(p.data) AND json_valid(m.data) AND json_extract(p.data, '$.type') = 'tool'
-                 GROUP BY 1, 2, 3";
+                 GROUP BY 1, 2, 3".to_string(),
+        ]
+    };
     // One grouped row of tool calls: (provider, model, day, directory, calls).
     type ToolRow = (Option<String>, Option<String>, Option<String>, Option<String>, u64);
     let mut tools_by_row: Vec<ToolRow> = Vec::new();
-    for sql in [joined.as_str(), plain] {
+    for sql in tools_sql.iter() {
         let Ok(mut stmt) = conn.prepare(sql) else { continue };
         let Ok(it) = stmt.query_map([], |r| {
             Ok((
@@ -1437,6 +1498,7 @@ fn parse_opencode(
     cache.opencode_db = Some(CachedDb {
         mtime_ns,
         size,
+        wal: wal_stamp,
         count,
         rows: db_rows.into_values().collect(),
         sessions: db_sess.into_keys().collect(),
@@ -1445,9 +1507,23 @@ fn parse_opencode(
     count
 }
 
+/// The model a message ran on.
+///
+/// The current schema keeps it in an object, with the provider and the id
+/// in it; the older one had the two fields at the top of the message.
 fn opencode_model(message: &serde_json::Value) -> String {
-    let id = message["modelID"].as_str().unwrap_or("unknown");
-    match message["providerID"].as_str().filter(|p| !p.is_empty()) {
+    let model = message.get("model").filter(|m| m.is_object());
+    let id = model
+        .and_then(|m| m.get("id"))
+        .and_then(|x| x.as_str())
+        .or_else(|| message["modelID"].as_str())
+        .unwrap_or("unknown");
+    let provider = model
+        .and_then(|m| m.get("providerID"))
+        .and_then(|x| x.as_str())
+        .or_else(|| message["providerID"].as_str())
+        .filter(|p| !p.is_empty());
+    match provider {
         Some(provider) => pricing::normalize_model(&format!("{}/{}", provider, id)),
         None => pricing::normalize_model(id),
     }

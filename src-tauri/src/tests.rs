@@ -311,6 +311,64 @@ fn opencode_uses_message_dates_models_and_request_counts() {
     }
 }
 
+/// The current OpenCode schema keeps the messages in `session_message`, with
+/// the model and the content inside the message, and the parts table is left
+/// behind.
+///
+/// A database that has both tables holds the old messages twice over, so only
+/// the current one may be read.
+#[test]
+fn the_current_opencode_schema_is_read() {
+    let home = Home::new();
+    let db = home.db(".local/share/opencode/opencode.db");
+    db.execute_batch("CREATE TABLE session_v2 (id TEXT, directory TEXT, parent_id TEXT, time_created INTEGER);
+        INSERT INTO session_v2 VALUES ('s', '/work/project', NULL, 1767225600000);
+        CREATE TABLE session_message (id TEXT, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);
+        CREATE TABLE message (id TEXT, session_id TEXT, data TEXT, time_created INTEGER);
+        CREATE TABLE part (message_id TEXT, data TEXT, time_created INTEGER);").unwrap();
+    // The old table, with the same messages in it, to make sure they are not
+    // counted twice.
+    for (id, model, ts, input) in [
+        ("a", "gpt-5", 1767225600000_i64, 100),
+        ("b", "gpt-4.1", 1767312000000, 200),
+    ] {
+        let data = json!({"model": {"id": model, "providerID": "openai", "variant": "max"},
+            "tokens": {"input": input, "output": 10, "reasoning": 2, "cache": {"read": 20, "write": 5}},
+            "cost": 1.0,
+            "content": [{"type": "text", "text": "hi"}, {"type": "tool", "id": "t1", "name": "read"}]})
+        .to_string();
+        db.execute(
+            "INSERT INTO session_message VALUES (?, 's', 'assistant', 1, ?, ?, ?)",
+            rusqlite::params![id, ts, ts, data],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO message VALUES (?, 's', ?, ?)",
+            rusqlite::params![id, data, ts],
+        )
+        .unwrap();
+    }
+    // A user message and a broken one are not requests.
+    db.execute("INSERT INTO session_message VALUES ('u', 's', 'user', 0, 1767225600000, 1767225600000, '{}')", []).unwrap();
+    db.execute("INSERT INTO session_message VALUES ('bad', 's', 'assistant', 2, 1767225600000, 1767225600000, 'not JSON')", []).unwrap();
+
+    let stats = scan_home(&home.0, &|_| {});
+    let first = stats.rows.iter().find(|r| r.day == "2026-01-01").expect("the OpenCode row should be there");
+    assert_eq!(first.model, "openai/gpt-5");
+    assert_eq!(first.requests, 1, "the old table must not be counted as well");
+    assert_eq!(first.input, 100);
+    assert_eq!(first.output, 10);
+    assert_eq!(first.cache_read, 20);
+    assert_eq!(first.cache_write, 5);
+    assert_eq!(first.reasoning, 2);
+    assert_eq!(first.tools, 1, "the tool call is inside the message");
+    assert_eq!(first.cost, 1.0);
+    assert_eq!(first.project, "project");
+    let second = stats.rows.iter().find(|r| r.day == "2026-01-02").expect("the second day should be there");
+    assert_eq!(second.model, "openai/gpt-4.1");
+    assert_eq!((second.requests, second.input, second.tools), (1, 200, 1));
+}
+
 /// DSH keeps its sessions as zstd-compressed JSONL.
 ///
 /// The fixture is the shape the real files have: a `session` line with the
