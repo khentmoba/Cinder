@@ -369,6 +369,7 @@ powershell -File scripts/check-logs.ps1 -Agent OpenCode              # OpenCode
 powershell -File scripts/check-logs.ps1 -Agent DSH                   # DSH
 powershell -File scripts/check-logs.ps1 -Agent Antigravity           # T3's Antigravity
 powershell -File scripts/check-logs.ps1 -Agent Codex 2026-10-19 2026-10-20
+node scripts/check-today-figure.mjs                                  # what the popover calls today
 ```
 
 `scripts/check-claude-logs.mjs`, `scripts/check-codex-logs.mjs`,
