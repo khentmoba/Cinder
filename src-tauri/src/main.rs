@@ -1253,7 +1253,10 @@ fn parse_opencode(
             "session_message",
             "json_extract(m.data,'$.model.providerID')",
             "json_extract(m.data,'$.model.id')",
-            "m.type = 'assistant'",
+            // A compaction is a model call of its own: the summary it wrote
+            // cost tokens, and they are spent whether or not the messages it
+            // replaced are still there.
+            "m.type IN ('assistant','compaction')",
         )
     } else {
         (

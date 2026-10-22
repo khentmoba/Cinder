@@ -39,7 +39,7 @@ const rows = hasCurrent
   ? db
       .prepare(
         `SELECT time_created AS ts, data FROM session_message
-         WHERE type = 'assistant' AND json_valid(data)`
+         WHERE type IN ('assistant','compaction') AND json_valid(data)`
       )
       .all()
   : db

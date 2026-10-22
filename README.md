@@ -71,6 +71,31 @@ not take the rest of the dashboard with it. The **Data sources** panel says
 which source failed and why, so a gap in the numbers is explained rather than
 just missing.
 
+### OpenCode, precisely
+
+OpenCode writes its usage into a SQLite database that is kept in write-ahead
+mode, and it has changed shape: the current version keeps the messages in
+`session_message`, with the model and the content inside the message, while
+the older `message` table is left behind holding a copy of the older ones.
+Only the current table is read — the old one holds the same messages, so
+reading both would count them twice. The stamp of the write-ahead log beside
+the database is part of the cache key, so a message written a moment ago
+counts even before it is checkpointed into the file.
+
+Two things are worth knowing about the numbers:
+
+- a **compaction** is a model call of its own, and the tokens it cost are
+  counted, even though the messages it replaced may be gone;
+- the tokens of messages OpenCode has **deleted** — a branch or a revert
+  takes them away — are counted by OpenCode's own session totals but cannot
+  be read from the log, because no message is left to read them from. They
+  are about 0.4% of the input tokens on a machine with a long history, and
+  no reader can do better.
+
+`scripts/check-opencode-logs.mjs` reads the same database with an
+implementation that shares no code with the collector, and the two have to
+agree line for line.
+
 Daily ranges use UTC dates; **Today** is a UTC calendar day, not a rolling
 24-hour window. Costs marked **≥** exclude some unpriced token usage. Codex
 cache counts are kept as reported, without borrowing ratios from other agents.

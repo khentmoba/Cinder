@@ -351,18 +351,30 @@ fn the_current_opencode_schema_is_read() {
     // A user message and a broken one are not requests.
     db.execute("INSERT INTO session_message VALUES ('u', 's', 'user', 0, 1767225600000, 1767225600000, '{}')", []).unwrap();
     db.execute("INSERT INTO session_message VALUES ('bad', 's', 'assistant', 2, 1767225600000, 1767225600000, 'not JSON')", []).unwrap();
+    // A compaction is a model call of its own: the summary it wrote cost
+    // tokens, and those are spent whether or not the messages it replaced
+    // are still there.
+    db.execute(
+        "INSERT INTO session_message VALUES ('c', 's', 'compaction', 3, 1767225600000, 1767225600000, ?)",
+        [json!({"time": {"created": 1767225600000i64}, "status": "done", "reason": "auto",
+            "model": {"id": "gpt-5", "providerID": "openai", "variant": "max"},
+            "summary": "a summary", "cost": 0.5,
+            "tokens": {"input": 7, "output": 3, "reasoning": 0, "cache": {"read": 0, "write": 0}}})
+        .to_string()],
+    )
+    .unwrap();
 
     let stats = scan_home(&home.0, &|_| {});
     let first = stats.rows.iter().find(|r| r.day == "2026-01-01").expect("the OpenCode row should be there");
     assert_eq!(first.model, "openai/gpt-5");
-    assert_eq!(first.requests, 1, "the old table must not be counted as well");
-    assert_eq!(first.input, 100);
-    assert_eq!(first.output, 10);
+    assert_eq!(first.requests, 2, "the compaction is a request of its own");
+    assert_eq!(first.input, 107, "the compaction's own tokens are counted");
+    assert_eq!(first.output, 13);
     assert_eq!(first.cache_read, 20);
     assert_eq!(first.cache_write, 5);
     assert_eq!(first.reasoning, 2);
     assert_eq!(first.tools, 1, "the tool call is inside the message");
-    assert_eq!(first.cost, 1.0);
+    assert_eq!(first.cost, 1.5);
     assert_eq!(first.project, "project");
     let second = stats.rows.iter().find(|r| r.day == "2026-01-02").expect("the second day should be there");
     assert_eq!(second.model, "openai/gpt-4.1");
