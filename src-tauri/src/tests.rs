@@ -58,6 +58,30 @@ fn day_of(ts: &str) -> String {
     t.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string()
 }
 
+/// A timestamp that cannot be read keeps the date it carries.
+///
+/// The agents write their timestamps in UTC, but some of the logs carry a
+/// shape the reader does not know. A row is still filed under the date that
+/// timestamp names, rather than being dropped or filed under the wrong day.
+#[test]
+fn a_timestamp_that_cannot_be_read_keeps_the_date_it_carries() {
+    // A timestamp the reader knows.
+    assert_eq!(super::day_of("2026-01-01T00:00:00Z"), day_of("2026-01-01T00:00:00Z"));
+    // A timestamp with no time at all.
+    assert_eq!(super::day_of("2026-01-01"), "2026-01-01");
+    // A timestamp with a zone offset rather than Z.
+    assert_eq!(
+        super::day_of("2026-01-01T00:00:00+00:00"),
+        day_of("2026-01-01T00:00:00+00:00")
+    );
+    assert_eq!(
+        super::day_of("2026-01-01T00:00:00+08:00"),
+        day_of("2026-01-01T00:00:00+08:00")
+    );
+    // Nonsense does not take the row with it.
+    assert_eq!(super::day_of("not a timestamp"), "not a time");
+}
+
 #[test]
 fn cache_preserves_rows_and_sessions_and_detects_modification() {
     let home = Home::new();
