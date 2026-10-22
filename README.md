@@ -287,5 +287,37 @@ The Codex check is the interesting one: it pins down the split between cached
 and uncached input, the model switching in the middle of a file, and the
 forked rollouts that replay their parent's earlier turns.
 
+### Checking the popover against the provider's own numbers
+
+The numbers on the popover come from the provider's own quota API, and they
+are checked against the provider's own record of them:
+
+```bash
+node scripts/check-live-quota.mjs
+```
+
+The Codex CLI writes its copy of the limits into its own session log, so
+there are three numbers to compare: what the CLI wrote down, what the usage
+API answers now, and what Cinder reads out of that API. The first two are
+independent of each other — the CLI writes the server's answer into the log,
+and the second is a fresh fetch — so when they agree, the number on the
+popover is the provider's number:
+
+```
+the CLI wrote its limits at 2026-10-21T21:45:47.547Z
+  5-hour window  log  70%  api  70%  gap 0  reset the same
+  7-day window   log  89%  api  89%  gap 0  reset the same
+  the popover shows the provider's own numbers
+```
+
+The reset times have to match exactly; the percentages may have moved a
+little between the log being written and the fetch, so they are compared
+with a small tolerance.
+
+Anthropic sends the list of the windows the plan has, and says which of them
+are running. That list is the authority where it is there, so a session
+window that has just reset reads **not running** rather than pretending to
+be a window that is counting.
+
 Add agents by extending `parse_*` functions in `src-tauri/src/main.rs` and
 `src-tauri/src/agents.rs`.

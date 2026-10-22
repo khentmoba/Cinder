@@ -258,6 +258,9 @@ pub struct LimitRow {
     /// The size of that allowance, in dollars.
     #[serde(default)]
     pub limit_amount: f64,
+    /// True when the provider says this window is not running.
+    #[serde(default)]
+    pub inactive: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -2434,6 +2437,7 @@ fn scan_home_with(
                 detail: w.detail.clone(),
                 used_amount: w.used_amount,
                 limit_amount: w.limit_amount,
+                inactive: w.inactive,
             });
             live_windows.push(w);
         }

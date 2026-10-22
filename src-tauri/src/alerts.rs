@@ -204,6 +204,7 @@ mod tests {
             detail: "5-hour session window".into(),
             used_amount: 0.0,
             limit_amount: 0.0,
+            ..Default::default()
         }
     }
 

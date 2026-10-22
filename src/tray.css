@@ -98,6 +98,8 @@ button.icon:hover { color: var(--text); }
 
 .wrow { margin-bottom: 8px; }
 .wrow:last-child { margin-bottom: 0; }
+.wrow.idle .wname { color: var(--faint); }
+.wrow.idle .track { opacity: .5; }
 .wtop { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
 .wname { color: var(--dim); }
 .wpct { font-weight: 600; }

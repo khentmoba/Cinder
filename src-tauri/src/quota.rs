@@ -45,6 +45,13 @@ pub struct LiveQuota {
     /// The size of that allowance, in dollars.
     #[serde(default)]
     pub limit_amount: f64,
+    /// True when the provider says this window is not running.
+    ///
+    /// A window that has just reset is not the same as a window that is
+    /// being used: it is not counting anything, and it has no reset time
+    /// because there is nothing to reset.
+    #[serde(default)]
+    pub inactive: bool,
 }
 
 /// Why a provider could not be read.
@@ -688,6 +695,53 @@ fn percent(v: &serde_json::Value) -> Option<f64> {
     Some((used / total * 100.0).clamp(0.0, 100.0))
 }
 
+/// The name, the length and the description of a window the provider names.
+fn claude_window(kind: &str) -> (&'static str, i64, &'static str) {
+    match kind {
+        "session" | "five_hour" => ("5h", 300, "5-hour session window"),
+        "weekly_all" | "seven_day" => ("7d", 7 * 24 * 60, "7-day window"),
+        "weekly_opus" | "seven_day_opus" => ("7d-opus", 7 * 24 * 60, "Weekly Opus limit"),
+        "weekly_sonnet" | "seven_day_sonnet" => ("7d-sonnet", 7 * 24 * 60, "Weekly Sonnet limit"),
+        "weekly_haiku" | "seven_day_haiku" => ("7d-haiku", 7 * 24 * 60, "Weekly Haiku limit"),
+        "weekly_cowork" | "seven_day_cowork" => ("7d-cowork", 7 * 24 * 60, "Weekly Cowork limit"),
+        _ => ("window", 0, "Rate limit window"),
+    }
+}
+
+/// The provider's own list of windows.
+///
+/// Anthropic sends a `limits` array that says which windows the plan has and
+/// which of them are running. Where it is there, it is the authority: it
+/// names windows Cinder does not know about, and it says when a window is not
+/// counting anything.
+fn parse_claude_limits(v: &serde_json::Value, plan: &str) -> Vec<LiveQuota> {
+    let Some(limits) = v.get("limits").and_then(|x| x.as_array()) else { return Vec::new() };
+    let mut out = Vec::new();
+    for l in limits {
+        let Some(kind) = l
+            .get("kind")
+            .and_then(|x| x.as_str())
+            .or_else(|| l.get("group").and_then(|x| x.as_str()))
+        else {
+            continue;
+        };
+        let Some(pct) = l.get("percent").and_then(percent) else { continue };
+        let (id, minutes, detail) = claude_window(kind);
+        out.push(LiveQuota {
+            agent: "Claude Code".into(),
+            window: id.into(),
+            used_percent: pct,
+            window_minutes: minutes,
+            resets_at: l.get("resets_at").map(parse_resets_at).unwrap_or(0),
+            plan: plan.into(),
+            detail: detail.into(),
+            inactive: l.get("is_active").and_then(|x| x.as_bool()) == Some(false),
+            ..Default::default()
+        });
+    }
+    out
+}
+
 /// Claude's usage payload: five_hour, seven_day, seven_day_sonnet, ...
 fn parse_claude_usage(v: &serde_json::Value, plan: &str) -> Vec<LiveQuota> {
     let mut out = Vec::new();
@@ -712,6 +766,19 @@ fn parse_claude_usage(v: &serde_json::Value, plan: &str) -> Vec<LiveQuota> {
             ..Default::default()
         });
     }
+    // The provider's own list of windows: it names the ones Cinder does not
+    // know about, and it says when one of them is not running.
+    for l in parse_claude_limits(v, plan) {
+        match out.iter_mut().find(|w| w.window == l.window) {
+            Some(existing) => {
+                if existing.resets_at == 0 {
+                    existing.resets_at = l.resets_at;
+                }
+                existing.inactive = l.inactive;
+            }
+            None => out.push(l),
+        }
+    }
     // Extra usage is a credit balance, not a window: report how much of the
     // monthly allowance is gone.
     if let Some(extra) = v.get("extra_usage") {
@@ -728,6 +795,7 @@ fn parse_claude_usage(v: &serde_json::Value, plan: &str) -> Vec<LiveQuota> {
                 detail: "Extra usage credits".into(),
                 used_amount: used,
                 limit_amount: limit,
+                ..Default::default()
             });
         }
     }
@@ -1901,6 +1969,65 @@ mod tests {
         assert_eq!(body["grant_type"], "refresh_token");
         assert_eq!(body["client_id"], "client-1");
         assert_eq!(body["refresh_token"], "refresh-1");
+    }
+
+    #[test]
+    fn the_providers_own_list_of_windows_is_the_authority() {
+        // The shape Anthropic sends: the named windows, and the list of the
+        // windows the plan actually has.
+        let v = json!({
+            "five_hour": {"utilization": 0.0, "resets_at": null},
+            "seven_day": {"utilization": 44.0, "resets_at": "2026-10-26T18:59:59.608698+00:00"},
+            "limits": [
+                {"kind": "session", "group": "session", "percent": 0, "resets_at": null, "is_active": false},
+                {"kind": "weekly_all", "group": "weekly", "percent": 44,
+                 "resets_at": "2026-10-26T18:59:59.608698+00:00", "is_active": true}
+            ]
+        });
+        let w = parse_claude_usage(&v, "pro");
+        let session = w.iter().find(|x| x.window == "5h").unwrap();
+        let weekly = w.iter().find(|x| x.window == "7d").unwrap();
+        // The session window is not running, and the provider says so.
+        assert!(session.inactive, "the session window is not counting anything");
+        assert_eq!(session.used_percent, 0.0);
+        assert_eq!(session.resets_at, 0, "a window that is not running has no reset");
+        assert!(!weekly.inactive);
+        assert_eq!(weekly.used_percent, 44.0);
+        assert_eq!(weekly.window_minutes, 7 * 24 * 60);
+        assert!(weekly.resets_at > 0);
+    }
+
+    #[test]
+    fn a_window_the_provider_names_and_cinder_does_not_is_still_shown() {
+        // A window the list names and the named fields do not have.
+        let v = json!({
+            "five_hour": {"utilization": 10.0},
+            "limits": [
+                {"kind": "session", "percent": 10, "is_active": true},
+                {"kind": "weekly_opus", "percent": 30, "resets_at": "2026-10-26T18:59:59Z", "is_active": true}
+            ]
+        });
+        let w = parse_claude_usage(&v, "max");
+        let opus = w.iter().find(|x| x.window == "7d-opus").expect("the window should be there");
+        assert_eq!(opus.used_percent, 30.0);
+        assert_eq!(opus.window_minutes, 7 * 24 * 60);
+        assert!(opus.resets_at > 0);
+        assert!(!opus.inactive);
+        // The window the named fields know about is still there.
+        assert!(w.iter().any(|x| x.window == "5h"));
+    }
+
+    #[test]
+    fn a_payload_without_a_list_of_windows_is_read_as_it_was() {
+        let v = json!({
+            "five_hour": {"utilization": 29.0, "resets_at": "2026-10-21T18:00:00Z"},
+            "seven_day": {"utilization": 44.0}
+        });
+        let w = parse_claude_usage(&v, "max");
+        assert_eq!(w.len(), 2);
+        assert!(w.iter().all(|x| !x.inactive), "nothing says the window is not running");
+        let session = w.iter().find(|x| x.window == "5h").unwrap();
+        assert!(session.resets_at > 0);
     }
 
     #[test]
