@@ -1,8 +1,10 @@
-- **Live quotas:** Read the current window from Claude Code, Codex, GitHub Copilot, Gemini CLI and OpenCode, using the token each agent already keeps.
-- **Quota alerts:** Cinder projects a window forward from how fast it is used and tells you when one will run out, with a desktop notification.
-- **Plans and budgets:** Declare a plan to see what the work was worth, or a budget to see what is left.
-- **Project breakdown:** A run is attributed to its repository, and git worktrees roll up into their main checkout.
-- **Billing badges:** Each row says whether it is covered by a plan, billed per token, or local.
-- **More agents:** Cursor, GitHub Copilot, Gemini CLI and Cline are now read.
-- **System tray:** The tooltip carries the live quota percentages.
-- **Faster scans:** FFF's SIMD search screens the log lines, and the OpenCode database is aggregated in SQLite.
+- **Tray popover:** Click the tray icon to see each provider's quota windows, when they reset, and what today cost.
+- **Stale numbers:** A provider that fails keeps its last numbers on screen, marked as stale.
+- **Contained failures:** A failing agent no longer takes the dashboard down with it.
+- **Claude Code totals:** Each turn is counted once instead of once per tool call, and priced at what it cost.
+- **Long requests:** Long requests are priced at the premium rate the provider lists.
+- **Daily prices:** New models are priced from a price list that refreshes once a day.
+- **OpenCode:** Its numbers update again, and its quota card reads the current endpoint.
+- **More providers:** Kimi Code, OpenRouter and DeepSeek have cards. Add your own in ~/.cinder/providers.json.
+- **Sign-in refresh:** A refused token is refreshed and the request is tried again.
+- **Local days:** Days follow your time zone instead of UTC. The scan cache is rebuilt once after the update.
